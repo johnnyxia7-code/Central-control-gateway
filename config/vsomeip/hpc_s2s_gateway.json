@@ -1,0 +1,34 @@
+{
+    "unicast": "10.0.0.10",
+    "netmask": "255.255.255.0",
+    "diagnosis": "0x10",
+    "logging": {
+        "level": "info",
+        "console": "true",
+        "file": { "enable": "false" },
+        "dlt": "false"
+    },
+    "applications": [
+        { "name": "ccg_s2s_gateway", "id": "0x1001" }
+    ],
+    "services": [
+        { "service": "0x6001", "instance": "0x0001", "unreliable": "30501" },
+        { "service": "0x6002", "instance": "0x0001", "unreliable": "30501" },
+        { "service": "0x6003", "instance": "0x0001", "unreliable": "30501" },
+        { "service": "0x6004", "instance": "0x0001", "unreliable": "30501" }
+    ],
+    "routing": "ccg_s2s_gateway",
+    "service-discovery": {
+        "enable": "true",
+        "multicast": "224.244.224.245",
+        "port": "30490",
+        "protocol": "udp",
+        "initial_delay_min": "10",
+        "initial_delay_max": "100",
+        "repetitions_base_delay": "200",
+        "repetitions_max": "3",
+        "ttl": "3",
+        "cyclic_offer_delay": "1000",
+        "request_response_delay": "1500"
+    }
+}
