@@ -1,0 +1,2 @@
+# vsomeip applications on the IVI (routing manager and clients), see someip.te.
+attribute someip_domain;

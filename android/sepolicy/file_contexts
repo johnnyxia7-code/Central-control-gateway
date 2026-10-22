@@ -1,0 +1,3 @@
+/vendor/bin/ccg_someipd                                              u:object_r:ccg_someipd_exec:s0
+/vendor/bin/hw/android\.hardware\.automotive\.vehicle-ccg-service     u:object_r:hal_vehicle_default_exec:s0
+/dev/socket/someip(/.*)?                                             u:object_r:someip_socket:s0

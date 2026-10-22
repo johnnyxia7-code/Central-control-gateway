@@ -1,0 +1,16 @@
+# vsomeip base path (/dev/socket/someip): UNIX stream sockets of the local
+# vsomeip applications and their lock files.
+type someip_socket, file_type;
+
+# someip_domain (attributes): every vsomeip application on the IVI, routing
+# manager (ccg_someipd) or client (Vehicle HAL, ...). The routing manager and
+# its clients connect to each other's sockets in both directions.
+
+allow someip_domain someip_socket:dir rw_dir_perms;
+allow someip_domain someip_socket:sock_file create_file_perms;
+allow someip_domain someip_socket:file create_file_perms;
+allow someip_domain self:unix_stream_socket create_stream_socket_perms;
+allow someip_domain someip_domain:unix_stream_socket { connectto getopt read write };
+
+# /vendor/etc/vsomeip/*.json
+r_dir_file(someip_domain, vendor_configs_file)

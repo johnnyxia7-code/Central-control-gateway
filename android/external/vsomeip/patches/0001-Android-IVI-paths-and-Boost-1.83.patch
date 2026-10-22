@@ -1,0 +1,67 @@
+From 050ce0f9c9409e409489d19c732c053e1f23038d Mon Sep 17 00:00:00 2001
+From: Central Control Gateway <ccg@example.invalid>
+Date: Thu, 22 Oct 2026 05:55:45 +0000
+Subject: [PATCH] Android: IVI paths and Boost 1.83
+
+- VSOMEIP_BASE_PATH /dev/socket/someip/ (tmpfs, usable by early_hal
+  services; /vendor/run does not exist on Android)
+- default configuration in /vendor/etc/vsomeip(.json), the vendor
+  partition's etc directory
+- VSOMEIP_BOOST_VERSION matching external/boost 1.83
+---
+ Android.bp                                             | 10 ++++++++--
+ .../configuration/include/android/internal.hpp         |  4 ++--
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/Android.bp b/Android.bp
+index 65533ba..e219701 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -53,7 +53,9 @@ cc_defaults {
+     name: "vsomeip_lib_defaults",
+ 
+     cflags: [
+-        "-DVSOMEIP_BOOST_VERSION=107500",
++        // Must match the Boost in external/boost (central-control-gateway:
++        // android/external/boost provides 1.83).
++        "-DVSOMEIP_BOOST_VERSION=108300",
+         "-DVSOMEIP_INTERNAL_SUPPRESS_DEPRECATED",
+         // std::result_of was removed in C++20; force Boost.Asio 1.75 to use
+         // std::invoke_result instead (supported since Boost 1.74).
+@@ -84,7 +86,11 @@ cc_library_shared {
+         "-DWITHOUT_SYSTEMD",
+         "-DVSOMEIP_VERSION=\"3.7.6\"",
+         "-DVSOMEIP_GIT_COMMIT=\"unknown\"",
+-        "-DVSOMEIP_BASE_PATH=\"/vendor/run/someip/\"",
++        // UNIX domain sockets of the local vsomeip applications. /vendor/run
++        // does not exist on Android; /dev/socket is a tmpfs available from early
++        // boot (the Vehicle HAL is an early_hal), created by init (ccg_someipd.rc).
++        // sun_path is limited to 108 bytes: keep the path short.
++        "-DVSOMEIP_BASE_PATH=\"/dev/socket/someip/\"",
+     ],
+ 
+     ldflags: [
+diff --git a/implementation/configuration/include/android/internal.hpp b/implementation/configuration/include/android/internal.hpp
+index 3a19703..0cafcde 100644
+--- a/implementation/configuration/include/android/internal.hpp
++++ b/implementation/configuration/include/android/internal.hpp
+@@ -30,14 +30,14 @@
+ #define VSOMEIP_GETENV(name) std::getenv(name)
+ #endif
+ 
+-#define VSOMEIP_DEFAULT_CONFIGURATION_FILE      "/vendor/run/etc/vsomeip.json"
++#define VSOMEIP_DEFAULT_CONFIGURATION_FILE      "/vendor/etc/vsomeip.json"
+ #define VSOMEIP_LOCAL_CONFIGURATION_FILE        "./vsomeip.json"
+ #define VSOMEIP_MANDATORY_CONFIGURATION_FILES                                                      \
+     "vsomeip_std.json,vsomeip_app.json,vsomeip_events.json,vsomeip_plc.json,vsomeip_log.json,"     \
+     "vsomeip_security.json,vsomeip_whitelist.json,vsomeip_policy_extensions.json,"                 \
+     "vsomeip_portcfg.json,vsomeip_device.json"
+ 
+-#define VSOMEIP_DEFAULT_CONFIGURATION_FOLDER    "/vendor/run/etc/vsomeip"
++#define VSOMEIP_DEFAULT_CONFIGURATION_FOLDER    "/vendor/etc/vsomeip"
+ #define VSOMEIP_LOCAL_CONFIGURATION_FOLDER      "./vsomeip"
+ 
+ // VSOMEIP_BASE_PATH should be specified in Android.bp or/and Android.mk file via c/c++ compiler
+-- 
+2.43.0
+

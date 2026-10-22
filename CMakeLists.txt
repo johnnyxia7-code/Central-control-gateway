@@ -59,7 +59,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_library(ccg_platform_linux
     platform/linux/socketcan_transport.cpp
     platform/linux/someip_udp_binding.cpp
-    platform/linux/multicast_route.cpp
+    platform/linux/network_setup.cpp
   )
   target_include_directories(ccg_platform_linux PUBLIC platform/linux)
   target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s)
@@ -120,7 +120,7 @@ if(CCG_BUILD_TESTS)
   target_link_libraries(ccg_s2s_tests PRIVATE ccg_vehicle_matrix ccg_ivi)
   if(TARGET ccg_platform_linux)
     target_sources(ccg_s2s_tests PRIVATE tests/test_someip_udp_binding.cpp
-                                         tests/test_multicast_route.cpp)
+                                         tests/test_network_setup.cpp)
     target_link_libraries(ccg_s2s_tests PRIVATE ccg_platform_linux)
   endif()
   ccg_warnings(ccg_s2s_tests)

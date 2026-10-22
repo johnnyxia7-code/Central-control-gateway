@@ -1,0 +1,120 @@
+// Android (Soong) build of the IVI side of the Central Control Gateway.
+//
+// Checked out to vendor/ccg/central-control-gateway (android/manifests), next to
+// external/vsomeip and external/boost prepared by android/setup_aosp.sh.
+// The Vehicle HAL service is in android/vhal; see docs/IVI_ANDROID_VSOMEIP.md.
+
+cc_defaults {
+    name: "ccg_defaults",
+    vendor: true,
+    cpp_std: "c++17",
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    // The gateway core and vsomeip use exceptions and RTTI (off by default in Soong).
+    cppflags: ["-fexceptions"],
+    rtti: true,
+}
+
+// Portable IVI client of the HPC services + VHAL property mapping (no OS dependencies).
+cc_library_static {
+    name: "libccg_ivi",
+    defaults: ["ccg_defaults"],
+    host_supported: true,
+    srcs: [
+        "src/someip/someip_message.cpp",
+        "ivi/src/vehicle_client.cpp",
+        "ivi/src/vehicle_property_bridge.cpp",
+        "ivi/src/vehicle_services.cpp",
+    ],
+    export_include_dirs: [
+        "include",
+        "ivi/include",
+        "config",
+    ],
+}
+
+// vsomeip transport of the IVI client.
+cc_library_static {
+    name: "libccg_vsomeip_client",
+    defaults: ["ccg_defaults"],
+    srcs: ["platform/vsomeip/vsomeip_client_transport.cpp"],
+    export_include_dirs: ["platform/vsomeip"],
+    static_libs: ["libccg_ivi"],
+    export_static_lib_headers: ["libccg_ivi"],
+    shared_libs: ["libvsomeip3"],
+    export_shared_lib_headers: ["libvsomeip3"],
+}
+
+// vsomeip configuration of the IVI (/vendor/etc/vsomeip/ivi_vehicle.json).
+prebuilt_etc {
+    name: "ccg_vsomeip_ivi.json",
+    vendor: true,
+    src: "config/vsomeip/ivi_vehicle.json",
+    sub_dir: "vsomeip",
+    filename: "ivi_vehicle.json",
+}
+
+// SOME/IP routing daemon (vsomeip routing manager host) of the IVI.
+cc_binary {
+    name: "ccg_someipd",
+    defaults: ["ccg_defaults"],
+    srcs: [
+        "app/someipd_main.cpp",
+        "platform/linux/network_setup.cpp",
+    ],
+    local_include_dirs: ["platform/linux"],
+    shared_libs: [
+        "libvsomeip3",
+        "liblog",
+    ],
+    // Configuration and SD plug-ins are loaded with dlopen() by libvsomeip3.
+    required: [
+        "libvsomeip_cfg",
+        "libvsomeip_sd",
+        "ccg_vsomeip_ivi.json",
+    ],
+    init_rc: ["android/someipd/ccg_someipd.rc"],
+}
+
+// Shell tool: same stack as the VHAL, prints VHAL property events (bring-up, debugging).
+cc_binary {
+    name: "ccg_ivi_vehicle_client",
+    defaults: ["ccg_defaults"],
+    srcs: ["app/ivi_vehicle_client_main.cpp"],
+    static_libs: [
+        "libccg_vsomeip_client",
+        "libccg_ivi",
+    ],
+    shared_libs: ["libvsomeip3"],
+    required: [
+        "libvsomeip_cfg",
+        "libvsomeip_sd",
+        "ccg_vsomeip_ivi.json",
+    ],
+}
+
+// Unit tests of the gateway core and the IVI client (host and target):
+//   atest ccg_s2s_tests   or   m ccg_s2s_tests && out/host/linux-x86/nativetest64/...
+cc_test {
+    name: "ccg_s2s_tests",
+    defaults: ["ccg_defaults"],
+    host_supported: true,
+    gtest: false,
+    srcs: [
+        "src/**/*.cpp",
+        "config/vehicle_s2s_matrix.cpp",
+        "platform/linux/someip_udp_binding.cpp",
+        "platform/linux/network_setup.cpp",
+        "tests/*.cpp",
+    ],
+    local_include_dirs: [
+        "config",
+        "platform/linux",
+        "tests",
+    ],
+    static_libs: ["libccg_ivi"],
+    exclude_srcs: ["src/someip/someip_message.cpp"], // part of libccg_ivi
+}

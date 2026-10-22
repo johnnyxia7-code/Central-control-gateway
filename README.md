@@ -11,8 +11,12 @@ signals into SOME/IP events/fields and SOME/IP method calls into CAN signals.
 - SOME/IP return codes per specification
 - Configuration consistency check at start-up
 - Linux process (SocketCAN + SOME/IP/UDP) and deterministic virtual-time simulator
+- vsomeip binding with SOME/IP-SD for the HPC
+- **IVI controller (Android)**: vsomeip ported to Android, SOME/IP routing daemon and a
+  Vehicle HAL that exposes the HPC services as VHAL properties
 
-See [docs/S2S_DESIGN.md](docs/S2S_DESIGN.md) for the design and the reference matrix.
+See [docs/S2S_DESIGN.md](docs/S2S_DESIGN.md) for the design and the reference matrix, and
+[docs/IVI_ANDROID_VSOMEIP.md](docs/IVI_ANDROID_VSOMEIP.md) for the Android IVI port.
 
 ## Build & test
 
@@ -23,6 +27,15 @@ ctest --test-dir build --output-on-failure    # or ./build/ccg_s2s_tests [filter
 ```
 
 Requirements: C++17 compiler (GCC ≥ 9 / Clang ≥ 10), CMake ≥ 3.16. No third-party dependencies.
+
+Optional vsomeip targets (`ccg_s2s_gateway_vsomeip`, `ccg_hpc_vsomeip_bench`, `ccg_someipd`,
+`ccg_ivi_vehicle_client`) are built when vsomeip 3 is found
+(`-DCMAKE_PREFIX_PATH=<vsomeip install>`, `-DCCG_WITH_VSOMEIP=ON|OFF|AUTO`).
+Two-ECU test of the IVI against the HPC in network namespaces (root):
+
+```sh
+sudo tools/ivi_hpc_netns_test.sh build <vsomeip install>/lib
+```
 
 ## Run
 
@@ -39,14 +52,27 @@ sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
 ./build/ccg_s2s_gateway --can vcan0 --port 30490 --subscriber 127.0.0.1:30501
 ```
 
+With vsomeip and SOME/IP-SD instead of static subscribers:
+
+```sh
+VSOMEIP_CONFIGURATION=config/vsomeip/hpc_s2s_gateway.json ./build/ccg_s2s_gateway_vsomeip --can vcan0
+```
+
+Android IVI: see [docs/IVI_ANDROID_VSOMEIP.md](docs/IVI_ANDROID_VSOMEIP.md) §4 (AOSP integration).
+
 ## Layout
 
 ```
-include/ccg/   public headers (can, e2e, someip, s2s)
-src/           portable S2S core library (ccg_s2s)
-config/        reference vehicle S2S matrix
-platform/linux SocketCAN and SOME/IP-over-UDP bindings
-app/           gateway process and simulator
-tests/         unit and integration tests
-docs/          design description
+include/ccg/      public headers (can, e2e, someip, s2s)
+src/              portable S2S core library (ccg_s2s)
+config/           reference vehicle S2S matrix, vsomeip configurations (HPC, IVI)
+ivi/              IVI client of the HPC services and VHAL property mapping (ccg_ivi)
+platform/linux    SocketCAN, SOME/IP-over-UDP, vehicle network setup (netlink)
+platform/vsomeip  vsomeip bindings: HPC server binding, IVI client transport
+app/              gateway processes, simulator, HPC bench, IVI routing daemon and client
+android/          AOSP integration: vsomeip patch, Boost, VHAL, init, SELinux, product
+Android.bp        Soong modules of the IVI side
+tests/            unit and integration tests
+tools/            two-ECU integration test (network namespaces)
+docs/             design descriptions
 ```

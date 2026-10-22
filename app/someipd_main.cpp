@@ -3,11 +3,12 @@
 // Hosts the vsomeip routing manager: it owns the SOME/IP-SD socket and the
 // vehicle network endpoints, and every other vsomeip application on the IVI
 // (Vehicle HAL, diagnostics, apps through a HAL) connects to it locally.
-// Optionally keeps the SD multicast route on the vehicle network interface
-// (see platform/linux/multicast_route.hpp).
+// With --net-if it also keeps the vehicle network interface usable: link up and
+// address (--net-address, for an interface no network manager owns) and the
+// SOME/IP-SD multicast route that Android lacks (platform/linux/network_setup.hpp).
 //
-//   ccg_someipd [--app routingmanagerd] [--sd-route IFACE [--sd-prefix 224.0.0.0/4]
-//               [--sd-table 254]]
+//   ccg_someipd [--app routingmanagerd] [--net-if IFACE [--net-address 10.0.0.20/24]
+//               [--sd-prefix 224.0.0.0/4] [--sd-table 254] [--no-sd-route]]
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
@@ -23,7 +24,7 @@
 
 #include <vsomeip/vsomeip.hpp>
 
-#include "multicast_route.hpp"
+#include "network_setup.hpp"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -46,7 +47,9 @@ void log(bool error, const char* fmt, ...) {
 
 struct Options {
     std::string appName = "routingmanagerd";
-    std::string routeInterface;
+    std::string netInterface;
+    std::string netAddress;
+    bool sdRoute = true;
     std::string routePrefix = "224.0.0.0/4";
     std::uint32_t routeTable = 254;
 };
@@ -60,16 +63,20 @@ int main(int argc, char** argv) {
         const bool hasValue = i + 1 < argc;
         if (arg == "--app" && hasValue) {
             opt.appName = argv[++i];
-        } else if (arg == "--sd-route" && hasValue) {
-            opt.routeInterface = argv[++i];
+        } else if (arg == "--net-if" && hasValue) {
+            opt.netInterface = argv[++i];
+        } else if (arg == "--net-address" && hasValue) {
+            opt.netAddress = argv[++i];
+        } else if (arg == "--no-sd-route") {
+            opt.sdRoute = false;
         } else if (arg == "--sd-prefix" && hasValue) {
             opt.routePrefix = argv[++i];
         } else if (arg == "--sd-table" && hasValue) {
             opt.routeTable = static_cast<std::uint32_t>(std::stoul(argv[++i]));
         } else {
             std::fprintf(stderr,
-                         "usage: %s [--app NAME] [--sd-route IFACE [--sd-prefix CIDR] "
-                         "[--sd-table N]]\n",
+                         "usage: %s [--app NAME] [--net-if IFACE [--net-address CIDR] "
+                         "[--sd-prefix CIDR] [--sd-table N] [--no-sd-route]]\n",
                          argv[0]);
             return EXIT_FAILURE;
         }
@@ -84,21 +91,24 @@ int main(int argc, char** argv) {
     pthread_sigmask(SIG_BLOCK, &mask, nullptr);
 
     std::atomic<bool> running{true};
-    std::optional<ccg::platform::MulticastRoute> route;
+    std::optional<ccg::platform::NetworkSetup> network;
     std::thread routeThread;
-    if (!opt.routeInterface.empty()) {
+    if (!opt.netInterface.empty()) {
         try {
-            route.emplace(opt.routeInterface, opt.routePrefix, opt.routeTable);
+            network.emplace(opt.netInterface);
+            if (!opt.netAddress.empty()) network->setAddress(opt.netAddress);
+            if (opt.sdRoute) network->setMulticastRoute(opt.routePrefix, opt.routeTable);
         } catch (const std::exception& e) {
             log(true, "%s", e.what());
             return EXIT_FAILURE;
         }
-        const auto first = route->install();
-        log(first != ccg::platform::MulticastRoute::Result::Installed,
-            "SD route %s dev %s table %u: %s %s", opt.routePrefix.c_str(),
-            opt.routeInterface.c_str(), opt.routeTable, ccg::platform::toString(first),
-            route->lastError().c_str());
-        routeThread = std::thread([&] { route->supervise(running); });
+        const auto first = network->apply();
+        log(first != ccg::platform::NetworkSetup::Result::Ok,
+            "network %s: address %s, SD route %s (table %u): %s %s", opt.netInterface.c_str(),
+            opt.netAddress.empty() ? "unmanaged" : opt.netAddress.c_str(),
+            opt.sdRoute ? opt.routePrefix.c_str() : "off", opt.routeTable,
+            ccg::platform::toString(first), network->lastError().c_str());
+        routeThread = std::thread([&] { network->supervise(running); });
     }
 
     auto app = vsomeip::runtime::get()->create_application(opt.appName);
@@ -135,5 +145,6 @@ int main(int argc, char** argv) {
     }
     signalThread.join();
     if (routeThread.joinable()) routeThread.join();
+    if (network) log(false, "network setup applied %u times", network->applyCount());
     return EXIT_SUCCESS;
 }
