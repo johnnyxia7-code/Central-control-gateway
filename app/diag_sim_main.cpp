@@ -1,5 +1,6 @@
 // Deterministic bench simulation of the diagnostic gateway: a scripted DoIP
-// tester talks to simulated UDS ECUs on PT_CAN (CAN FD), CHS_CAN and BODY_CAN.
+// tester talks to simulated UDS ECUs on PT_CAN (CAN FD), CHS_CAN and BODY_CAN,
+// and - routed DoIP-to-DoIP - to the ADAS domain controller on ETH_ADAS.
 #include <cstdio>
 #include <deque>
 #include <iomanip>
@@ -11,9 +12,13 @@
 #include <vector>
 
 #include "ccg/diag/diag_gateway.hpp"
+#include "ccg/diag/doip_client.hpp"
 #include "ccg/doip/doip_message.hpp"
+#include "doip_ecu.hpp"
+#include "doip_link.hpp"
 #include "uds_ecu.hpp"
 #include "vehicle_diag_routing.hpp"
+#include "vehicle_key_master.hpp"
 
 namespace {
 
@@ -119,6 +124,14 @@ int main() {
     SimTransport tx;
     diag::DiagGateway gw(cfg, tx);
 
+    // ETH_ADAS: the gateway's DoIP client and the ADAS DoIP entity.
+    sim::DoipLink ethernet;
+    diag::DoipClient doip(config::makeVehicleDoipClient(), ethernet);
+    ethernet.attach(doip);
+    gw.setEthernetRouting(doip);
+    sim::DoipEcu adas(config::makeAdasDoipEntity(), config::makeEcuKeySlots(dg::kAdas), ethernet.port(dg::kAdasEndpoint));
+    ethernet.bind(dg::kAdasEndpoint, adas.entity());
+
     std::deque<std::pair<std::size_t, can::CanFrame>> ecuOut;
     std::vector<std::pair<std::size_t, std::unique_ptr<sim::UdsEcu>>> ecus;
     for (const auto& r : cfg.ecus) {
@@ -171,7 +184,8 @@ int main() {
     g_t0 = g_now = diag::TimePoint{} + 1s;
     gw.start(g_now);
 
-    for (int t = 0; t <= 1800; ++t) {
+    adas.entity().start(g_now);
+    for (int t = 0; t <= 1900; ++t) {
         g_now = g_t0 + std::chrono::milliseconds(t);
         switch (t) {
             case 10: {
@@ -190,7 +204,7 @@ int main() {
                 request(dg::kEsp, {0x22, 0xF1, 0x87});
                 break;
             case 60:
-                log("functional TesterPresent 3E 80 (0xE400) to every CAN bus");
+                log("functional TesterPresent 3E 80 (0xE400) to every CAN bus and ADAS");
                 request(dg::kFunctional, {0x3E, 0x80});
                 break;
             case 80:
@@ -219,19 +233,35 @@ int main() {
                 log("gateway itself (0x1001): ReadDataByIdentifier F190");
                 request(dg::kGateway, {0x22, 0xF1, 0x90});
                 break;
+            case 1800:
+                log("ADAS (0x1010) on ETH_ADAS: routed DoIP-to-DoIP with the tester's address 0x0E80");
+                request(dg::kAdas, {0x22, 0xF1, 0x90});
+                break;
+            case 1820:
+                log("ADAS: DiagnosticSessionControl extended over the kept connection");
+                request(dg::kAdas, {0x10, 0x03});
+                break;
+            case 1840:
+                log("functional DiagnosticSessionControl default (0xE400): CAN buses and ADAS");
+                request(dg::kFunctional, {0x10, 0x01});
+                break;
             default:
                 break;
         }
         gw.mainFunction(g_now);
+        doip.mainFunction(g_now);
+        adas.entity().mainFunction(g_now);
         for (auto& [ch, e] : ecus) e->mainFunction(g_now);
         deliver();
+        ethernet.pump(g_now);
     }
     g_can.flushAll();
 
     const auto& s = gw.statistics();
     std::cout << "\nstatistics: requests=" << s.diagRequests << " acks=" << s.diagAcks << " nacks=" << s.diagNacks
               << " functional=" << s.functionalRequests << " local=" << s.localRequests
-              << " ecuResponses=" << s.ecuResponses << " tpTxErrors=" << s.isotpTxErrors
+              << " ecuResponses=" << s.ecuResponses << " ethernet=" << s.ethernetRequests << "/"
+              << s.ethernetResponses << " tpTxErrors=" << s.isotpTxErrors
               << " announcements=" << s.announcements << "\n";
     return 0;
 }

@@ -247,3 +247,79 @@ TEST_CASE("doip client: UDS with the simulated ADAS DoIP entity") {
     CHECK(results[2].second == (Bytes{0x7E, 0x00}));
     CHECK_EQ(client.statistics().connects, 2u);
 }
+
+TEST_CASE("doip client: routed tester requests (pass-through source, ACK, NRC 0x78, NACK, busy)") {
+    Scripted s;
+    std::vector<std::optional<doip::DiagNack>> delivered;
+    std::vector<Bytes> responses;
+    auto handlers = [&] {
+        diag::DoipClient::RouteHandlers h;
+        h.delivered = [&](std::optional<doip::DiagNack> n) { delivered.push_back(n); };
+        h.response = [&](Bytes d) { responses.push_back(std::move(d)); };
+        return h;
+    };
+    constexpr std::uint16_t kTester = 0x0E80;
+    s.client.route(kTester, dg::kAdas, dg::kAdas, {0x31, 0x01, 0xFF, 0x00}, s.now, handlers());
+    REQUIRE(s.net.connects.size() == 1u);
+    s.client.onConnected(1, s.now);
+    CHECK(s.net.sent.back().second == (Bytes{0x0E, 0x80, 0x00, 0, 0, 0, 0}));  // activation as the tester
+    auto fromEntity = [&](std::uint16_t type, const Bytes& payload) {
+        const auto b = doip::encode(doip::kVersion2012, type, payload);
+        s.client.onData(1, b.data(), b.size(), s.now);
+    };
+    fromEntity(pt::kRoutingActivationResponse,
+               doip::routingActivationResponsePayload(kTester, dg::kAdas, doip::ActivationCode::Success));
+    CHECK(s.net.sent.back().second == (Bytes{0x0E, 0x80, 0x10, 0x10, 0x31, 0x01, 0xFF, 0x00}));
+    CHECK(s.client.routingActive(dg::kAdas, kTester));
+    CHECK(!s.client.routingActive(dg::kAdas));  // the internal connection is a different one
+
+    fromEntity(pt::kDiagnosticAck, doip::diagnosticAckPayload(dg::kAdas, kTester, 0x00));
+    REQUIRE(delivered.size() == 1u);
+    CHECK(!delivered[0].has_value());
+    // Pending and final response are both forwarded; the tester runs its own P2 timers.
+    fromEntity(pt::kDiagnosticMessage, doip::diagnosticMessagePayload(dg::kAdas, kTester, {0x7F, 0x31, 0x78}));
+    s.advance(6000ms);
+    fromEntity(pt::kDiagnosticMessage, doip::diagnosticMessagePayload(dg::kAdas, kTester, {0x71, 0x01, 0xFF, 0x00}));
+    REQUIRE(responses.size() == 2u);
+    CHECK(responses[0] == (Bytes{0x7F, 0x31, 0x78}));
+    CHECK(responses[1] == (Bytes{0x71, 0x01, 0xFF, 0x00}));
+
+    // Busy until the entity acknowledged; a NACK is passed through with its code.
+    s.client.route(kTester, dg::kAdas, dg::kAdas, {0x22, 0x12, 0x34}, s.now, handlers());
+    s.client.route(kTester, dg::kAdas, dg::kAdas, {0x3E, 0x00}, s.now, handlers());
+    REQUIRE(delivered.size() == 2u);
+    CHECK(delivered[1] == std::optional<doip::DiagNack>(doip::DiagNack::TransportProtocolError));
+    fromEntity(pt::kDiagnosticNack, doip::diagnosticAckPayload(dg::kAdas, kTester, 0x04));
+    REQUIRE(delivered.size() == 3u);
+    CHECK(delivered[2] == std::optional<doip::DiagNack>(doip::DiagNack::MessageTooLarge));
+
+    // No ACK within A_DoIP_Ctrl: NACK "target unreachable", connection dropped.
+    s.client.route(kTester, dg::kAdas, dg::kAdas, {0x3E, 0x00}, s.now, handlers());
+    s.advance(2001ms);
+    REQUIRE(delivered.size() == 4u);
+    CHECK(delivered[3] == std::optional<doip::DiagNack>(doip::DiagNack::TargetUnreachable));
+    CHECK(!s.client.routingActive(dg::kAdas, kTester));
+
+    // Unknown ECU
+    s.client.route(kTester, 0x2222, 0x2222, {0x3E, 0x00}, s.now, handlers());
+    CHECK(delivered.back() == std::optional<doip::DiagNack>(doip::DiagNack::UnknownTargetAddress));
+}
+
+TEST_CASE("doip client: closeSource ends a tester's connections, not the gateway's own") {
+    Scripted s;
+    diag::DoipClient::RouteHandlers h;
+    h.delivered = [](std::optional<doip::DiagNack>) {};
+    h.response = [](Bytes) {};
+    s.client.request(dg::kAdas, {0x3E, 0x00}, s.now, s.collect());   // connection 1 (0x0F00)
+    s.client.route(0x0E80, dg::kAdas, dg::kAdas, {0x3E, 0x00}, s.now, h);  // connection 2
+    REQUIRE(s.net.connects.size() == 2u);
+    s.client.onConnected(1, s.now);
+    s.client.onConnected(2, s.now);
+    CHECK_EQ(s.client.openConnections(), 2u);
+    s.client.closeSource(0x0E80);
+    CHECK_EQ(s.client.openConnections(), 1u);
+    REQUIRE(s.net.closed.size() == 1u);
+    CHECK_EQ(s.net.closed[0], 2u);
+    s.client.closeSource(dg::kInternalTester);  // never closes the gateway's own connection
+    CHECK_EQ(s.client.openConnections(), 1u);
+}

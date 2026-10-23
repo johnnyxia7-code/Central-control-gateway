@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <sstream>
 
+#include "ccg/diag/doip_client.hpp"
+
 namespace ccg::diag {
 
 namespace {
@@ -240,9 +242,14 @@ void DiagGateway::onTcpConnected(ConnectionId id, TimePoint now) {
 void DiagGateway::onTcpClosed(ConnectionId id, TimePoint) { closeConnection(id, false); }
 
 void DiagGateway::closeConnection(ConnectionId id, bool notifyTransport) {
-    if (connections_.erase(id) == 0) {
+    const auto it = connections_.find(id);
+    if (it == connections_.end()) {
         return;
     }
+    if (ethernet_ && it->second.registered) {
+        ethernet_->closeSource(it->second.tester);  // its connections to the Ethernet ECUs end too
+    }
+    connections_.erase(it);
     ++stats_.tcpConnectionsClosed;
     if (notifyTransport) {
         transport_.closeTcp(id);
@@ -449,6 +456,10 @@ void DiagGateway::handleDiagnosticMessage(ConnectionId id, const std::vector<std
     }
     const auto it = ecuByAddress_.find(target);
     if (it == ecuByAddress_.end()) {
+        if (ethernet_ && ethernet_->reaches(target)) {
+            routeToEthernet(req, target, target, std::move(data), false, now);
+            return;  // ACK / NACK once the entity has answered
+        }
         sendDiagNack(req, target, DiagNack::UnknownTargetAddress);
         return;
     }
@@ -490,6 +501,11 @@ void DiagGateway::handleFunctionalRequest(const Requester& req,
     }
     for (auto& ecu : ecus_) {
         ecu.responseOwner = req;  // every ECU may answer
+    }
+    if (ethernet_) {
+        for (const auto& ecu : ethernet_->config().ecus) {
+            routeToEthernet(req, ecu.logicalAddress, config_.entity.functionalAddress, data, true, now);
+        }
     }
     if (auto response = localService(data, true, now)) {
         sendDiagMessage(req, config_.entity.logicalAddress, *response);
@@ -605,6 +621,39 @@ void DiagGateway::onEcuResponse(std::size_t index, std::vector<std::uint8_t>&& d
         return;
     }
     sendDiagMessage(*owner, config_.ecus[index].logicalAddress, data);
+}
+
+// ---------------------------------------------------------------------------
+// DoIP-to-DoIP routing (Ethernet ECUs)
+// ---------------------------------------------------------------------------
+
+bool DiagGateway::testerConnected(const Requester& req) const {
+    const auto it = connections_.find(req.connection);
+    return it != connections_.end() && it->second.registered && it->second.tester == req.tester;
+}
+
+void DiagGateway::routeToEthernet(const Requester& req, std::uint16_t ecu, std::uint16_t targetOnWire,
+                                  std::vector<std::uint8_t> data, bool functional, TimePoint now) {
+    ++stats_.ethernetRequests;
+    DoipClient::RouteHandlers handlers;
+    handlers.delivered = [this, req, ecu, functional](std::optional<DiagNack> nack) {
+        // A functional request was acknowledged by the gateway already.
+        if (functional || !testerConnected(req)) return;
+        if (nack) {
+            sendDiagNack(req, ecu, *nack);
+        } else {
+            sendDiagAck(req, ecu);
+        }
+    };
+    handlers.response = [this, req, ecu](std::vector<std::uint8_t> uds) {
+        if (!testerConnected(req)) {
+            ++stats_.responsesDropped;
+            return;
+        }
+        ++stats_.ethernetResponses;
+        sendDiagMessage(req, ecu, uds);
+    };
+    ethernet_->route(req.tester, ecu, targetOnWire, std::move(data), now, std::move(handlers));
 }
 
 // ---------------------------------------------------------------------------

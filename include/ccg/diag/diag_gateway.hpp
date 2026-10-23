@@ -57,6 +57,8 @@ struct DiagStatistics {
     std::uint64_t responsesDropped = 0;
     std::uint64_t isotpTxErrors = 0;
     std::uint64_t isotpRxErrors = 0;
+    std::uint64_t ethernetRequests = 0;   // routed to DoIP entities on the vehicle Ethernet
+    std::uint64_t ethernetResponses = 0;
 };
 
 // Request to the gateway's own UDS server, as seen by a local service handler.
@@ -124,6 +126,8 @@ private:
     std::vector<IDiagClient*> clients_;
 };
 
+class DoipClient;
+
 class DiagConfigError : public std::runtime_error {
 public:
     explicit DiagConfigError(std::vector<std::string> errors);
@@ -156,6 +160,11 @@ public:
 
     // The handler must outlive the gateway.
     void addLocalService(ILocalServiceHandler& handler) { localHandlers_.push_back(&handler); }
+
+    // DoIP-to-DoIP routing: tester requests to the client's Ethernet ECUs (and
+    // functional requests) are forwarded through it with the tester's source
+    // address. The client must outlive the gateway's use of it.
+    void setEthernetRouting(DoipClient& client) { ethernet_ = &client; }
 
     // IDiagClient. While an internal request is open, tester requests to that
     // ECU are refused (diagnostic NACK) and its responses go to the callback.
@@ -215,6 +224,9 @@ private:
                                  TimePoint now);
     void handleFunctionalRequest(const Requester& req, const std::vector<std::uint8_t>& data,
                                  TimePoint now);
+    void routeToEthernet(const Requester& req, std::uint16_t ecu, std::uint16_t targetOnWire,
+                         std::vector<std::uint8_t> data, bool functional, TimePoint now);
+    bool testerConnected(const Requester& req) const;
     std::optional<std::vector<std::uint8_t>> localService(const std::vector<std::uint8_t>& request,
                                                           bool functional, TimePoint now);
 
@@ -253,6 +265,7 @@ private:
     std::uint8_t announcementsLeft_ = 0;
     TimePoint nextAnnouncement_{};
     std::vector<ILocalServiceHandler*> localHandlers_;
+    DoipClient* ethernet_ = nullptr;
     TimePoint now_{};  // latest time seen, for callbacks without a time argument
     std::uint8_t localSession_ = 0x01;
     TimePoint localSessionActivity_{};

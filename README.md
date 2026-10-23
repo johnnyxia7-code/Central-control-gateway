@@ -29,12 +29,13 @@ Design: [docs/ETH_GATEWAY_DESIGN.md](docs/ETH_GATEWAY_DESIGN.md)
 
 ## Diagnostic gateway (DoIP → UDS on CAN)
 
-DoIP edge node for the external tester, routing UDS requests to the ECUs on CAN.
+DoIP edge node for the external tester, routing UDS requests to the ECUs on CAN and to the DoIP ECUs on the vehicle Ethernet.
 
 - **DoIP (ISO 13400-2)**: vehicle identification and announcements, entity status, power mode (UDP); routing activation with alive-check socket handling, inactivity timers, header NACKs, diagnostic message ACK/NACK (TCP)
 - **ISO-TP (ISO 15765-2)** on CAN and CAN FD: single/first/consecutive/flow-control frames, escape lengths > 4095 bytes, block size and STmin, N_As/N_Bs/N_Cr timeouts, FC.WAIT, overflow
 - **Routing** by logical address to the ECU's CAN channel and IDs; functional requests (0xE400) on 0x7DF on every bus; responses including NRC 0x78 *response pending* go back to the requesting tester
 - Local UDS server for the gateway's own address (session control, tester present, VIN / serial number), extensible by further services
+- **DoIP-to-DoIP routing** to Ethernet ECUs (ADAS 0x1010): the gateway connects to the ECU's DoIP entity with the tester's own source address; ACK after the ECU's ACK, its NACKs passed on (0x06 if unreachable), responses including NRC 0x78 forwarded, functional requests reach the Ethernet ECUs too
 - Gateway-internal diagnostic client: own UDS requests to CAN ECUs (ISO-TP) and to Ethernet ECUs as **DoIP client** (TCP connect, routing activation, ACK/NACK, alive check, NRC 0x78)
 
 Design: [docs/DIAG_GATEWAY_DESIGN.md](docs/DIAG_GATEWAY_DESIGN.md)

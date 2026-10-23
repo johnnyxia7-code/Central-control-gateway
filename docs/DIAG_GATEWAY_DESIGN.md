@@ -20,8 +20,9 @@ messages to the right ECU on the right CAN bus, then sends the answers back.
 |-------|--------|---------|
 | DoIP message | `ccg/doip/doip_message.hpp` | generic header (version, inverse version, payload type, length), payload types, NACK/response codes, TCP stream reassembly, payload builders |
 | ISO-TP | `ccg/isotp/isotp_channel.hpp` | SF/FF/CF/FC on CAN and CAN FD, flow control, timers |
-| Routing | `ccg/diag/diag_gateway.hpp` | DoIP entity (UDP + TCP), routing activation, address-based routing to ISO-TP channels, local UDS server |
-| Platform | `platform/linux/doip_sockets.hpp` | TCP listener (max + 1 sockets), UDP socket with broadcast |
+| Routing | `ccg/diag/diag_gateway.hpp` | DoIP entity (UDP + TCP), routing activation, address-based routing to ISO-TP channels and Ethernet ECUs, local UDS server |
+| DoIP client | `ccg/diag/doip_client.hpp` | connections to the DoIP entities on the vehicle Ethernet: DoIP-to-DoIP routing, gateway-internal requests |
+| Platform | `platform/linux/doip_sockets.hpp`, `doip_tcp_connector.hpp` | TCP listener (max + 1 sockets), UDP socket with broadcast, non-blocking TCP client connections |
 
 ## 3. DoIP entity
 
@@ -77,8 +78,9 @@ Payload: `SA (2) | TA (2) | UDS data`.
 |-------|----------|
 | Socket not activated, or SA ≠ activated SA | NACK 0x02 invalid SA, socket closed |
 | TA = gateway LA 0x1001 | ACK, local UDS server answers (§5) |
-| TA = functional 0xE400 | ACK from 0xE400, single frame on 0x7DF on **every** CAN bus (§4.3) |
+| TA = functional 0xE400 | ACK from 0xE400, single frame on 0x7DF on **every** CAN bus (§4.3), and forwarded to every Ethernet ECU (§3.5) |
 | TA = ECU LA | ISO-TP to the ECU; ACK **after** ISO-TP delivered the request, NACK 0x08 on ISO-TP failure |
+| TA = Ethernet ECU LA (ADAS 0x1010) | DoIP-to-DoIP (§3.5); ACK **after** the ECU's DoIP entity acknowledged, its NACK passed on, NACK 0x06 if it cannot be reached |
 | Request longer than the ECU's `maxRequestLength` | NACK 0x04 too large |
 | ECU's ISO-TP channel still sending the previous request | NACK 0x08 |
 | Unknown TA | NACK 0x03 |
@@ -88,6 +90,47 @@ ECU are sent as diagnostic messages `SA = ECU`, `TA = tester` to the tester
 that last addressed this ECU. This includes several responses per request,
 e.g. NRC 0x78 *response pending* followed by the final answer. If that tester
 has disconnected, the response is dropped (`responsesDropped`).
+
+### 3.5 DoIP-to-DoIP routing (Ethernet ECUs)
+
+ECUs on the vehicle Ethernet that are DoIP entities themselves (the ADAS
+domain controller, 0x1010 at 192.168.10.20:13400) are reached through the
+gateway's DoIP client (`diag::DoipClient`, enabled with
+`DiagGateway::setEthernetRouting`).
+
+```
+tester 0x0E80          gateway 0x1001                          ADAS 0x1010
+  | 0x8001 0E80->1010 -->|                                          |
+  |                      |-- TCP connect, 0x0005 activation SA 0E80 ->|  (first request only)
+  |                      |<- 0x0006 code 0x10 -----------------------|
+  |                      |-- 0x8001 0E80->1010 ---------------------->|
+  |                      |<- 0x8002 ACK 1010->0E80 ------------------|
+  |<- 0x8002 ACK 1010 ---|                                           |
+  |                      |<- 0x8001 1010->0E80 (7F xx 78, final) ----|
+  |<- 0x8001 1010->0E80 -|                                           |
+```
+
+- **Source address passed through**: the gateway opens one connection per
+  tester and ECU and activates routing with the tester's own address. The ECU
+  sees who asks and applies its own access rules (for example, accepting only
+  in-vehicle testers). The key master uses a separate connection with
+  0x0F00.
+- **ACK semantics** as for CAN: the tester's ACK means the ECU has the request.
+  A NACK of the ECU is passed on with its code. If the TCP connection, the
+  routing activation or the ECU's ACK (A_DoIP_Ctrl 2 s) fails, the tester
+  gets NACK 0x06 *target unreachable*.
+- **Responses are transparent**: every diagnostic message of the ECU for that
+  tester goes back to it, including NRC 0x78, so the tester runs its own
+  P2/P2* timers. While a request still waits for the ECU's ACK, a further
+  request from the same tester gets NACK 0x08.
+- **Functional requests** (0xE400) are forwarded on each tester connection
+  to every Ethernet ECU with the functional target address. The gateway alone
+  acknowledges them, and the ECUs' responses come back with their own source
+  address.
+- **Lifetime**: the connections are kept between requests and answer the
+  ECU's alive checks. When the tester disconnects, its connections to the
+  Ethernet ECUs are closed. When the ECU closes an idle connection, the next
+  request reconnects.
 
 ## 4. ISO-TP (ISO 15765-2)
 
@@ -192,7 +235,8 @@ ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
   tester requests to the same ECU get NACK 0x08.
 - **DoIP client** (`diag::DoipClient`): reaches the ECUs on the vehicle
   Ethernet that are DoIP entities themselves (ADAS 0x1010 at
-  192.168.10.20:13400, `--doip ADAS=IP:PORT`). It connects over TCP and
+  192.168.10.20:13400, `--doip ADAS=IP:PORT`). It routes tester requests
+  (§3.5) and serves gateway functions. For the gateway's own requests it
   activates routing with source address 0x0F00 (in-vehicle test equipment).
   Each request is a diagnostic message followed by the ACK and the response.
   The client handles NACKs, NRC 0x78, alive checks and reconnects, and keeps
@@ -206,7 +250,7 @@ ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
   routing activation (codes 0x04, 0x05, 0x11 are never sent).
 - One outstanding physical request per ECU; a second one is refused with NACK
   0x08 rather than queued.
-- External testers are not routed to Ethernet ECUs (DoIP-to-DoIP); the DoIP
-  client serves gateway-internal functions (key master) only.
+- DoIP-to-DoIP routing uses plain TCP towards the Ethernet ECUs (no TLS) and
+  does not forward the tester's routing-activation OEM data or authentication.
 - No extended or mixed ISO-TP addressing, and no LIN diagnostics.
 - The UDS server of the gateway itself is minimal (session, tester present, three DIDs).

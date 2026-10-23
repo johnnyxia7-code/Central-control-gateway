@@ -38,6 +38,10 @@ public:
         return entities_[endpoint].foreign;
     }
     std::uint64_t bytesToEntities() const { return bytesToEntities_; }
+    // DoIP messages the gateway sent to the entity (header included).
+    const std::vector<std::vector<std::uint8_t>>& received(const std::string& endpoint) {
+        return entities_[endpoint].received;
+    }
 
 private:
     struct Port final : diag::IDiagTransport {
@@ -56,6 +60,7 @@ private:
         bool muted = false;
         std::map<diag::ConnectionId, diag::ConnectionId> clientOf;  // entity connection -> client id
         std::map<diag::ConnectionId, std::vector<std::vector<std::uint8_t>>> foreign;
+        std::vector<std::vector<std::uint8_t>> received;
     };
     struct Event {
         enum class Kind : std::uint8_t { Connect, ToEntity, ToClient, CloseByClient, CloseByEntity } kind;

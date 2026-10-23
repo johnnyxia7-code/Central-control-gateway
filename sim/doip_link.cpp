@@ -66,6 +66,7 @@ void DoipLink::pump(diag::TimePoint now) {
                 if (it == routes_.end()) break;
                 auto& e = entities_[it->second.first];
                 bytesToEntities_ += ev.data.size();
+                e.received.push_back(ev.data);
                 if (e.gateway && !e.muted) e.gateway->onTcpData(it->second.second, ev.data.data(), ev.data.size(), now);
                 break;
             }

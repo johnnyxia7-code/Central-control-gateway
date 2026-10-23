@@ -170,6 +170,7 @@ if(CCG_BUILD_TESTS)
     tests/test_key_manager.cpp
     tests/test_key_master.cpp
     tests/test_doip_client.cpp
+    tests/test_doip_routing.cpp
   )
   target_link_libraries(ccg_tests PRIVATE ccg_vehicle_matrix ccg_sim ccg_secoc)
   if(TARGET ccg_platform_linux)

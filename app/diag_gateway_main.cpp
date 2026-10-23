@@ -10,6 +10,8 @@
 // is also the in-vehicle key master: RoutineControl 31 01 F210 distributes new
 // SecOC keys to the ECUs (31 03 F210: results) - to CAN ECUs over ISO-TP and
 // to Ethernet ECUs (ADAS) as DoIP client (--doip overrides their endpoints).
+// Tester requests to the Ethernet ECUs are routed DoIP-to-DoIP through the
+// same client, with the tester's source address.
 #include <poll.h>
 
 #include <algorithm>
@@ -166,6 +168,7 @@ int main(int argc, char** argv) {
         platform::DoipTcpConnector doipConnector;
         diag::DoipClient doipClient(doipCfg, doipConnector);
         doipConnector.attach(doipClient);
+        gateway.setEthernetRouting(doipClient);  // tester -> ADAS (DoIP-to-DoIP)
         diag::DiagClientRouter diagClients;  // CAN ECUs first, then Ethernet ECUs
         diagClients.add(gateway);
         diagClients.add(doipClient);
