@@ -61,11 +61,15 @@ void DoipTcpConnector::enableTls(const TlsClientConfig& config) {
     SSL_CTX_set_cipher_list(ctx, "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:"
                                  "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384");
     SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    // The ECU must prove its identity: certificate from the vehicle CA, name checked per route.
+    // The ECU must prove its identity: certificate from the vehicle CA (not
+    // revoked), name checked per route.
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
-    if (SSL_CTX_load_verify_locations(ctx, config.caFile.c_str(), nullptr) != 1) {
+    auto checker = std::make_unique<RevocationChecker>(config.crl);
+    try {
+        SSL_CTX_set_cert_store(ctx, checker->build(config.caFile));
+    } catch (...) {
         SSL_CTX_free(ctx);
-        throw std::runtime_error(sslError("vehicle CA " + config.caFile));
+        throw;
     }
     if (!config.certificateFile.empty()) {
         if (SSL_CTX_use_certificate_chain_file(ctx, config.certificateFile.c_str()) != 1 ||
@@ -77,6 +81,8 @@ void DoipTcpConnector::enableTls(const TlsClientConfig& config) {
     }
     SSL_CTX_free(ctx_);
     ctx_ = ctx;
+    revocation_ = std::move(checker);
+    caFile_ = config.caFile;
 #else
     (void)config;
     throw std::runtime_error("built without OpenSSL: no DoIP over TLS");
@@ -159,10 +165,39 @@ void DoipTcpConnector::close(diag::ConnectionId id) {
     if (it->second.ssl) {
         if (it->second.established) SSL_shutdown(it->second.ssl);  // best effort close_notify
         SSL_free(it->second.ssl);
+        X509_free(it->second.peer);
     }
 #endif
     ::close(it->second.fd);
     sockets_.erase(it);
+}
+
+bool DoipTcpConnector::reloadCrl(diag::TimePoint now) {
+#ifdef CCG_HAVE_TLS
+    if (!ctx_ || !revocation_ || !revocation_->enabled()) return false;
+    X509_STORE* store = nullptr;
+    try {
+        store = revocation_->build(caFile_);
+    } catch (const std::exception&) {
+        return false;  // keep the CRLs in use
+    }
+    SSL_CTX_set_cert_store(ctx_, store);
+    std::vector<diag::ConnectionId> revoked;
+    for (const auto& [id, s] : sockets_) {
+        if (s.established && s.ssl && s.peer && !revocation_->stillValid(store, s.ssl, s.peer, false)) {
+            revoked.push_back(id);
+        }
+    }
+    for (const auto id : revoked) {
+        ++revocation_->statistics().sessionsClosed;
+        close(id);
+        if (client_) client_->onClosed(id, now);
+    }
+    return true;
+#else
+    (void)now;
+    return false;
+#endif
 }
 
 void DoipTcpConnector::fail(diag::ConnectionId id) {
@@ -195,6 +230,7 @@ void DoipTcpConnector::handshake(diag::ConnectionId id, Socket& s, diag::TimePoi
     }
     s.established = true;
     s.wantWrite = false;
+    s.peer = SSL_get1_peer_certificate(s.ssl);
     if (client_) client_->onConnected(id, now);
 #else
     (void)s;

@@ -40,7 +40,12 @@ std::string commonName(X509* cert) {
 
 DoipTlsServer::DoipTlsServer(std::uint16_t port, std::size_t maxConnections, const TlsServerConfig& config,
                              diag::ConnectionId firstId)
-    : maxConnections_(maxConnections), firstId_(firstId), nextId_(firstId), handshakeTimeout_(config.handshakeTimeout) {
+    : revocation_(config.crl),
+      caFile_(config.caFile),
+      maxConnections_(maxConnections),
+      firstId_(firstId),
+      nextId_(firstId),
+      handshakeTimeout_(config.handshakeTimeout) {
     ctx_ = SSL_CTX_new(TLS_server_method());
     if (!ctx_) throw std::runtime_error(sslError("TLS context"));
     try {
@@ -56,9 +61,7 @@ DoipTlsServer::DoipTlsServer(std::uint16_t port, std::size_t maxConnections, con
             throw std::runtime_error(sslError("TLS private key " + config.privateKeyFile));
         }
         if (!config.caFile.empty()) {
-            if (SSL_CTX_load_verify_locations(ctx_, config.caFile.c_str(), nullptr) != 1) {
-                throw std::runtime_error(sslError("TLS tester CA " + config.caFile));
-            }
+            SSL_CTX_set_cert_store(ctx_, revocation_.build(config.caFile));  // CAs + CRLs
             SSL_CTX_set_client_CA_list(ctx_, SSL_load_client_CA_file(config.caFile.c_str()));
             // A presented certificate must verify; without one the tester is
             // only unauthenticated (unless certificates are required).
@@ -67,6 +70,8 @@ DoipTlsServer::DoipTlsServer(std::uint16_t port, std::size_t maxConnections, con
                                nullptr);
         } else if (config.requireClientCertificate) {
             throw std::runtime_error("TLS: client certificates required but no tester CA given");
+        } else if (revocation_.enabled()) {
+            throw std::runtime_error("TLS: a CRL needs the tester CA");
         }
 
         listenFd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -147,7 +152,7 @@ void DoipTlsServer::accept(diag::TimePoint now) {
             continue;
         }
         SSL_set_accept_state(ssl);
-        sockets_[nextId_++] = Socket{fd, ssl, false, false, now + handshakeTimeout_};
+        sockets_[nextId_++] = Socket{fd, ssl, nullptr, false, false, now + handshakeTimeout_};
     }
 }
 
@@ -171,7 +176,7 @@ void DoipTlsServer::handshake(diag::ConnectionId id, Socket& s, diag::DiagGatewa
     if (X509* peer = SSL_get1_peer_certificate(s.ssl)) {
         security.clientAuthenticated = SSL_get_verify_result(s.ssl) == X509_V_OK;
         security.peer = commonName(peer);
-        X509_free(peer);
+        s.peer = peer;  // kept for re-checks after a CRL update
     }
     gateway.onTcpConnected(id, now, security);
     read(id, s, gateway, now);  // data may have arrived with the last handshake flight
@@ -216,11 +221,33 @@ bool DoipTlsServer::send(diag::ConnectionId id, const std::vector<std::uint8_t>&
 
 void DoipTlsServer::close(diag::ConnectionId id) { destroy(id); }
 
+bool DoipTlsServer::reloadCrl(diag::DiagGateway& gateway, diag::TimePoint now) {
+    if (!revocation_.enabled()) return false;
+    X509_STORE* store = nullptr;
+    try {
+        store = revocation_.build(caFile_);
+    } catch (const std::exception&) {
+        return false;  // keep the CRLs in use
+    }
+    SSL_CTX_set_cert_store(ctx_, store);  // new handshakes use the new CRLs
+    std::vector<diag::ConnectionId> revoked;
+    for (const auto& [id, s] : sockets_) {
+        if (s.established && s.peer && !revocation_.stillValid(store, s.ssl, s.peer, true)) revoked.push_back(id);
+    }
+    for (const auto id : revoked) {
+        ++revocation_.statistics().sessionsClosed;
+        destroy(id);
+        gateway.onTcpClosed(id, now);
+    }
+    return true;
+}
+
 void DoipTlsServer::destroy(diag::ConnectionId id) {
     const auto it = sockets_.find(id);
     if (it == sockets_.end()) return;
     if (it->second.established) SSL_shutdown(it->second.ssl);  // best effort close_notify
     SSL_free(it->second.ssl);
+    X509_free(it->second.peer);
     ::close(it->second.fd);
     sockets_.erase(it);
 }

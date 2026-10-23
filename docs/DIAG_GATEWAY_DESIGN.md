@@ -198,6 +198,37 @@ handshake (trusted or not, name, client certificate). The real handshake is
 tested with OpenSSL on loopback against the same `DoipTlsServer` that the
 gateway uses towards its testers.
 
+### 3.8 Certificate revocation (CRLs)
+
+Both TLS sides check revocation: tester certificates (`--tls-crl`) and ECU
+certificates (`--vehicle-crl`). A vehicle is often offline, so the gateway uses
+certificate revocation lists that the backend distributes with the PKI. It does
+not use OCSP (`platform::RevocationChecker`, used by `DoipTlsServer` and
+`DoipTcpConnector`).
+
+| Topic | Behaviour |
+|-------|-----------|
+| Coverage | every certificate in the peer's chain against the CRL of its issuer (OpenSSL checks the CRL's signature, issuer and validity) |
+| Revoked certificate | handshake fails, for testers and ECUs alike |
+| No CRL for an issuer | handshake fails; `--crl-optional` accepts it and counts it |
+| Outdated CRL (past nextUpdate) | **still used** and counted, so an offline vehicle does not lock out its workshop; `--crl-reject-expired` refuses it |
+| Updates | the process watches the CRL files (every 5 s) and loads a changed file into a new trust store. New handshakes use it at once |
+| Running sessions | after an update every established session is verified again. A tester or ECU whose certificate is now revoked is disconnected (the gateway sees `onTcpClosed`; the DoIP client sees the ECU connection close) |
+| Broken CRL file | the update is refused and the previous CRLs stay in force; at start-up the process does not start |
+
+Counters (`RevocationStatistics`) cover handshakes refused as revoked or
+without CRL, acceptances with an outdated or missing CRL, closed sessions and
+reloads. The process prints them after every reload.
+
+CRLs with the OpenSSL CLI (the backend PKI does this in production):
+
+```sh
+touch index.txt && echo 1000 > crlnumber
+printf '[ca]\ndefault_ca = CA\n[CA]\ndatabase = index.txt\ncrlnumber = crlnumber\ndefault_md = sha256\ndefault_crl_days = 30\n' > ca.cnf
+openssl ca -config ca.cnf -keyfile ca.key -cert ca.pem -revoke workshop-17.pem
+openssl ca -config ca.cnf -keyfile ca.key -cert ca.pem -gencrl -out testers.crl
+```
+
 ## 4. ISO-TP (ISO 15765-2)
 
 ### 4.1 Frames (normal addressing)
@@ -289,7 +320,8 @@ ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
                  [--tls-cert gw.pem --tls-key gw.key [--tls-ca testers.pem] \
                   [--tls-require-client-cert] [--tls-only] [--tls-port 3496]] \
                  [--vehicle-ca vehicle-ca.pem --vehicle-cert gw-vehicle.pem --vehicle-key gw-vehicle.key] \
-                 [--doip-plain]
+                 [--doip-plain] [--tls-crl testers.crl] [--vehicle-crl vehicle.crl] \
+                 [--crl-optional] [--crl-reject-expired]
 ```
 
 TLS needs OpenSSL 3 at build time (`CCG_HAVE_TLS`). Without it, the process
@@ -319,10 +351,10 @@ refuses the TLS options.
 
 ## 8. Limitations / next steps
 
-- TLS: certificate revocation (CRL/OCSP) is not checked, and the tester's
-  certificate grants one level ("verified"), with no roles from certificate
-  attributes. There is no confirmation step in routing activation (0x05 and
-  0x11 are never sent).
+- TLS: revocation uses full CRLs only (no OCSP, no OCSP stapling, no delta
+  CRLs). The tester's certificate grants one level ("verified"), with no roles
+  from certificate attributes. There is no confirmation step in routing
+  activation (0x05 and 0x11 are never sent).
 - One outstanding physical request per ECU; a second one is refused with NACK
   0x08 rather than queued.
 - DoIP-to-DoIP routing does not forward the tester's routing-activation OEM

@@ -9,9 +9,9 @@
 #include <vector>
 
 #include "ccg/diag/diag_gateway.hpp"
+#include "tls_revocation.hpp"
 
 typedef struct ssl_ctx_st SSL_CTX;
-typedef struct ssl_st SSL;
 
 // DoIP over TLS (ISO 13400-2:2019, TCP port 3496) for testers, with OpenSSL.
 //
@@ -21,6 +21,9 @@ typedef struct ssl_st SSL;
 //    gateway (central security activation, key management routines)
 //  - non-blocking handshakes and I/O for the process's poll() loop; the
 //    gateway sees a connection only once its handshake has completed
+//  - revocation: client certificates are checked against the tester CRLs
+//    (CrlPolicy); reloadCrl() takes a new CRL file and closes sessions whose
+//    certificate has been revoked meanwhile
 //
 // Connection IDs start at `firstId` so they never collide with the plain
 // TCP server's IDs.
@@ -32,6 +35,7 @@ struct TlsServerConfig {
     std::string caFile;           // tester CA (PEM); empty = no client certificates
     bool requireClientCertificate = false;  // handshake fails without a valid client certificate
     std::chrono::milliseconds handshakeTimeout{2000};
+    CrlPolicy crl;  // revocation of client certificates (needs caFile)
 };
 
 class DoipTlsServer {
@@ -58,10 +62,17 @@ public:
     std::size_t connections() const { return sockets_.size(); }
     std::uint64_t handshakeFailures() const { return handshakeFailures_; }
 
+    // Loads the CRL file again (e.g. after the backend replaced it) and closes
+    // established sessions whose client certificate is now revoked (reported
+    // with onTcpClosed). False: the file is unusable, the old CRLs stay.
+    bool reloadCrl(diag::DiagGateway& gateway, diag::TimePoint now);
+    const RevocationStatistics& revocation() const { return revocation_.statistics(); }
+
 private:
     struct Socket {
         int fd = -1;
         SSL* ssl = nullptr;
+        X509* peer = nullptr;  // verified client certificate, for re-checks
         bool established = false;
         bool wantWrite = false;  // handshake waits for POLLOUT
         diag::TimePoint deadline{};
@@ -72,6 +83,8 @@ private:
     void read(diag::ConnectionId id, Socket& s, diag::DiagGateway& gateway, diag::TimePoint now);
     void destroy(diag::ConnectionId id);
 
+    RevocationChecker revocation_;
+    std::string caFile_;
     SSL_CTX* ctx_ = nullptr;
     int listenFd_ = -1;
     std::size_t maxConnections_;

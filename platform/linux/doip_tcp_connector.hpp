@@ -4,13 +4,14 @@
 
 #include <deque>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "ccg/diag/doip_client.hpp"
+#include "tls_revocation.hpp"
 
 typedef struct ssl_ctx_st SSL_CTX;
-typedef struct ssl_st SSL;
 
 // TCP connections of the gateway's DoIP client to DoIP entities on the
 // vehicle Ethernet (non-blocking connect, for a poll() loop).
@@ -22,13 +23,16 @@ typedef struct ssl_st SSL;
 // connector then runs the TLS handshake after the TCP connect, verifies the
 // entity's certificate against the vehicle CA and its name against the
 // route's server name, and presents the gateway's vehicle certificate. The
-// client is told "connected" only once TLS is up.
+// client is told "connected" only once TLS is up. With a CRL policy the ECU
+// certificates are checked for revocation; reloadCrl() takes a new CRL file
+// and closes connections to ECUs whose certificate has been revoked.
 namespace ccg::platform {
 
 struct TlsClientConfig {
     std::string certificateFile;  // gateway's vehicle certificate (PEM)
     std::string privateKeyFile;
     std::string caFile;           // vehicle CA that signs the ECU certificates
+    CrlPolicy crl;                // revocation of ECU certificates
 };
 
 class DoipTcpConnector final : public diag::IDoipConnector {
@@ -40,9 +44,16 @@ public:
 
     void attach(diag::DoipClient& client) { client_ = &client; }
 
-    // Throws std::runtime_error (no OpenSSL in this build, bad files).
+    // Throws std::runtime_error (no OpenSSL in this build, bad files). Call
+    // before the first connection.
     void enableTls(const TlsClientConfig& config);
     bool tlsEnabled() const { return ctx_ != nullptr; }
+
+    // Loads the CRL file again and closes established TLS connections whose
+    // ECU certificate is now revoked (reported with onClosed). False: the
+    // file is unusable (old CRLs stay) or no CRL is configured.
+    bool reloadCrl(diag::TimePoint now);
+    const RevocationStatistics* revocation() const { return revocation_ ? &revocation_->statistics() : nullptr; }
 
     // diag::IDoipConnector; endpoint "a.b.c.d:port"
     void connect(diag::ConnectionId id, const diag::DoipTarget& target) override;
@@ -62,6 +73,7 @@ private:
         bool tcpConnected = false;
         bool established = false;  // plain: TCP up; TLS: handshake done
         SSL* ssl = nullptr;
+        X509* peer = nullptr;  // ECU certificate, for re-checks
         bool wantWrite = false;
     };
     void fail(diag::ConnectionId id);  // closes and reports onClosed at the end of process()
@@ -69,6 +81,8 @@ private:
     void read(diag::ConnectionId id, Socket& s, diag::TimePoint now);
 
     diag::DoipClient* client_ = nullptr;
+    std::unique_ptr<RevocationChecker> revocation_;
+    std::string caFile_;
     SSL_CTX* ctx_ = nullptr;
     std::map<diag::ConnectionId, Socket> sockets_;
     std::deque<diag::ConnectionId> failed_;

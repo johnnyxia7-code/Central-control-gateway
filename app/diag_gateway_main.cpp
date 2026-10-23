@@ -6,7 +6,8 @@
 //                    [--tls-cert gw.pem --tls-key gw.key [--tls-ca testers.pem]
 //                     [--tls-require-client-cert] [--tls-only] [--tls-port 3496]]
 //                    [--vehicle-ca vehicle-ca.pem --vehicle-cert gw-vehicle.pem --vehicle-key gw-vehicle.key]
-//                    [--doip-plain]
+//                    [--doip-plain] [--tls-crl testers.crl] [--vehicle-crl vehicle.crl]
+//                    [--crl-optional] [--crl-reject-expired]
 //
 // DoIP over TLS (ISO 13400-2:2019): testers connect to the TLS port; with
 // --tls-ca their client certificates are verified, and a verified tester may
@@ -16,6 +17,11 @@
 // certificate must come from the vehicle CA and carry the route's name; the
 // gateway presents its vehicle certificate. --doip-plain switches the
 // Ethernet routes to plain DoIP (bench only).
+// Certificate revocation: --tls-crl (tester certificates) and --vehicle-crl
+// (ECU certificates) are CRL files. They are reloaded when they change, and
+// sessions whose certificate has been revoked meanwhile are closed. Without a
+// CRL for an issuer the handshake fails (--crl-optional accepts it); an
+// outdated CRL is still used (--crl-reject-expired refuses it).
 //
 // With --key-store the gateway's own diagnostic address also serves the SecOC
 // key management routines (SHE key update, activation, key status); the file
@@ -47,6 +53,7 @@
 #endif
 #include "doip_tcp_connector.hpp"
 #include "key_store.hpp"
+#include "tls_revocation.hpp"
 #include "socketcan_transport.hpp"
 #include "system_random.hpp"
 #include "vehicle_diag_routing.hpp"
@@ -139,6 +146,9 @@ int main(int argc, char** argv) {
     std::uint16_t tlsPort = 3496;
     std::string vehicleCa, vehicleCert, vehicleKey;
     bool doipPlain = false;
+    std::string testerCrl, vehicleCrl;
+    bool crlOptional = false;
+    bool crlRejectExpired = false;
     try {
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -156,6 +166,14 @@ int main(int argc, char** argv) {
             }
             if (arg == "--doip-plain") {
                 doipPlain = true;
+                continue;
+            }
+            if (arg == "--crl-optional") {
+                crlOptional = true;
+                continue;
+            }
+            if (arg == "--crl-reject-expired") {
+                crlRejectExpired = true;
                 continue;
             }
             if (i + 1 >= argc) throw std::invalid_argument("missing value for " + arg);
@@ -176,6 +194,10 @@ int main(int argc, char** argv) {
                 tlsKey = value;
             } else if (arg == "--tls-ca") {
                 tlsCa = value;
+            } else if (arg == "--tls-crl") {
+                testerCrl = value;
+            } else if (arg == "--vehicle-crl") {
+                vehicleCrl = value;
             } else if (arg == "--vehicle-ca") {
                 vehicleCa = value;
             } else if (arg == "--vehicle-cert") {
@@ -196,6 +218,8 @@ int main(int argc, char** argv) {
         if (vehicleCert.empty() != vehicleKey.empty()) {
             throw std::invalid_argument("--vehicle-cert and --vehicle-key go together");
         }
+        if (!testerCrl.empty() && tlsCa.empty()) throw std::invalid_argument("--tls-crl needs --tls-ca");
+        if (!vehicleCrl.empty() && vehicleCa.empty()) throw std::invalid_argument("--vehicle-crl needs --vehicle-ca");
         if ((tlsOnly || tlsRequireClientCert || !tlsCa.empty()) && tlsCert.empty()) {
             throw std::invalid_argument("TLS options need --tls-cert and --tls-key");
         }
@@ -208,7 +232,7 @@ int main(int argc, char** argv) {
                      " [--key-store FILE [--demo-keys]] [--doip ECU=IP:PORT]"
                      " [--tls-cert PEM --tls-key PEM [--tls-ca PEM] [--tls-require-client-cert] [--tls-only]"
                      " [--tls-port 3496]] [--vehicle-ca PEM [--vehicle-cert PEM --vehicle-key PEM]]"
-                     " [--doip-plain]\n";
+                     " [--doip-plain] [--tls-crl PEM] [--vehicle-crl PEM] [--crl-optional] [--crl-reject-expired]\n";
         return EXIT_FAILURE;
     }
 
@@ -231,12 +255,14 @@ int main(int argc, char** argv) {
             tc.privateKeyFile = tlsKey;
             tc.caFile = tlsCa;
             tc.requireClientCertificate = tlsRequireClientCert;
+            tc.crl = platform::CrlPolicy{testerCrl, !crlOptional, !crlRejectExpired};
             tls = std::make_unique<platform::DoipTlsServer>(tlsPort, config.entity.maxTcpConnections, tc);
             transport.tls = tls.get();
             std::cout << "[diag] DoIP over TLS on TCP " << tlsPort
                       << (tlsCa.empty() ? "" : tlsRequireClientCert ? ", client certificate required"
                                                                     : ", client certificates verified")
-                      << (tlsOnly ? ", plain TCP refused for routing activation" : "") << "\n";
+                      << (tlsOnly ? ", plain TCP refused for routing activation" : "")
+                      << (testerCrl.empty() ? "" : ", revocation: " + testerCrl) << "\n";
         }
 #endif
 
@@ -275,7 +301,9 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("Ethernet ECUs use DoIP over TLS: --vehicle-ca (and --vehicle-cert/"
                                             "--vehicle-key), or --doip-plain on the bench");
             }
-            doipConnector.enableTls(platform::TlsClientConfig{vehicleCert, vehicleKey, vehicleCa});
+            doipConnector.enableTls(platform::TlsClientConfig{
+                vehicleCert, vehicleKey, vehicleCa, platform::CrlPolicy{vehicleCrl, !crlOptional, !crlRejectExpired}});
+            if (!vehicleCrl.empty()) std::cout << "[diag] ECU certificate revocation: " << vehicleCrl << "\n";
         }
         diag::DoipClient doipClient(doipCfg, doipConnector);
         doipConnector.attach(doipClient);
@@ -316,6 +344,9 @@ int main(int argc, char** argv) {
 
         auto nextTick = now + std::chrono::milliseconds(1);
         auto nextStats = now + std::chrono::seconds(10);
+        auto nextCrlCheck = now + std::chrono::seconds(5);
+        platform::FileWatcher testerCrlWatch(testerCrl);
+        platform::FileWatcher vehicleCrlWatch(vehicleCrl);
         std::vector<std::uint8_t> buffer;
         while (g_running) {
             std::vector<pollfd> fds = {{tcp.listenFd(), POLLIN, 0}, {udp.fd(), POLLIN, 0}};
@@ -390,6 +421,29 @@ int main(int argc, char** argv) {
             if (now >= nextStats) {
                 printStatistics(gateway.statistics());
                 nextStats = now + std::chrono::seconds(10);
+            }
+            // CRLs replaced by the backend: new handshakes use them, revoked sessions end.
+            if (now >= nextCrlCheck) {
+                nextCrlCheck = now + std::chrono::seconds(5);
+#ifdef CCG_HAVE_TLS
+                if (tls && !testerCrl.empty() && testerCrlWatch.changed()) {
+                    const bool ok = tls->reloadCrl(gateway, now);
+                    const auto& r = tls->revocation();
+                    std::cout << "[diag] tester CRL " << (ok ? "reloaded" : "unusable - previous CRL kept")
+                              << " (revoked sessions closed " << r.sessionsClosed << ", handshakes refused revoked/"
+                              << "no CRL " << r.revokedRejected << "/" << r.missingCrlRejected
+                              << ", accepted with outdated CRL " << r.expiredCrlAccepted << ")\n";
+                }
+#endif
+                if (!vehicleCrl.empty() && vehicleCrlWatch.changed()) {
+                    const bool ok = doipConnector.reloadCrl(now);
+                    std::cout << "[diag] vehicle CRL " << (ok ? "reloaded" : "unusable - previous CRL kept");
+                    if (const auto* r = doipConnector.revocation()) {
+                        std::cout << " (ECU connections closed " << r->sessionsClosed << ", refused revoked "
+                                  << r->revokedRejected << ")";
+                    }
+                    std::cout << "\n";
+                }
             }
         }
         printStatistics(gateway.statistics());

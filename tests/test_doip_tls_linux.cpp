@@ -87,6 +87,37 @@ Credential makeCredential(const std::string& name, const char* cn, const Credent
     return c;
 }
 
+// CRL of `ca` revoking the given serial numbers; `expired`: nextUpdate in the past.
+std::string makeCrl(const std::string& name, const Credential& ca, const std::vector<long>& revoked,
+                    bool expired = false) {
+    X509_CRL* crl = X509_CRL_new();
+    X509_CRL_set_version(crl, 1);  // v2
+    X509_CRL_set_issuer_name(crl, X509_get_subject_name(ca.cert));
+    ASN1_TIME* last = X509_gmtime_adj(nullptr, expired ? -2 * 86400 : -3600);
+    ASN1_TIME* next = X509_gmtime_adj(nullptr, expired ? -86400 : 7 * 86400);
+    X509_CRL_set1_lastUpdate(crl, last);
+    X509_CRL_set1_nextUpdate(crl, next);
+    for (const long serial : revoked) {
+        X509_REVOKED* r = X509_REVOKED_new();
+        ASN1_INTEGER* sn = ASN1_INTEGER_new();
+        ASN1_INTEGER_set(sn, serial);
+        X509_REVOKED_set_serialNumber(r, sn);
+        X509_REVOKED_set_revocationDate(r, last);
+        X509_CRL_add0_revoked(crl, r);
+        ASN1_INTEGER_free(sn);
+    }
+    X509_CRL_sort(crl);
+    X509_CRL_sign(crl, ca.key, EVP_sha256());
+    const std::string path = tempFile(name);
+    FILE* f = std::fopen(path.c_str(), "w");
+    PEM_write_X509_CRL(f, crl);
+    std::fclose(f);
+    ASN1_TIME_free(last);
+    ASN1_TIME_free(next);
+    X509_CRL_free(crl);
+    return path;
+}
+
 struct Pki {
     Credential ca = makeCredential("ca", "CCG Tester CA", nullptr, true, 1);
     Credential gateway = makeCredential("gw", "ccg-gateway", &ca, false, 2);
@@ -490,4 +521,158 @@ TEST_CASE("doip tls linux: ADAS refuses a gateway without vehicle certificate; n
         threw = true;
     }
     CHECK(threw);
+}
+
+// --------------------------------------------------------------- revocation (CRLs)
+
+namespace {
+
+struct TempFiles {
+    std::vector<std::string> paths;
+    std::string add(std::string p) {
+        paths.push_back(p);
+        return p;
+    }
+    ~TempFiles() {
+        for (const auto& p : paths) std::remove(p.c_str());
+    }
+};
+
+platform::TlsServerConfig withCrl(platform::TlsServerConfig c, const std::string& crl, bool require = true,
+                                  bool acceptExpired = true) {
+    c.crl = platform::CrlPolicy{crl, require, acceptExpired};
+    return c;
+}
+
+// Connects a tester; true if TLS came up and routing activation succeeded.
+bool testerGetsIn(Bench& bench, std::uint16_t port, const Pki& pki, const Credential& identity) {
+    Client client(port, pki, &identity);
+    const auto hs = handshake(bench, client);
+    if (hs != std::optional<bool>(true)) return false;
+    const auto ra = exchange(bench, client, pt::kRoutingActivationRequest, kDefaultActivation,
+                             pt::kRoutingActivationResponse);
+    return ra && ra->at(4) == 0x10;
+}
+
+}  // namespace
+
+TEST_CASE("doip tls linux: a revoked tester certificate is refused, others are not") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    const auto crl = files.add(makeCrl("crl_tester", pki.ca, {3}));  // serial 3: backend-keyserver
+    Bench bench(31520, withCrl(serverConfig(pki, false), crl));
+    CHECK(!testerGetsIn(bench, 31520, pki, pki.tester));
+    CHECK_EQ(bench.server.revocation().revokedRejected, 1u);
+    CHECK_EQ(bench.gw.statistics().tcpConnectionsAccepted, 0u);
+    CHECK(testerGetsIn(bench, 31520, pki, pki.gateway));  // serial 2, not revoked
+    CHECK_EQ(bench.gw.statistics().authenticatedConnections, 1u);
+}
+
+TEST_CASE("doip tls linux: CRL policy for missing and outdated CRLs") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    const auto foreign = files.add(makeCrl("crl_foreign", pki.rogueCa, {}));  // no CRL of our CA
+    const auto expired = files.add(makeCrl("crl_expired", pki.ca, {}, true));
+    {
+        Bench bench(31521, withCrl(serverConfig(pki, false), foreign));
+        CHECK(!testerGetsIn(bench, 31521, pki, pki.tester));
+        CHECK(bench.server.revocation().missingCrlRejected >= 1u);
+    }
+    {
+        Bench bench(31522, withCrl(serverConfig(pki, false), foreign, false));  // --crl-optional
+        CHECK(testerGetsIn(bench, 31522, pki, pki.tester));
+        CHECK(bench.server.revocation().missingCrlAccepted >= 1u);
+    }
+    {
+        Bench bench(31523, withCrl(serverConfig(pki, false), expired));  // offline vehicle: outdated CRL used
+        CHECK(testerGetsIn(bench, 31523, pki, pki.tester));
+        CHECK(bench.server.revocation().expiredCrlAccepted >= 1u);
+    }
+    {
+        Bench bench(31524, withCrl(serverConfig(pki, false), expired, true, false));  // --crl-reject-expired
+        CHECK(!testerGetsIn(bench, 31524, pki, pki.tester));
+        CHECK(bench.server.revocation().expiredCrlRejected >= 1u);
+    }
+    bool threw = false;
+    try {
+        Bench bench(31525, withCrl(serverConfig(pki, false), "/nonexistent/crl.pem"));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST_CASE("doip tls linux: a CRL update closes the session of a revoked tester") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    const auto crl = files.add(makeCrl("crl_update", pki.ca, {}));
+    Bench bench(31526, withCrl(serverConfig(pki, false), crl));
+    Client client(31526, pki, &pki.tester);
+    REQUIRE(handshake(bench, client) == std::optional<bool>(true));
+    const auto ra = exchange(bench, client, pt::kRoutingActivationRequest, kCentralSecurity,
+                             pt::kRoutingActivationResponse);
+    REQUIRE(ra.has_value());
+    REQUIRE(ra->at(4) == 0x10);
+    CHECK_EQ(bench.gw.openConnections(), 1u);
+
+    // The backend revokes the tester's certificate and distributes a new CRL.
+    makeCrl("crl_update", pki.ca, {3});
+    CHECK(bench.server.reloadCrl(bench.gw, diag::Clock::now()));
+    CHECK_EQ(bench.server.revocation().sessionsClosed, 1u);
+    CHECK_EQ(bench.server.connections(), 0u);
+    CHECK_EQ(bench.gw.openConnections(), 0u);
+    bool open = true;
+    for (int i = 0; i < 50 && open; ++i) {
+        bench.step();
+        open = client.poll();
+    }
+    CHECK(!open);  // the tester sees its connection end
+    CHECK(!testerGetsIn(bench, 31526, pki, pki.tester));  // and cannot come back
+
+    // A broken CRL file is not taken; the previous CRLs stay in force.
+    {
+        FILE* f = std::fopen(crl.c_str(), "w");
+        std::fputs("-----BEGIN X509 CRL-----\nnot a crl\n-----END X509 CRL-----\n", f);
+        std::fclose(f);
+    }
+    CHECK(!bench.server.reloadCrl(bench.gw, diag::Clock::now()));
+    CHECK(!testerGetsIn(bench, 31526, pki, pki.tester));
+    CHECK(testerGetsIn(bench, 31526, pki, pki.gateway));
+}
+
+TEST_CASE("doip tls linux: a revoked ADAS certificate is refused; a CRL update ends the connection") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    {
+        const auto crl = files.add(makeCrl("crl_vehicle_revoked", pki.ca, {6}));  // serial 6: adas-dc
+        AdasOverTls v(31527, adasServer(pki.adas, pki));
+        auto cfg = gatewayClient(pki);
+        cfg.crl = platform::CrlPolicy{crl, true, true};
+        v.connector.enableTls(cfg);
+        const auto r = v.request({0x3E, 0x00});
+        REQUIRE(r.has_value());
+        CHECK(r->first == diag::ClientResult::TransportError);
+        REQUIRE(v.connector.revocation() != nullptr);
+        CHECK_EQ(v.connector.revocation()->revokedRejected, 1u);
+        CHECK_EQ(v.adas.entity().statistics().tcpConnectionsAccepted, 0u);
+    }
+    {
+        const auto crl = files.add(makeCrl("crl_vehicle", pki.ca, {}));
+        AdasOverTls v(31528, adasServer(pki.adas, pki));
+        auto cfg = gatewayClient(pki);
+        cfg.crl = platform::CrlPolicy{crl, true, true};
+        v.connector.enableTls(cfg);
+        CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::Ok);
+        CHECK(v.client.routingActive(dg::kAdas));
+
+        makeCrl("crl_vehicle", pki.ca, {6});  // ADAS certificate revoked
+        CHECK(v.connector.reloadCrl(diag::Clock::now()));
+        CHECK_EQ(v.connector.revocation()->sessionsClosed, 1u);
+        CHECK(!v.client.routingActive(dg::kAdas));
+        CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::TransportError);  // no reconnect possible
+    }
 }
