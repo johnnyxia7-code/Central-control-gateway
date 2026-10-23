@@ -494,6 +494,14 @@ std::optional<std::vector<std::uint8_t>> DiagGateway::localService(
         return std::vector<std::uint8_t>{0x7F, sid, nrc};
     };
 
+    for (auto* handler : localHandlers_) {
+        auto response = handler->handle(request, LocalRequestContext{localSession_, functional, now});
+        if (!response) continue;
+        if (response->empty()) return std::nullopt;
+        if (response->size() == 3 && (*response)[0] == 0x7F) return negative((*response)[2]);
+        return response;
+    }
+
     switch (sid) {
         case 0x10: {  // DiagnosticSessionControl
             if (request.size() != 2) return negative(0x13);

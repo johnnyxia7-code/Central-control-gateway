@@ -4,7 +4,11 @@
 //   ccg_eth_gateway --bind PT_CAN=can0 --bind CHS_CAN=can1 --bind BODY_CAN=can2
 //                   --bind ETH_ADAS=udp:30500:192.168.10.20:30500
 //                   --bind ETH_IVI=udp:30501:192.168.10.30:30501
-//                   --keys /etc/ccg/secoc.keys --fv-store /var/lib/ccg/freshness
+//                   --key-store /var/lib/ccg/keys --fv-store /var/lib/ccg/freshness
+//
+// SecOC keys: --key-store follows the key store of the key manager (written by
+// ccg_diag_gateway on key updates; reloaded when it changes, rollover with
+// grace period). --keys loads a static key file, --demo-keys the test keys.
 #include <poll.h>
 
 #include <atomic>
@@ -18,10 +22,13 @@
 #include <vector>
 
 #include "ccg/ethgw/ethernet_gateway.hpp"
+#include "ccg/keym/key_manager.hpp"
+#include "key_store.hpp"
 #include "socketcan_transport.hpp"
 #include "secoc_storage.hpp"
 #include "udp_socket.hpp"
 #include "vehicle_eth_gateway_matrix.hpp"
+#include "vehicle_key_slots.hpp"
 
 namespace {
 
@@ -84,6 +91,7 @@ int main(int argc, char** argv) {
     int periodMs = 1;
     std::string keyFile;
     std::string fvStore;
+    std::string keyStore;
     bool demoKeys = false;
     try {
         for (int i = 1; i < argc; ++i) {
@@ -92,7 +100,8 @@ int main(int argc, char** argv) {
                 demoKeys = true;
                 continue;
             }
-            if ((arg == "--bind" || arg == "--period-ms" || arg == "--keys" || arg == "--fv-store") &&
+            if ((arg == "--bind" || arg == "--period-ms" || arg == "--keys" || arg == "--fv-store" ||
+                 arg == "--key-store") &&
                 i + 1 < argc) {
                 const std::string value = argv[++i];
                 if (arg == "--period-ms") {
@@ -107,6 +116,10 @@ int main(int argc, char** argv) {
                     fvStore = value;
                     continue;
                 }
+                if (arg == "--key-store") {
+                    keyStore = value;
+                    continue;
+                }
                 const auto eq = value.find('=');
                 if (eq == std::string::npos) throw std::invalid_argument("expected NAME=TARGET");
                 bindings[value.substr(0, eq)] = value.substr(eq + 1);
@@ -115,10 +128,13 @@ int main(int argc, char** argv) {
             }
         }
         if (periodMs <= 0) throw std::invalid_argument("--period-ms must be > 0");
+        if (!keyStore.empty() && (demoKeys || !keyFile.empty())) {
+            throw std::invalid_argument("--key-store excludes --keys and --demo-keys");
+        }
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\nusage: " << argv[0]
                   << " --bind CHANNEL=IFACE | --bind CHANNEL=udp:LPORT:IP:RPORT ... "
-                     "(--keys FILE | --demo-keys) [--fv-store FILE] [--period-ms N]\n";
+                     "(--key-store FILE | --keys FILE | --demo-keys) [--fv-store FILE] [--period-ms N]\n";
         return EXIT_FAILURE;
     }
 
@@ -164,6 +180,18 @@ int main(int argc, char** argv) {
 
         // SecOC keys (HSM on the target) and persisted freshness counters.
         secoc::SoftwareCryptoService crypto;
+        keym::KeyManager keyManager(config::makeVehicleKeySlots());
+        std::unique_ptr<platform::FileWatcher> keyWatcher;
+        auto reloadKeys = [&](ethgw::TimePoint t) {
+            const auto snapshot = platform::loadKeyStore(keyStore);
+            if (!snapshot) throw std::runtime_error("key store " + keyStore + " missing");
+            keyManager.restore(*snapshot, t);
+            std::cout << "[ethgw] key store " << keyStore << " (re)loaded: " << snapshot->keys.size() << " keys\n";
+        };
+        if (!keyStore.empty()) {
+            keyWatcher = std::make_unique<platform::FileWatcher>(keyStore);
+            reloadKeys(ethgw::Clock::now());
+        }
         if (!keyFile.empty()) {
             std::cout << "[ethgw] " << platform::loadKeyFile(keyFile, crypto) << " SecOC key(s) loaded\n";
         }
@@ -171,7 +199,9 @@ int main(int argc, char** argv) {
             std::cout << "[ethgw] WARNING: built-in SecOC TEST KEYS in use - bench only\n";
             config::provisionDemoSecOcKeys(crypto);
         }
-        ethgw::EthernetGateway gateway(std::move(config), transmitter, &crypto);
+        secoc::ICryptoService* cryptoService = keyStore.empty() ? static_cast<secoc::ICryptoService*>(&crypto)
+                                                                : &keyManager;
+        ethgw::EthernetGateway gateway(std::move(config), transmitter, cryptoService);
         constexpr std::uint64_t kFreshnessMargin = 10000;  // > Tx PDUs between two saves
         if (!fvStore.empty()) {
             if (const auto snapshot = platform::loadFreshness(fvStore)) {
@@ -199,6 +229,7 @@ int main(int argc, char** argv) {
         persistTripCounter();
         auto nextTick = now + period;
         auto nextStats = now + std::chrono::seconds(10);
+        auto nextKeyCheck = now + std::chrono::seconds(1);
         std::vector<std::uint8_t> datagram;
 
         while (g_running) {
@@ -223,6 +254,19 @@ int main(int argc, char** argv) {
                 }
             }
             if (now >= nextTick) {
+                if (keyWatcher) {
+                    keyManager.mainFunction(now);
+                    if (now >= nextKeyCheck) {
+                        nextKeyCheck = now + std::chrono::seconds(1);
+                        if (keyWatcher->changed()) {
+                            try {
+                                reloadKeys(now);  // keys updated / activated over UDS
+                            } catch (const std::exception& e) {
+                                std::cerr << "[ethgw] keeping current keys: " << e.what() << "\n";
+                            }
+                        }
+                    }
+                }
                 gateway.mainFunction(now);
                 persistTripCounter();  // reset counter overflow starts a new trip
                 nextTick += period;
@@ -230,6 +274,9 @@ int main(int argc, char** argv) {
             }
             if (now >= nextStats) {
                 printStatistics(gateway.statistics());
+                if (keyWatcher) {
+                    std::cout << "[ethgw] keym rollover verifications=" << keyManager.rolloverVerifications() << "\n";
+                }
                 if (!fvStore.empty()) platform::saveFreshness(fvStore, gateway.freshness().snapshot());
                 nextStats = now + std::chrono::seconds(10);
             }

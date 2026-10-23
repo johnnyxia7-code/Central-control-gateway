@@ -1,6 +1,6 @@
 # Central Control Gateway – HPC
 
-Gateway functions for a vehicle HPC (high performance computer): signal-to-service, Ethernet routing with SecOC, and diagnostic routing.
+Gateway functions for a vehicle HPC (high performance computer): signal-to-service, Ethernet routing with SecOC and key management, and diagnostic routing.
 
 ## Signal-to-Service (S2S)
 
@@ -51,6 +51,18 @@ Authenticity, integrity and replay protection for security-relevant PDUs routed 
 
 Design: [docs/SECOC_DESIGN.md](docs/SECOC_DESIGN.md)
 
+## SecOC key management
+
+Key slots of the gateway HSM and their renewal from the backend.
+
+- **SHE memory update protocol**: keys arrive encrypted and authenticated (M1–M3, authorised by MASTER_ECU_KEY) and are confirmed with M4/M5; verified against the SHE specification example
+- **Protection**: anti-rollback update counter per key, UID binding (wildcard only if allowed), write protection, MAC-only key usage, lockout after repeated authentication failures
+- **Rollover without communication loss**: new keys are staged until the backend activates them; the previous key is still accepted for verification during a grace period, the pending key already verifies MACs of ECUs that switched early
+- **UDS on DoIP** (gateway address 0x1001): RoutineControl F200 load key, F201 activate, F202 discard; DID F2A0 key status; the key store is persisted before M4/M5 are returned
+- Security events for the IdsM; backend tool `ccg_key_tool` builds M1–M3 and checks M4/M5
+
+Design: [docs/KEY_MANAGEMENT_DESIGN.md](docs/KEY_MANAGEMENT_DESIGN.md)
+
 All functions check their configuration at start-up and come with a Linux
 process and a deterministic virtual-time simulator.
 
@@ -72,6 +84,7 @@ Bench simulations (no hardware, print the traffic the gateway produces):
 ./build/ccg_s2s_sim
 ./build/ccg_eth_gw_sim
 ./build/ccg_diag_sim
+./build/ccg_keym_sim
 ```
 
 On a Linux HPC / bench PC with (virtual) CAN interfaces:
@@ -82,18 +95,22 @@ sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
 
 ./build/ccg_eth_gateway --bind PT_CAN=can0 --bind CHS_CAN=can1 --bind BODY_CAN=can2 \
     --bind ETH_ADAS=udp:30500:192.168.10.20:30500 --bind ETH_IVI=udp:30501:192.168.10.30:30501 \
-    --keys secoc.keys --fv-store freshness.dat      # or --demo-keys on the bench
+    --key-store keys.dat --fv-store freshness.dat   # or --keys FILE / --demo-keys
 
-./build/ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2   # DoIP on TCP/UDP 13400
+./build/ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
+    --key-store keys.dat --demo-keys                # DoIP on TCP/UDP 13400, key update routines
+
+./build/ccg_key_tool --uid 000000000000004343470000000001 --slot 6 --auth-slot 1 \
+    --auth-key <MASTER_ECU_KEY> --key <new key> --counter 2      # backend: M1..M3, expected M4/M5
 ```
 
 ## Layout
 
 ```
-include/ccg/   public headers (can, e2e, someip, s2s, ethgw, isotp, doip, diag, crypto, secoc)
-src/           portable core libraries (ccg_s2s, ccg_ethgw, ccg_diag, ccg_secoc)
-config/        reference S2S matrix, Ethernet routing table, diagnostic routing table
-platform/linux SocketCAN, UDP, SOME/IP-over-UDP and DoIP sockets, SecOC key file / freshness store
+include/ccg/   public headers (can, e2e, someip, s2s, ethgw, isotp, doip, diag, crypto, secoc, keym)
+src/           portable core libraries (ccg_s2s, ccg_ethgw, ccg_diag, ccg_secoc, ccg_keym)
+config/        reference S2S matrix, Ethernet routing table, diagnostic routing table, key slots
+platform/linux SocketCAN, UDP, SOME/IP-over-UDP and DoIP sockets, SecOC key file / key store / freshness store
 sim/           simulated UDS ECU for tests and the diagnostic simulator
 app/           gateway processes and simulators
 tests/         unit and integration tests

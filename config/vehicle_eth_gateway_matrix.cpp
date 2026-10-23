@@ -307,13 +307,15 @@ RoutingConfig makeVehicleEthGatewayMatrix() {
     return cfg;
 }
 
-void provisionDemoSecOcKeys(secoc::SoftwareCryptoService& crypto) {
+crypto::Block demoKey(std::uint8_t seed) {
     // Deterministic test keys - not for production use.
-    auto key = [](std::uint8_t seed) {
-        crypto::Block k{};
-        for (std::size_t i = 0; i < k.size(); ++i) k[i] = static_cast<std::uint8_t>(seed * 31 + i * 7);
-        return k;
-    };
+    crypto::Block k{};
+    for (std::size_t i = 0; i < k.size(); ++i) k[i] = static_cast<std::uint8_t>(seed * 31 + i * 7);
+    return k;
+}
+
+void provisionDemoSecOcKeys(secoc::SoftwareCryptoService& crypto) {
+    const auto key = demoKey;
     crypto.setKey("K_ADAS_GW", key(1));
     crypto.setKey("K_GW_ADAS", key(2));
     crypto.setKey("K_VCU_GW", key(3));

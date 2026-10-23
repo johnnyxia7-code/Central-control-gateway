@@ -58,6 +58,24 @@ struct DiagStatistics {
     std::uint64_t isotpRxErrors = 0;
 };
 
+// Request to the gateway's own UDS server, as seen by a local service handler.
+struct LocalRequestContext {
+    std::uint8_t session = 0x01;  // active diagnostic session of the gateway
+    bool functional = false;      // functional (0xE400) or physical request
+    TimePoint now{};
+};
+
+// Additional UDS services of the gateway's own diagnostic server (e.g. key
+// management). Handlers are asked before the built-in services.
+class ILocalServiceHandler {
+public:
+    virtual ~ILocalServiceHandler() = default;
+    // nullopt: not handled here. Otherwise the response: positive, negative
+    // (7F SID NRC) or empty for "no response" (suppressPosRspMsgIndicationBit).
+    virtual std::optional<std::vector<std::uint8_t>> handle(const std::vector<std::uint8_t>& request,
+                                                            const LocalRequestContext& context) = 0;
+};
+
 class DiagConfigError : public std::runtime_error {
 public:
     explicit DiagConfigError(std::vector<std::string> errors);
@@ -87,6 +105,9 @@ public:
                        TimePoint now);
     void onCanFrame(std::size_t channel, const can::CanFrame& frame, TimePoint now);
     void mainFunction(TimePoint now);
+
+    // The handler must outlive the gateway.
+    void addLocalService(ILocalServiceHandler& handler) { localHandlers_.push_back(&handler); }
 
     std::optional<std::size_t> channelIndex(const std::string& name) const;
     bool isRoutingActive(ConnectionId connection) const;
@@ -170,6 +191,7 @@ private:
 
     std::uint8_t announcementsLeft_ = 0;
     TimePoint nextAnnouncement_{};
+    std::vector<ILocalServiceHandler*> localHandlers_;
     std::uint8_t localSession_ = 0x01;
     TimePoint localSessionActivity_{};
 };

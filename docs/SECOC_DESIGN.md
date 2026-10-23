@@ -212,16 +212,19 @@ when the gateway is not a party to the key.
 ## 6. Crypto service
 
 `secoc::ICryptoService` corresponds to the AUTOSAR Csm and works with key slots
-(`hasKey`, `generateMac`):
+(`hasKey`, `generateMac`, `verifyMac`). SecOC and the FV sync slave verify with
+`verifyMac` (Csm_MacVerify), so a key manager can accept more than one key
+generation during a key rollover.
 
 | Implementation | Use | Key source |
 |----------------|-----|------------|
 | HSM driver (target) | series vehicles | keys provisioned at end of line or by OTA key management; they never leave the HSM |
+| `keym::KeyManager` | gateway key management | SHE key slots updated over UDS, rollover with grace period, see [KEY_MANAGEMENT_DESIGN.md](KEY_MANAGEMENT_DESIGN.md); `--key-store FILE` |
 | `SoftwareCryptoService` | bench, simulation, tests | `--keys FILE` (`KEY_ID=<32 hex digits>` per line) or `--demo-keys` (built-in **test keys**, bench only) |
 
 The software AES-128 / CMAC (`ccg/crypto/aes_cmac.hpp`) has no dependencies and
 is verified against:
-- FIPS-197 and SP 800-38A AES known answers,
+- FIPS-197 and SP 800-38A AES known answers (encryption and decryption),
 - RFC 4493 CMAC examples 1–4 (including the subkeys),
 - OpenSSL 3 for 201 random keys and messages (test-only, built when OpenSSL is found).
 
@@ -251,8 +254,9 @@ ccg_eth_gw_sim     # genuine stream, tampered request, replay, timeout -> safe s
   neither are secondary FV masters or FV master redundancy.
 - No secured I-PDU header (dynamic length) and no secured container PDUs. The
   authentic part has a fixed length.
-- No key management. Key update (e.g. via UDS 0x31/0x2E into the HSM) and key
-  validity periods are out of scope.
+- Key management (SHE key update over UDS, rollover) is described in
+  [KEY_MANAGEMENT_DESIGN.md](KEY_MANAGEMENT_DESIGN.md); key validity periods
+  and in-vehicle key distribution are not implemented.
 - SecOC is integrated in the Ethernet gateway. The S2S and diagnostic paths do
   not use it; diagnostics are protected by UDS SecurityAccess/Authentication
   in the ECUs.

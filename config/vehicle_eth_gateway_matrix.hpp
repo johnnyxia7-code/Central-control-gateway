@@ -17,6 +17,9 @@ ethgw::RoutingConfig makeVehicleEthGatewayMatrix();
 // provisioned into the HSM and never leave it.
 void provisionDemoSecOcKeys(secoc::SoftwareCryptoService& crypto);
 
+// Deterministic demo key number `seed` (K_ADAS_GW = 1 .. K_FV_MASTER = 5).
+crypto::Block demoKey(std::uint8_t seed);
+
 namespace gw {
 // channel indices (order in RoutingConfig::channels)
 inline constexpr std::size_t kPtCan = 0;

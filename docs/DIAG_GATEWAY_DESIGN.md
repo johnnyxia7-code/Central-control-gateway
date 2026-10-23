@@ -140,7 +140,11 @@ the requesting tester, and the gateway's own answer is added too.
 | 0x10 DiagnosticSessionControl 01/03 | `50 xx 00 32 01 F4` (P2 50 ms, P2* 5 s), suppress bit honoured |
 | 0x3E TesterPresent 00 | `7E 00`, suppress bit honoured |
 | 0x22 ReadDataByIdentifier | F190 VIN, F186 active session, F18C serial number; NRC 0x31 otherwise |
+| 0x31 RoutineControl F200/F201/F202, 0x22 F2A0 | SecOC key management (with `--key-store`), see [KEY_MANAGEMENT_DESIGN.md](KEY_MANAGEMENT_DESIGN.md) |
 | others | NRC 0x11 |
+
+Further services plug in as `diag::ILocalServiceHandler` (`DiagGateway::addLocalService`);
+handlers are asked before the built-in services.
 
 On functional requests, NRCs 0x11/0x12/0x31/0x7E/0x7F are suppressed (ISO 14229-1).
 The session falls back to the default session after S3 = 5 s without a request.

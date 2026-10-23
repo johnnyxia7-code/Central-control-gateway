@@ -63,6 +63,14 @@ const char* toString(VerifyResult result) {
 
 // --- crypto service -----------------------------------------------------------
 
+std::optional<bool> ICryptoService::verifyMac(const std::string& keyId, const std::uint8_t* data,
+                                              std::size_t length, const std::uint8_t* mac,
+                                              std::size_t macBits) {
+    crypto::Block expected;
+    if (!generateMac(keyId, data, length, expected)) return std::nullopt;
+    return crypto::equalBits(expected.data(), mac, macBits);
+}
+
 void SoftwareCryptoService::setKey(const std::string& keyId, const crypto::Block& key) {
     keys_.erase(keyId);
     keys_.emplace(keyId, crypto::Cmac(key));
@@ -196,8 +204,9 @@ std::size_t SecOcProcessor::completeFreshnessBits(const SecOcConfig& c) const {
     return c.freshnessMode == FreshnessMode::TripReset ? freshness_.layout().totalBits() : c.freshnessBits;
 }
 
-bool SecOcProcessor::authenticator(const SecOcConfig& c, const std::uint8_t* authentic,
-                                   std::size_t length, std::uint64_t fv, crypto::Block& mac) {
+std::vector<std::uint8_t> SecOcProcessor::dataToAuthenticator(const SecOcConfig& c,
+                                                              const std::uint8_t* authentic,
+                                                              std::size_t length, std::uint64_t fv) const {
     std::vector<std::uint8_t> dta;
     const std::size_t fvBytes = (completeFreshnessBits(c) + 7u) / 8u;
     dta.reserve(2 + length + fvBytes);
@@ -207,7 +216,7 @@ bool SecOcProcessor::authenticator(const SecOcConfig& c, const std::uint8_t* aut
     for (std::size_t i = fvBytes; i > 0; --i) {
         dta.push_back(static_cast<std::uint8_t>(fv >> (8 * (i - 1))));
     }
-    return crypto_.generateMac(c.keyId, dta.data(), dta.size(), mac);
+    return dta;
 }
 
 std::optional<std::vector<std::uint8_t>> SecOcProcessor::protect(const SecOcConfig& c,
@@ -227,7 +236,8 @@ std::optional<std::vector<std::uint8_t>> SecOcProcessor::protect(const SecOcConf
         truncated = *fv;  // LSBs are taken below
     }
     crypto::Block mac;
-    if (!authenticator(c, authentic, length, complete, mac)) {
+    const auto dta = dataToAuthenticator(c, authentic, length, complete);
+    if (!crypto_.generateMac(c.keyId, dta.data(), dta.size(), mac)) {
         return std::nullopt;
     }
     std::vector<std::uint8_t> out(authentic, authentic + length);
@@ -240,12 +250,13 @@ std::optional<std::vector<std::uint8_t>> SecOcProcessor::protect(const SecOcConf
 
 bool SecOcProcessor::matches(const SecOcConfig& c, const std::uint8_t* authentic, std::size_t length,
                              std::uint64_t fv, const crypto::Block& receivedMac, VerifyResult& error) {
-    crypto::Block mac;
-    if (!authenticator(c, authentic, length, fv, mac)) {
+    const auto dta = dataToAuthenticator(c, authentic, length, fv);
+    const auto ok = crypto_.verifyMac(c.keyId, dta.data(), dta.size(), receivedMac.data(), c.macTxBits);
+    if (!ok) {
         error = VerifyResult::CryptoError;
         return false;
     }
-    return crypto::equalBits(mac.data(), receivedMac.data(), c.macTxBits);
+    return *ok;
 }
 
 VerifyResult SecOcProcessor::verify(const SecOcConfig& c, const std::uint8_t* secured,

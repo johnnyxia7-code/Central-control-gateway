@@ -63,14 +63,25 @@ add_library(ccg_secoc
 target_include_directories(ccg_secoc PUBLIC include)
 ccg_warnings(ccg_secoc)
 
+# --- SecOC key management: SHE key update protocol, key slots, rollover -------
+add_library(ccg_keym
+  src/keym/she.cpp
+  src/keym/key_manager.cpp
+  src/keym/key_management_service.cpp
+)
+target_include_directories(ccg_keym PUBLIC include)
+target_link_libraries(ccg_keym PUBLIC ccg_secoc ccg_diag)
+ccg_warnings(ccg_keym)
+
 # --- reference vehicle matrices ----------------------------------------------
 add_library(ccg_vehicle_matrix
   config/vehicle_s2s_matrix.cpp
   config/vehicle_eth_gateway_matrix.cpp
   config/vehicle_diag_routing.cpp
+  config/vehicle_key_slots.cpp
 )
 target_include_directories(ccg_vehicle_matrix PUBLIC config)
-target_link_libraries(ccg_vehicle_matrix PUBLIC ccg_s2s ccg_ethgw ccg_diag)
+target_link_libraries(ccg_vehicle_matrix PUBLIC ccg_s2s ccg_ethgw ccg_diag ccg_keym)
 ccg_warnings(ccg_vehicle_matrix)
 
 # --- simulated ECUs for tests and bench simulations --------------------------
@@ -92,6 +103,15 @@ add_executable(ccg_diag_sim app/diag_sim_main.cpp)
 target_link_libraries(ccg_diag_sim PRIVATE ccg_vehicle_matrix ccg_sim)
 ccg_warnings(ccg_diag_sim)
 
+add_executable(ccg_keym_sim app/keym_sim_main.cpp)
+target_link_libraries(ccg_keym_sim PRIVATE ccg_vehicle_matrix)
+ccg_warnings(ccg_keym_sim)
+
+# --- backend key server tool (builds SHE M1..M3, checks M4/M5) ---------------
+add_executable(ccg_key_tool app/key_tool_main.cpp)
+target_link_libraries(ccg_key_tool PRIVATE ccg_keym)
+ccg_warnings(ccg_key_tool)
+
 # --- Linux gateway process (SocketCAN + SOME/IP over UDP) --------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_library(ccg_platform_linux
@@ -100,9 +120,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     platform/linux/udp_socket.cpp
     platform/linux/doip_sockets.cpp
     platform/linux/secoc_storage.cpp
+    platform/linux/key_store.cpp
   )
   target_include_directories(ccg_platform_linux PUBLIC platform/linux)
-  target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s ccg_diag ccg_secoc)
+  target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s ccg_diag ccg_secoc ccg_keym)
   ccg_warnings(ccg_platform_linux)
 
   add_executable(ccg_s2s_gateway app/s2s_gateway_main.cpp)
@@ -136,11 +157,14 @@ if(CCG_BUILD_TESTS)
     tests/test_aes_cmac.cpp
     tests/test_secoc.cpp
     tests/test_fv_sync.cpp
+    tests/test_she.cpp
+    tests/test_key_manager.cpp
   )
   target_link_libraries(ccg_tests PRIVATE ccg_vehicle_matrix ccg_sim ccg_secoc)
   if(TARGET ccg_platform_linux)
     target_sources(ccg_tests PRIVATE tests/test_someip_udp_binding.cpp tests/test_udp_socket.cpp
-                                     tests/test_doip_sockets.cpp tests/test_secoc_storage.cpp)
+                                     tests/test_doip_sockets.cpp tests/test_secoc_storage.cpp
+                                     tests/test_key_store.cpp)
     target_link_libraries(ccg_tests PRIVATE ccg_platform_linux)
   endif()
   find_package(OpenSSL 3 QUIET)

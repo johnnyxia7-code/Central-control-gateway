@@ -77,6 +77,12 @@ public:
     virtual bool hasKey(const std::string& keyId) const = 0;
     virtual bool generateMac(const std::string& keyId, const std::uint8_t* data, std::size_t length,
                              crypto::Block& mac) = 0;
+    // Csm_MacVerify: true if the first `macBits` of `mac` match, nullopt on a
+    // crypto error. A key manager may accept the previous key version here
+    // during a key rollover; the default checks the key generateMac() uses.
+    virtual std::optional<bool> verifyMac(const std::string& keyId, const std::uint8_t* data,
+                                          std::size_t length, const std::uint8_t* mac,
+                                          std::size_t macBits);
 };
 
 // Software AES-128-CMAC implementation for bench, simulation and tests.
@@ -175,8 +181,8 @@ public:
     FreshnessManager& freshness() { return freshness_; }
 
 private:
-    bool authenticator(const SecOcConfig& config, const std::uint8_t* authentic, std::size_t length,
-                       std::uint64_t fv, crypto::Block& mac);
+    std::vector<std::uint8_t> dataToAuthenticator(const SecOcConfig& config, const std::uint8_t* authentic,
+                                                  std::size_t length, std::uint64_t fv) const;
     std::size_t completeFreshnessBits(const SecOcConfig& config) const;
     bool matches(const SecOcConfig& config, const std::uint8_t* authentic, std::size_t length,
                  std::uint64_t fv, const crypto::Block& receivedMac, VerifyResult& error);

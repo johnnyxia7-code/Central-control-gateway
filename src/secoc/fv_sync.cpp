@@ -1,5 +1,7 @@
 #include "ccg/secoc/fv_sync.hpp"
 
+#include <array>
+
 namespace ccg::secoc {
 
 namespace {
@@ -53,15 +55,20 @@ const char* toString(SyncResult result) {
     return "UNKNOWN";
 }
 
-bool syncAuthenticator(ICryptoService& crypto, const SyncMessageConfig& c, std::uint32_t trip,
-                       std::uint32_t reset, crypto::Block& mac) {
-    const std::uint8_t data[10] = {
+static std::array<std::uint8_t, 10> syncDataToAuthenticator(const SyncMessageConfig& c, std::uint32_t trip,
+                                                            std::uint32_t reset) {
+    return {
         static_cast<std::uint8_t>(c.dataId >> 8), static_cast<std::uint8_t>(c.dataId),
         static_cast<std::uint8_t>(trip >> 24),    static_cast<std::uint8_t>(trip >> 16),
         static_cast<std::uint8_t>(trip >> 8),     static_cast<std::uint8_t>(trip),
         static_cast<std::uint8_t>(reset >> 24),   static_cast<std::uint8_t>(reset >> 16),
         static_cast<std::uint8_t>(reset >> 8),    static_cast<std::uint8_t>(reset)};
-    return crypto.generateMac(c.keyId, data, sizeof data, mac);
+}
+
+bool syncAuthenticator(ICryptoService& crypto, const SyncMessageConfig& c, std::uint32_t trip,
+                       std::uint32_t reset, crypto::Block& mac) {
+    const auto data = syncDataToAuthenticator(c, trip, reset);
+    return crypto.generateMac(c.keyId, data.data(), data.size(), mac);
 }
 
 // ---------------------------------------------------------------------------
@@ -158,11 +165,12 @@ SyncResult FreshnessSyncSlave::onSyncMessage(const std::uint8_t* data, std::size
     for (std::size_t i = 0; i < cfg_.macTxBits; ++i, ++pos) {
         if ((data[pos / 8] >> (7 - pos % 8)) & 1) received[i / 8] = static_cast<std::uint8_t>(received[i / 8] | (0x80 >> (i % 8)));
     }
-    crypto::Block mac;
-    if (!syncAuthenticator(crypto_, cfg_, trip, reset, mac)) {
+    const auto dta = syncDataToAuthenticator(cfg_, trip, reset);
+    const auto ok = crypto_.verifyMac(cfg_.keyId, dta.data(), dta.size(), received.data(), cfg_.macTxBits);
+    if (!ok) {
         return SyncResult::CryptoError;
     }
-    if (!crypto::equalBits(mac.data(), received.data(), cfg_.macTxBits)) {
+    if (!*ok) {
         return SyncResult::MacFailure;
     }
     if (freshness_.synchronized()) {

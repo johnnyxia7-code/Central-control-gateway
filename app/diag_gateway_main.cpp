@@ -2,8 +2,14 @@
 //
 //   ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2
 //                    [--port 13400] [--broadcast 255.255.255.255]
+//                    [--key-store /var/lib/ccg/keys [--demo-keys]]
+//
+// With --key-store the gateway's own diagnostic address also serves the SecOC
+// key management routines (SHE key update, activation, key status); the file
+// is the gateway's key store and is followed by ccg_eth_gateway.
 #include <poll.h>
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
@@ -14,9 +20,12 @@
 #include <vector>
 
 #include "ccg/diag/diag_gateway.hpp"
+#include "ccg/keym/key_management_service.hpp"
 #include "doip_sockets.hpp"
+#include "key_store.hpp"
 #include "socketcan_transport.hpp"
 #include "vehicle_diag_routing.hpp"
+#include "vehicle_key_slots.hpp"
 
 namespace {
 
@@ -56,15 +65,34 @@ void printStatistics(const diag::DiagStatistics& s) {
               << " tpTxErr=" << s.isotpTxErrors << " tpRxErr=" << s.isotpRxErrors << "\n";
 }
 
+// Prints key management events not printed yet (security log).
+void printKeyEvents(const keym::KeyManager& keys, std::uint64_t& seen) {
+    const auto& events = keys.events();
+    const auto fresh = std::min<std::uint64_t>(keys.eventCount() - seen, events.size());
+    for (auto it = events.end() - static_cast<std::ptrdiff_t>(fresh); it != events.end(); ++it) {
+        std::cout << "[keym] " << keym::toString(it->kind) << " slot " << int{it->slot} << " counter "
+                  << it->counter;
+        if (it->error != keym::she::ErrorCode::NoError) std::cout << " " << keym::she::toString(it->error);
+        std::cout << "\n";
+    }
+    seen = keys.eventCount();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::map<std::string, std::string> canBindings;
     std::uint16_t port = doip::kPort;
     std::string broadcast = "255.255.255.255";
+    std::string keyStore;
+    bool demoKeys = false;
     try {
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
+            if (arg == "--demo-keys") {
+                demoKeys = true;
+                continue;
+            }
             if (i + 1 >= argc) throw std::invalid_argument("missing value for " + arg);
             const std::string value = argv[++i];
             if (arg == "--can") {
@@ -75,13 +103,16 @@ int main(int argc, char** argv) {
                 port = static_cast<std::uint16_t>(std::stoul(value));
             } else if (arg == "--broadcast") {
                 broadcast = value;
+            } else if (arg == "--key-store") {
+                keyStore = value;
             } else {
                 throw std::invalid_argument("unknown argument " + arg);
             }
         }
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\nusage: " << argv[0]
-                  << " --can CHANNEL=IFACE ... [--port 13400] [--broadcast ADDR]\n";
+                  << " --can CHANNEL=IFACE ... [--port 13400] [--broadcast ADDR]"
+                     " [--key-store FILE [--demo-keys]]\n";
         return EXIT_FAILURE;
     }
 
@@ -111,6 +142,29 @@ int main(int argc, char** argv) {
 
         diag::DiagGateway gateway(std::move(config), transport);
         auto now = diag::Clock::now();
+
+        // SecOC key management; the key store file stands in for the HSM key NvM.
+        std::unique_ptr<keym::KeyManager> keys;
+        std::unique_ptr<keym::KeyManagementService> keyService;
+        std::uint64_t keyEventsSeen = 0;
+        auto saveKeys = [&] { return platform::saveKeyStore(keyStore, keys->snapshot(diag::Clock::now())); };
+        if (!keyStore.empty()) {
+            keys = std::make_unique<keym::KeyManager>(config::makeVehicleKeySlots());
+            if (const auto snapshot = platform::loadKeyStore(keyStore)) {
+                keys->restore(*snapshot, now);
+                std::cout << "[diag] key store " << keyStore << " loaded (" << snapshot->keys.size() << " keys)\n";
+            } else if (demoKeys) {
+                std::cout << "[diag] WARNING: key store provisioned with TEST KEYS - bench only\n";
+                config::provisionDemoKeyStore(*keys, now);
+                if (!saveKeys()) throw std::runtime_error("cannot write key store " + keyStore);
+            } else {
+                throw std::runtime_error("key store " + keyStore + " missing (EOL provisioning or --demo-keys)");
+            }
+            keys->takePersistRequest();
+            keyEventsSeen = keys->eventCount();
+            keyService = std::make_unique<keym::KeyManagementService>(*keys, saveKeys);
+            gateway.addLocalService(*keyService);
+        }
         gateway.start(now);
         std::cout << "[diag] DoIP entity listening on TCP/UDP " << port << "\n";
 
@@ -156,6 +210,13 @@ int main(int argc, char** argv) {
             }
             if (now >= nextTick) {
                 gateway.mainFunction(now);
+                if (keys) {
+                    keys->mainFunction(now);  // previous keys expire after the grace period
+                    if (keys->takePersistRequest() && !saveKeys()) {
+                        std::cerr << "[diag] ERROR: cannot persist key store " << keyStore << "\n";
+                    }
+                    printKeyEvents(*keys, keyEventsSeen);
+                }
                 nextTick += std::chrono::milliseconds(1);
                 if (nextTick <= now) nextTick = now + std::chrono::milliseconds(1);
             }

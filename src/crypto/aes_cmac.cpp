@@ -48,6 +48,16 @@ const std::array<std::uint8_t, 256>& sbox() {
     return table;
 }
 
+const std::array<std::uint8_t, 256>& inverseSbox() {
+    static const std::array<std::uint8_t, 256> table = [] {
+        std::array<std::uint8_t, 256> inv{};
+        const auto& s = sbox();
+        for (std::size_t x = 0; x < 256; ++x) inv[s[x]] = static_cast<std::uint8_t>(x);
+        return inv;
+    }();
+    return table;
+}
+
 void shiftLeftOne(const Block& in, Block& out) {
     std::uint8_t carry = 0;
     for (int i = 15; i >= 0; --i) {
@@ -113,6 +123,39 @@ Block Aes128::encrypt(const Block& plaintext) const {
     return st;
 }
 
+Block Aes128::decrypt(const Block& ciphertext) const {
+    const auto& si = inverseSbox();
+    Block st = ciphertext;
+    auto addRoundKey = [&](std::size_t round) {
+        for (std::size_t i = 0; i < 16; ++i) st[i] ^= roundKeys_[round * 16 + i];
+    };
+    auto invShiftSub = [&] {
+        Block t;
+        for (std::size_t c = 0; c < 4; ++c) {
+            for (std::size_t r = 0; r < 4; ++r) {
+                t[r + 4 * ((c + r) % 4)] = si[st[r + 4 * c]];  // InvShiftRows + InvSubBytes
+            }
+        }
+        st = t;
+    };
+    addRoundKey(10);
+    for (std::size_t round = 10; round-- > 0;) {
+        invShiftSub();
+        addRoundKey(round);
+        if (round != 0) {
+            for (std::size_t c = 0; c < 4; ++c) {  // InvMixColumns
+                std::uint8_t* col = &st[4 * c];
+                const std::uint8_t a0 = col[0], a1 = col[1], a2 = col[2], a3 = col[3];
+                col[0] = static_cast<std::uint8_t>(gfMul(a0, 14) ^ gfMul(a1, 11) ^ gfMul(a2, 13) ^ gfMul(a3, 9));
+                col[1] = static_cast<std::uint8_t>(gfMul(a0, 9) ^ gfMul(a1, 14) ^ gfMul(a2, 11) ^ gfMul(a3, 13));
+                col[2] = static_cast<std::uint8_t>(gfMul(a0, 13) ^ gfMul(a1, 9) ^ gfMul(a2, 14) ^ gfMul(a3, 11));
+                col[3] = static_cast<std::uint8_t>(gfMul(a0, 11) ^ gfMul(a1, 13) ^ gfMul(a2, 9) ^ gfMul(a3, 14));
+            }
+        }
+    }
+    return st;
+}
+
 Cmac::Cmac(const Block& key) : aes_(key) {
     const Block l = aes_.encrypt(Block{});
     shiftLeftOne(l, k1_);
@@ -141,6 +184,24 @@ Block Cmac::compute(const std::uint8_t* data, std::size_t length) const {
     }
     for (std::size_t i = 0; i < 16; ++i) x[i] ^= last[i];
     return aes_.encrypt(x);
+}
+
+Block mpCompress(const std::uint8_t* data, std::size_t length) {
+    Block out{};  // OUT_0 = 0
+    for (std::size_t offset = 0; offset + 16 <= length; offset += 16) {
+        Block x;
+        std::memcpy(x.data(), data + offset, 16);
+        const Block e = Aes128(out).encrypt(x);  // OUT_i = E(OUT_i-1, x_i) ^ x_i ^ OUT_i-1
+        for (std::size_t i = 0; i < 16; ++i) out[i] = static_cast<std::uint8_t>(e[i] ^ x[i] ^ out[i]);
+    }
+    return out;
+}
+
+Block deriveKey(const Block& key, const Block& constant) {
+    std::uint8_t data[32];
+    std::memcpy(data, key.data(), 16);
+    std::memcpy(data + 16, constant.data(), 16);
+    return mpCompress(data, sizeof data);
 }
 
 bool equalBits(const std::uint8_t* a, const std::uint8_t* b, std::size_t bits) {
