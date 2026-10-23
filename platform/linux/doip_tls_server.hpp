@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "ccg/diag/diag_gateway.hpp"
+#include "tls_ocsp.hpp"
 #include "tls_revocation.hpp"
 
 typedef struct ssl_ctx_st SSL_CTX;
@@ -24,6 +25,9 @@ typedef struct ssl_ctx_st SSL_CTX;
 //  - revocation: client certificates are checked against the tester CRLs
 //    (CrlPolicy); reloadCrl() takes a new CRL file and closes sessions whose
 //    certificate has been revoked meanwhile
+//  - OCSP stapling: the server's own OCSP response (DER file from the
+//    backend) is stapled when the client asks for it; reloadOcsp() takes a
+//    new response
 //
 // Connection IDs start at `firstId` so they never collide with the plain
 // TCP server's IDs.
@@ -36,6 +40,8 @@ struct TlsServerConfig {
     bool requireClientCertificate = false;  // handshake fails without a valid client certificate
     std::chrono::milliseconds handshakeTimeout{2000};
     CrlPolicy crl;  // revocation of client certificates (needs caFile)
+    std::string ocspResponseFile;  // OCSP response for our certificate (DER); empty = no stapling
+    int maxProtocolVersion = 0;    // e.g. TLS1_2_VERSION for interoperability tests; 0 = newest
 };
 
 class DoipTlsServer {
@@ -60,6 +66,8 @@ public:
     void close(diag::ConnectionId id);
 
     std::size_t connections() const { return sockets_.size(); }
+    // Negotiated protocol of an established connection ("TLSv1.3", ...), empty if unknown.
+    std::string protocol(diag::ConnectionId id) const;
     std::uint64_t handshakeFailures() const { return handshakeFailures_; }
 
     // Loads the CRL file again (e.g. after the backend replaced it) and closes
@@ -67,6 +75,10 @@ public:
     // with onTcpClosed). False: the file is unusable, the old CRLs stay.
     bool reloadCrl(diag::DiagGateway& gateway, diag::TimePoint now);
     const RevocationStatistics& revocation() const { return revocation_.statistics(); }
+
+    // Loads a new OCSP response for stapling. False: unusable, the old one stays.
+    bool reloadOcsp() { return stapler_.load(); }
+    const OcspStatistics& ocsp() const { return stapler_.statistics(); }
 
 private:
     struct Socket {
@@ -84,6 +96,7 @@ private:
     void destroy(diag::ConnectionId id);
 
     RevocationChecker revocation_;
+    OcspStapler stapler_;
     std::string caFile_;
     SSL_CTX* ctx_ = nullptr;
     int listenFd_ = -1;

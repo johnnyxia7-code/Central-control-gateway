@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "ccg/diag/doip_client.hpp"
+#include "tls_ocsp.hpp"
 #include "tls_revocation.hpp"
 
 typedef struct ssl_ctx_st SSL_CTX;
@@ -25,7 +26,8 @@ typedef struct ssl_ctx_st SSL_CTX;
 // route's server name, and presents the gateway's vehicle certificate. The
 // client is told "connected" only once TLS is up. With a CRL policy the ECU
 // certificates are checked for revocation; reloadCrl() takes a new CRL file
-// and closes connections to ECUs whose certificate has been revoked.
+// and closes connections to ECUs whose certificate has been revoked. The ECU
+// is asked for an OCSP staple, which is verified (OcspPolicy).
 namespace ccg::platform {
 
 struct TlsClientConfig {
@@ -33,6 +35,7 @@ struct TlsClientConfig {
     std::string privateKeyFile;
     std::string caFile;           // vehicle CA that signs the ECU certificates
     CrlPolicy crl;                // revocation of ECU certificates
+    OcspPolicy ocsp;              // OCSP stapling by the ECUs
 };
 
 class DoipTcpConnector final : public diag::IDoipConnector {
@@ -54,6 +57,7 @@ public:
     // file is unusable (old CRLs stay) or no CRL is configured.
     bool reloadCrl(diag::TimePoint now);
     const RevocationStatistics* revocation() const { return revocation_ ? &revocation_->statistics() : nullptr; }
+    const OcspStatistics* ocsp() const { return ocsp_ ? &ocsp_->statistics() : nullptr; }
 
     // diag::IDoipConnector; endpoint "a.b.c.d:port"
     void connect(diag::ConnectionId id, const diag::DoipTarget& target) override;
@@ -82,6 +86,7 @@ private:
 
     diag::DoipClient* client_ = nullptr;
     std::unique_ptr<RevocationChecker> revocation_;
+    std::unique_ptr<OcspVerifier> ocsp_;
     std::string caFile_;
     SSL_CTX* ctx_ = nullptr;
     std::map<diag::ConnectionId, Socket> sockets_;

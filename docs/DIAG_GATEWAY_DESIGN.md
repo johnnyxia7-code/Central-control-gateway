@@ -229,6 +229,32 @@ openssl ca -config ca.cnf -keyfile ca.key -cert ca.pem -revoke workshop-17.pem
 openssl ca -config ca.cnf -keyfile ca.key -cert ca.pem -gencrl -out testers.crl
 ```
 
+### 3.9 OCSP stapling
+
+In addition to the CRLs, each TLS server proves the current status of its own
+certificate with a stapled OCSP response (RFC 6066 `status_request`, RFC 6960).
+This works with TLS 1.3 (Certificate extension) and TLS 1.2
+(CertificateStatus message) (`platform::OcspStapler`, `platform::OcspVerifier`).
+
+| Side | Behaviour |
+|------|-----------|
+| Gateway → testers | staples the response in `--tls-ocsp` (DER) when the tester asks. The backend or OTA client fetches it, because the vehicle cannot reach a responder itself. The file is reloaded when it changes. A response past its nextUpdate is withheld, since it would only fail the tester. A broken file keeps the previous response, and at start-up the process does not start |
+| Gateway → ECUs (ADAS) | asks every ECU for its staple and checks it: signed by the CA or a delegated OCSP signer that chains to the vehicle CA, about exactly the ECU's certificate, within thisUpdate/nextUpdate (5 min clock tolerance), status good |
+| Policy | **revoked** always fails the handshake. A missing, unverifiable, outdated or "unknown" staple fails it only with `--vehicle-ocsp-require`; otherwise it is counted and the CRLs remain the revocation check |
+
+Counters (`OcspStatistics`): stapled, withheld as outdated, verified, revoked,
+missing, invalid, and handshakes refused.
+
+A staple with the OpenSSL CLI (the CA database from §3.8; in production the
+backend's OCSP responder):
+
+```sh
+openssl ca -config ca.cnf -keyfile ca.key -cert ca.pem -valid gw.pem   # register the certificate
+openssl ocsp -no_nonce -issuer ca.pem -cert gw.pem -reqout req.der
+openssl ocsp -index index.txt -rsigner ca.pem -rkey ca.key -CA ca.pem -reqin req.der \
+    -respout gw.ocsp -ndays 7
+```
+
 ## 4. ISO-TP (ISO 15765-2)
 
 ### 4.1 Frames (normal addressing)
@@ -321,7 +347,8 @@ ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
                   [--tls-require-client-cert] [--tls-only] [--tls-port 3496]] \
                  [--vehicle-ca vehicle-ca.pem --vehicle-cert gw-vehicle.pem --vehicle-key gw-vehicle.key] \
                  [--doip-plain] [--tls-crl testers.crl] [--vehicle-crl vehicle.crl] \
-                 [--crl-optional] [--crl-reject-expired]
+                 [--crl-optional] [--crl-reject-expired] \
+                 [--tls-ocsp gw.ocsp] [--vehicle-ocsp-require]
 ```
 
 TLS needs OpenSSL 3 at build time (`CCG_HAVE_TLS`). Without it, the process
@@ -351,8 +378,9 @@ refuses the TLS options.
 
 ## 8. Limitations / next steps
 
-- TLS: revocation uses full CRLs only (no OCSP, no OCSP stapling, no delta
-  CRLs). The tester's certificate grants one level ("verified"), with no roles
+- TLS: revocation uses full CRLs and OCSP stapling. The gateway does not query
+  OCSP responders itself (it is offline), does not enforce the "must staple"
+  certificate extension, and does not use delta CRLs. The tester's certificate grants one level ("verified"), with no roles
   from certificate attributes. There is no confirmation step in routing
   activation (0x05 and 0x11 are never sent).
 - One outstanding physical request per ECU; a second one is refused with NACK

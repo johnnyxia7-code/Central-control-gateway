@@ -41,6 +41,7 @@ std::string commonName(X509* cert) {
 DoipTlsServer::DoipTlsServer(std::uint16_t port, std::size_t maxConnections, const TlsServerConfig& config,
                              diag::ConnectionId firstId)
     : revocation_(config.crl),
+      stapler_(config.ocspResponseFile),
       caFile_(config.caFile),
       maxConnections_(maxConnections),
       firstId_(firstId),
@@ -50,6 +51,7 @@ DoipTlsServer::DoipTlsServer(std::uint16_t port, std::size_t maxConnections, con
     if (!ctx_) throw std::runtime_error(sslError("TLS context"));
     try {
         SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
+        if (config.maxProtocolVersion != 0) SSL_CTX_set_max_proto_version(ctx_, config.maxProtocolVersion);
         if (SSL_CTX_set_cipher_list(ctx_, kTls12Ciphers) != 1) throw std::runtime_error(sslError("TLS ciphers"));
         SSL_CTX_set_options(ctx_, SSL_OP_NO_RENEGOTIATION | SSL_OP_CIPHER_SERVER_PREFERENCE);
         SSL_CTX_set_mode(ctx_, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
@@ -72,6 +74,11 @@ DoipTlsServer::DoipTlsServer(std::uint16_t port, std::size_t maxConnections, con
             throw std::runtime_error("TLS: client certificates required but no tester CA given");
         } else if (revocation_.enabled()) {
             throw std::runtime_error("TLS: a CRL needs the tester CA");
+        }
+
+        if (stapler_.enabled()) {
+            if (!stapler_.load()) throw std::runtime_error("TLS: unusable OCSP response " + config.ocspResponseFile);
+            stapler_.attach(ctx_);
         }
 
         listenFd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -220,6 +227,11 @@ bool DoipTlsServer::send(diag::ConnectionId id, const std::vector<std::uint8_t>&
 }
 
 void DoipTlsServer::close(diag::ConnectionId id) { destroy(id); }
+
+std::string DoipTlsServer::protocol(diag::ConnectionId id) const {
+    const auto it = sockets_.find(id);
+    return it != sockets_.end() && it->second.established ? SSL_get_version(it->second.ssl) : "";
+}
 
 bool DoipTlsServer::reloadCrl(diag::DiagGateway& gateway, diag::TimePoint now) {
     if (!revocation_.enabled()) return false;

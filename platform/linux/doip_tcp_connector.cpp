@@ -65,6 +65,8 @@ void DoipTcpConnector::enableTls(const TlsClientConfig& config) {
     // revoked), name checked per route.
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
     auto checker = std::make_unique<RevocationChecker>(config.crl);
+    auto ocsp = std::make_unique<OcspVerifier>(config.ocsp);
+    ocsp->attach(ctx);
     try {
         SSL_CTX_set_cert_store(ctx, checker->build(config.caFile));
     } catch (...) {
@@ -82,6 +84,7 @@ void DoipTcpConnector::enableTls(const TlsClientConfig& config) {
     SSL_CTX_free(ctx_);
     ctx_ = ctx;
     revocation_ = std::move(checker);
+    ocsp_ = std::move(ocsp);
     caFile_ = config.caFile;
 #else
     (void)config;
@@ -117,6 +120,7 @@ void DoipTcpConnector::connect(diag::ConnectionId id, const diag::DoipTarget& ta
         SSL_set_tlsext_host_name(s.ssl, target.serverName.c_str());  // SNI
         SSL_set_hostflags(s.ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
         SSL_set1_host(s.ssl, target.serverName.c_str());              // certificate name check
+        ocsp_->prepare(s.ssl);                                          // ask for the OCSP staple
         SSL_set_connect_state(s.ssl);
     }
 #endif

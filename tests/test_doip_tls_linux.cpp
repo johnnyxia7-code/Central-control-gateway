@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/ocsp.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -115,6 +116,37 @@ std::string makeCrl(const std::string& name, const Credential& ca, const std::ve
     ASN1_TIME_free(last);
     ASN1_TIME_free(next);
     X509_CRL_free(crl);
+    return path;
+}
+
+// OCSP response signed by `signer` about `cert` (issued by `issuer`).
+enum class OcspTime { Current, Expired, NotYetValid };
+std::string makeOcsp(const std::string& name, const Credential& cert, const Credential& issuer,
+                     const Credential& signer, int status, OcspTime time = OcspTime::Current) {
+    OCSP_CERTID* id = OCSP_cert_to_id(nullptr, cert.cert, issuer.cert);
+    OCSP_BASICRESP* basic = OCSP_BASICRESP_new();
+    const long from = time == OcspTime::Expired ? -2 * 86400 : time == OcspTime::NotYetValid ? 86400 : -60;
+    const long to = time == OcspTime::Expired ? -86400 : 7 * 86400;
+    ASN1_TIME* thisUpdate = X509_gmtime_adj(nullptr, from);
+    ASN1_TIME* nextUpdate = X509_gmtime_adj(nullptr, to);
+    ASN1_TIME* revokedAt = X509_gmtime_adj(nullptr, -3600);
+    OCSP_basic_add1_status(basic, id, status, OCSP_REVOKED_STATUS_KEYCOMPROMISE,
+                           status == V_OCSP_CERTSTATUS_REVOKED ? revokedAt : nullptr, thisUpdate, nextUpdate);
+    OCSP_basic_sign(basic, signer.cert, signer.key, EVP_sha256(), nullptr, 0);
+    OCSP_RESPONSE* resp = OCSP_response_create(OCSP_RESPONSE_STATUS_SUCCESSFUL, basic);
+    unsigned char* der = nullptr;
+    const int len = i2d_OCSP_RESPONSE(resp, &der);
+    const std::string path = tempFile(name);
+    FILE* f = std::fopen(path.c_str(), "wb");
+    std::fwrite(der, 1, static_cast<std::size_t>(len), f);
+    std::fclose(f);
+    OPENSSL_free(der);
+    OCSP_RESPONSE_free(resp);
+    OCSP_BASICRESP_free(basic);
+    OCSP_CERTID_free(id);
+    ASN1_TIME_free(thisUpdate);
+    ASN1_TIME_free(nextUpdate);
+    ASN1_TIME_free(revokedAt);
     return path;
 }
 
@@ -674,5 +706,137 @@ TEST_CASE("doip tls linux: a revoked ADAS certificate is refused; a CRL update e
         CHECK_EQ(v.connector.revocation()->sessionsClosed, 1u);
         CHECK(!v.client.routingActive(dg::kAdas));
         CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::TransportError);  // no reconnect possible
+    }
+}
+
+// --------------------------------------------------------------- OCSP stapling
+
+namespace {
+
+// Tester that asks for the staple; returns the OCSP status of the gateway's
+// certificate it received (nullopt: no staple).
+std::optional<int> testerSeesStaple(Bench& bench, std::uint16_t port, const Pki& pki, bool ask = true) {
+    Client client(port, pki, &pki.tester);
+    if (ask) SSL_set_tlsext_status_type(client.ssl, TLSEXT_STATUSTYPE_ocsp);
+    if (handshake(bench, client) != std::optional<bool>(true)) return std::nullopt;
+    const unsigned char* p = nullptr;
+    const long len = SSL_get_tlsext_status_ocsp_resp(client.ssl, &p);
+    if (!p || len <= 0) return std::nullopt;
+    OCSP_RESPONSE* resp = d2i_OCSP_RESPONSE(nullptr, &p, len);
+    OCSP_BASICRESP* basic = resp ? OCSP_response_get1_basic(resp) : nullptr;
+    OCSP_CERTID* id = OCSP_cert_to_id(nullptr, pki.gateway.cert, pki.ca.cert);
+    int status = -1;
+    int reason = 0;
+    ASN1_GENERALIZEDTIME *rev = nullptr, *thisUpd = nullptr, *nextUpd = nullptr;
+    if (basic) OCSP_resp_find_status(basic, id, &status, &reason, &rev, &thisUpd, &nextUpd);
+    OCSP_CERTID_free(id);
+    OCSP_BASICRESP_free(basic);
+    OCSP_RESPONSE_free(resp);
+    return status;
+}
+
+platform::TlsServerConfig withOcsp(platform::TlsServerConfig c, const std::string& file) {
+    c.ocspResponseFile = file;
+    return c;
+}
+
+}  // namespace
+
+TEST_CASE("doip tls linux: the gateway staples its OCSP response for testers") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    const auto good = files.add(makeOcsp("ocsp_gw_good", pki.gateway, pki.ca, pki.ca, V_OCSP_CERTSTATUS_GOOD));
+    Bench bench(31530, withOcsp(serverConfig(pki, false), good));
+    CHECK(testerSeesStaple(bench, 31530, pki) == std::optional<int>(V_OCSP_CERTSTATUS_GOOD));
+    CHECK_EQ(bench.server.ocsp().stapled, 1u);
+    CHECK(!testerSeesStaple(bench, 31530, pki, false).has_value());  // not asked, not sent
+    CHECK_EQ(bench.server.ocsp().stapled, 1u);
+
+    auto tls12 = withOcsp(serverConfig(pki, false), good);  // CertificateStatus message instead of extension
+    tls12.maxProtocolVersion = TLS1_2_VERSION;
+    Bench bench12(31529, tls12);
+    CHECK(testerSeesStaple(bench12, 31529, pki) == std::optional<int>(V_OCSP_CERTSTATUS_GOOD));
+}
+
+TEST_CASE("doip tls linux: an outdated OCSP response is withheld; a reload takes the new one") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    const auto file = files.add(
+        makeOcsp("ocsp_gw", pki.gateway, pki.ca, pki.ca, V_OCSP_CERTSTATUS_GOOD, OcspTime::Expired));
+    Bench bench(31531, withOcsp(serverConfig(pki, false), file));
+    CHECK(!testerSeesStaple(bench, 31531, pki).has_value());
+    CHECK_EQ(bench.server.ocsp().notStapledExpired, 1u);
+
+    makeOcsp("ocsp_gw", pki.gateway, pki.ca, pki.ca, V_OCSP_CERTSTATUS_GOOD);  // backend fetched a fresh one
+    CHECK(bench.server.reloadOcsp());
+    CHECK(testerSeesStaple(bench, 31531, pki) == std::optional<int>(V_OCSP_CERTSTATUS_GOOD));
+
+    {
+        FILE* f = std::fopen(file.c_str(), "wb");
+        std::fputs("garbage", f);
+        std::fclose(f);
+    }
+    CHECK(!bench.server.reloadOcsp());  // the previous response stays
+    CHECK(testerSeesStaple(bench, 31531, pki) == std::optional<int>(V_OCSP_CERTSTATUS_GOOD));
+
+    bool threw = false;
+    try {
+        Bench broken(31532, withOcsp(serverConfig(pki, false), file));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST_CASE("doip tls linux: the gateway checks the ADAS OCSP staple") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    const auto good = files.add(makeOcsp("ocsp_adas_good", pki.adas, pki.ca, pki.ca, V_OCSP_CERTSTATUS_GOOD));
+    const auto revoked = files.add(makeOcsp("ocsp_adas_revoked", pki.adas, pki.ca, pki.ca, V_OCSP_CERTSTATUS_REVOKED));
+    const auto forged = files.add(makeOcsp("ocsp_adas_forged", pki.adas, pki.ca, pki.rogueCa, V_OCSP_CERTSTATUS_GOOD));
+    const auto otherCert = files.add(makeOcsp("ocsp_other", pki.gateway, pki.ca, pki.ca, V_OCSP_CERTSTATUS_GOOD));
+    const auto notYet = files.add(
+        makeOcsp("ocsp_adas_future", pki.adas, pki.ca, pki.ca, V_OCSP_CERTSTATUS_GOOD, OcspTime::NotYetValid));
+
+    struct Case {
+        std::string staple;  // empty: ADAS staples nothing
+        bool require;
+        diag::ClientResult expected;
+        std::uint64_t platform::OcspStatistics::*counter;
+    };
+    using S = platform::OcspStatistics;
+    const std::vector<Case> cases = {
+        {good, true, diag::ClientResult::Ok, &S::verified},
+        {revoked, false, diag::ClientResult::TransportError, &S::revoked},  // revoked fails even if optional
+        {"", true, diag::ClientResult::TransportError, &S::missing},
+        {"", false, diag::ClientResult::Ok, &S::missing},                  // optional: CRLs remain the check
+        {forged, true, diag::ClientResult::TransportError, &S::invalid},   // not signed by the vehicle CA
+        {forged, false, diag::ClientResult::Ok, &S::invalid},
+        {otherCert, true, diag::ClientResult::TransportError, &S::invalid},// about another certificate
+        {notYet, true, diag::ClientResult::TransportError, &S::invalid},   // outside its validity
+    };
+    std::uint16_t port = 31533;
+    for (const int version : {0, TLS1_2_VERSION}) {  // TLS 1.3 (extension) and TLS 1.2 (CertificateStatus)
+      for (const auto& c : cases) {
+        auto server = adasServer(pki.adas, pki);
+        server.ocspResponseFile = c.staple;
+        server.maxProtocolVersion = version;
+        AdasOverTls v(port++, server);
+        auto cfg = gatewayClient(pki);
+        cfg.ocsp = platform::OcspPolicy{true, c.require};
+        v.connector.enableTls(cfg);
+        const auto r = v.request({0x3E, 0x00});
+        REQUIRE(r.has_value());
+        CHECK(r->first == c.expected);
+        REQUIRE(v.connector.ocsp() != nullptr);
+        CHECK_EQ((*v.connector.ocsp()).*(c.counter), 1u);
+        CHECK_EQ(v.adas.entity().statistics().tcpConnectionsAccepted, c.expected == diag::ClientResult::Ok ? 1u : 0u);
+        if (c.expected == diag::ClientResult::Ok) {
+            CHECK(v.server.protocol(0x10000) == (version == TLS1_2_VERSION ? "TLSv1.2" : "TLSv1.3"));
+        }
+      }
     }
 }
