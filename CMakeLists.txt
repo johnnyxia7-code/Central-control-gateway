@@ -134,9 +134,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     platform/linux/key_store.cpp
     platform/linux/system_random.cpp
     platform/linux/doip_tcp_connector.cpp
+    platform/linux/crl_fetcher.cpp
   )
   target_include_directories(ccg_platform_linux PUBLIC platform/linux)
-  target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s ccg_diag ccg_secoc ccg_keym)
+  find_package(Threads REQUIRED)  # CRL downloads run on a worker thread
+  target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s ccg_diag ccg_secoc ccg_keym Threads::Threads)
   if(OpenSSL_FOUND)
     target_sources(ccg_platform_linux PRIVATE platform/linux/doip_tls_server.cpp platform/linux/tls_revocation.cpp
                                                platform/linux/tls_ocsp.cpp)
@@ -187,7 +189,7 @@ if(CCG_BUILD_TESTS)
   if(TARGET ccg_platform_linux)
     target_sources(ccg_tests PRIVATE tests/test_someip_udp_binding.cpp tests/test_udp_socket.cpp
                                      tests/test_doip_sockets.cpp tests/test_secoc_storage.cpp
-                                     tests/test_key_store.cpp)
+                                     tests/test_key_store.cpp tests/test_crl_fetcher_linux.cpp)
     target_link_libraries(ccg_tests PRIVATE ccg_platform_linux)
   endif()
   if(OpenSSL_FOUND)  # test-only cross-check of the software AES-CMAC

@@ -15,6 +15,10 @@
 
 #include <csignal>
 #include <cstdio>
+#include <deque>
+#include <fstream>
+#include <sstream>
+#include <thread>
 #include <optional>
 #include <string>
 #include <vector>
@@ -25,6 +29,7 @@
 #include "doip_ecu.hpp"
 #include "doip_tcp_connector.hpp"
 #include "doip_tls_server.hpp"
+#include "http_test_server.hpp"
 #include "test_framework.hpp"
 #include "vehicle_diag_routing.hpp"
 #include "vehicle_key_master.hpp"
@@ -59,8 +64,9 @@ void addExtension(X509* cert, X509* issuer, int nid, const char* value) {
 }
 
 // ECDSA P-256 certificate, signed by `issuer` (self-signed CA if null).
+// `cdp`: CRL Distribution Points URI.
 Credential makeCredential(const std::string& name, const char* cn, const Credential* issuer, bool ca, long serial,
-                          bool mustStaple = false) {
+                          bool mustStaple = false, const std::string& cdp = "") {
     Credential c;
     c.key = EVP_EC_gen("P-256");
     c.cert = X509_new();
@@ -77,6 +83,7 @@ Credential makeCredential(const std::string& name, const char* cn, const Credent
     addExtension(c.cert, signer, NID_key_usage, ca ? "critical,keyCertSign,cRLSign" : "critical,digitalSignature");
     if (!ca) addExtension(c.cert, signer, NID_ext_key_usage, "serverAuth,clientAuth");
     if (mustStaple) addExtension(c.cert, signer, NID_tlsfeature, "status_request");  // RFC 7633
+    if (!cdp.empty()) addExtension(c.cert, signer, NID_crl_distribution_points, ("URI:" + cdp).c_str());
     X509_sign(c.cert, issuer ? issuer->key : c.key, EVP_sha256());
 
     c.certFile = tempFile(name + "_cert");
@@ -102,6 +109,8 @@ struct CrlSpec {
     long number = -1;                     // CRL number; -1: none
     long deltaBase = -1;                  // delta CRL: BaseCRLNumber (critical Delta CRL Indicator)
     const Credential* signer = nullptr;   // another key than the issuer's: forged CRL
+    bool future = false;                  // thisUpdate a day ahead
+    std::string freshest;                 // Freshest CRL (delta distribution point) URI
 };
 
 // CRL issued in the name of `ca` (complete or delta).
@@ -109,7 +118,7 @@ std::string writeCrl(const std::string& name, const Credential& ca, const CrlSpe
     X509_CRL* crl = X509_CRL_new();
     X509_CRL_set_version(crl, 1);  // v2
     X509_CRL_set_issuer_name(crl, X509_get_subject_name(ca.cert));
-    ASN1_TIME* last = X509_gmtime_adj(nullptr, spec.expired ? -2 * 86400 : -3600);
+    ASN1_TIME* last = X509_gmtime_adj(nullptr, spec.future ? 86400 : spec.expired ? -2 * 86400 : -3600);
     ASN1_TIME* next = X509_gmtime_adj(nullptr, spec.expired ? -86400 : 7 * 86400);
     X509_CRL_set1_lastUpdate(crl, last);
     X509_CRL_set1_nextUpdate(crl, next);
@@ -136,6 +145,14 @@ std::string writeCrl(const std::string& name, const Credential& ca, const CrlSpe
     };
     if (spec.number >= 0) addNumber(NID_crl_number, spec.number, 0);
     if (spec.deltaBase >= 0) addNumber(NID_delta_crl, spec.deltaBase, 1);
+    if (!spec.freshest.empty()) {
+        X509V3_CTX ctx;
+        X509V3_set_ctx_nodb(&ctx);
+        X509V3_set_ctx(&ctx, ca.cert, nullptr, nullptr, crl, 0);
+        X509_EXTENSION* ext = X509V3_EXT_conf_nid(nullptr, &ctx, NID_freshest_crl, ("URI:" + spec.freshest).c_str());
+        X509_CRL_add_ext(crl, ext, -1);
+        X509_EXTENSION_free(ext);
+    }
     X509_CRL_sort(crl);
     X509_CRL_sign(crl, (spec.signer ? spec.signer : &ca)->key, EVP_sha256());
     const std::string path = tempFile(name);
@@ -612,7 +629,7 @@ struct TempFiles {
 
 platform::TlsServerConfig withCrl(platform::TlsServerConfig c, const std::string& crl, bool require = true,
                                   bool acceptExpired = true) {
-    c.crl = platform::CrlPolicy{crl, require, acceptExpired, ""};
+    c.crl = platform::CrlPolicy{crl, require, acceptExpired, "", {}};
     return c;
 }
 
@@ -723,7 +740,7 @@ TEST_CASE("doip tls linux: a revoked ADAS certificate is refused; a CRL update e
         const auto crl = files.add(makeCrl("crl_vehicle_revoked", pki.ca, {6}));  // serial 6: adas-dc
         AdasOverTls v(31527, adasServer(pki.adas, pki));
         auto cfg = gatewayClient(pki);
-        cfg.crl = platform::CrlPolicy{crl, true, true, ""};
+        cfg.crl = platform::CrlPolicy{crl, true, true, "", {}};
         v.connector.enableTls(cfg);
         const auto r = v.request({0x3E, 0x00});
         REQUIRE(r.has_value());
@@ -736,7 +753,7 @@ TEST_CASE("doip tls linux: a revoked ADAS certificate is refused; a CRL update e
         const auto crl = files.add(makeCrl("crl_vehicle", pki.ca, {}));
         AdasOverTls v(31528, adasServer(pki.adas, pki));
         auto cfg = gatewayClient(pki);
-        cfg.crl = platform::CrlPolicy{crl, true, true, ""};
+        cfg.crl = platform::CrlPolicy{crl, true, true, "", {}};
         v.connector.enableTls(cfg);
         CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::Ok);
         CHECK(v.client.routingActive(dg::kAdas));
@@ -759,7 +776,7 @@ constexpr int kRemoveFromCrl = 8;
 
 platform::TlsServerConfig withDelta(platform::TlsServerConfig c, const std::string& crl, const std::string& delta,
                                     bool acceptExpired = true) {
-    c.crl = platform::CrlPolicy{crl, true, acceptExpired, delta};
+    c.crl = platform::CrlPolicy{crl, true, acceptExpired, delta, {}};
     return c;
 }
 
@@ -918,7 +935,7 @@ TEST_CASE("doip tls linux: a delta CRL ends the connection to a revoked ADAS") {
     const auto d = files.add(writeCrl("dcrl_vehicle_delta", pki.ca, delta(21, 20)));
     AdasOverTls v(31547, adasServer(pki.adas, pki));
     auto cfg = gatewayClient(pki);
-    cfg.crl = platform::CrlPolicy{base, true, true, d};
+    cfg.crl = platform::CrlPolicy{base, true, true, d, {}};
     v.connector.enableTls(cfg);
     CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::Ok);
 
@@ -935,6 +952,305 @@ TEST_CASE("doip tls linux: a delta CRL ends the connection to a revoked ADAS") {
     forged.signer = &pki.rogueCa;
     writeCrl("dcrl_vehicle_delta", pki.ca, forged);
     CHECK(!v.connector.reloadCrl(diag::Clock::now()));
+    CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::TransportError);
+}
+
+// --------------------------------------------------------------- CRL distribution points
+
+namespace {
+
+// Credentials made inside a test, freed with it.
+struct ExtraCredentials {
+    std::deque<Credential> list;
+    const Credential& add(Credential c) {
+        list.push_back(c);
+        return list.back();
+    }
+    ~ExtraCredentials() {
+        for (auto& c : list) {
+            std::remove(c.certFile.c_str());
+            std::remove(c.keyFile.c_str());
+            X509_free(c.cert);
+            EVP_PKEY_free(c.key);
+        }
+    }
+};
+
+// DER of a PEM CRL file, as a distribution point serves it.
+test::HttpTestServer::Response crlResponse(const std::string& pemFile) {
+    FILE* f = std::fopen(pemFile.c_str(), "r");
+    X509_CRL* crl = PEM_read_X509_CRL(f, nullptr, nullptr, nullptr);
+    std::fclose(f);
+    unsigned char* der = nullptr;
+    const int len = i2d_X509_CRL(crl, &der);
+    test::HttpTestServer::Response r;
+    r.body.assign(reinterpret_cast<char*>(der), static_cast<std::size_t>(len));
+    OPENSSL_free(der);
+    X509_CRL_free(crl);
+    return r;
+}
+
+platform::CrlFetchPolicy fastFetch(const std::string& cache) {
+    platform::CrlFetchPolicy p;
+    p.cacheFile = cache;
+    p.refresh = std::chrono::milliseconds(100);
+    p.minInterval = std::chrono::milliseconds(0);
+    p.retry = std::chrono::milliseconds(20);
+    p.timeout = std::chrono::milliseconds(1000);
+    return p;
+}
+
+platform::TlsServerConfig withFetch(platform::TlsServerConfig c, const std::string& cache, const std::string& crl = "") {
+    c.crl = platform::CrlPolicy{crl, true, true, "", fastFetch(cache)};
+    return c;
+}
+
+// Runs the bench and the CRL fetching until `done` (about 3 s at most).
+template <typename Done>
+bool fetchUntil(Bench& bench, Done done) {
+    for (int i = 0; i < 1500; ++i) {
+        if (done()) return true;
+        bench.server.fetchCrls(bench.gw, diag::Clock::now());
+        bench.step();
+    }
+    return done();
+}
+
+// Serves `r` at `path` and runs until the gateway has handled a download of it.
+void serveAndFetch(Bench& bench, test::HttpTestServer& http, const std::string& path,
+                   const test::HttpTestServer::Response& r) {
+    http.set(path, r);
+    const auto before = http.hits(path);
+    // Downloads of one URL are serial: the second request after the change
+    // starts only once the first answer has been handled.
+    CHECK(fetchUntil(bench, [&] { return http.hits(path) >= before + 2; }));
+}
+
+}  // namespace
+
+TEST_CASE("doip tls linux: tester CRL fetched from the certificate's distribution point") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    ExtraCredentials extra;
+    const auto& tester = extra.add(makeCredential("tester_cdp", "backend-keyserver", &pki.ca, false, 10, false,
+                                                  "http://127.0.0.1:31590/tester-ca.crl"));
+    const auto cache = files.add(tempFile("crl_cache_fetch"));
+    {
+        test::HttpTestServer http(31590);
+        http.set("/tester-ca.crl", crlResponse(files.add(writeCrl("cdp_c1", pki.ca, complete(1)))));
+        Bench bench(31580, withFetch(serverConfig(pki, false), cache));  // no CRL file at all
+        // No CRL yet: the first handshake is refused but names the distribution point.
+        CHECK(!testerGetsIn(bench, 31580, pki, tester));
+        CHECK(bench.server.revocation().missingCrlRejected >= 1u);
+        REQUIRE(bench.server.crlFetch() != nullptr);
+        CHECK(bench.server.crlDistributionPoints() == std::vector<std::string>{"http://127.0.0.1:31590/tester-ca.crl"});
+        CHECK(fetchUntil(bench, [&] { return bench.server.crlFetch()->installed == 1; }));
+        CHECK(testerGetsIn(bench, 31580, pki, tester));
+
+        // A session is open when the CA's next CRL revokes the tester.
+        Client client(31580, pki, &tester);
+        REQUIRE(handshake(bench, client) == std::optional<bool>(true));
+        const auto ra = exchange(bench, client, pt::kRoutingActivationRequest, kDefaultActivation,
+                                 pt::kRoutingActivationResponse);
+        REQUIRE(ra.has_value());
+        http.set("/tester-ca.crl",
+                 crlResponse(files.add(writeCrl("cdp_c2", pki.ca, complete(2, {{10, kKeyCompromise}})))));
+        CHECK(fetchUntil(bench, [&] { return bench.server.revocation().sessionsClosed == 1; }));
+        CHECK_EQ(bench.server.crlFetch()->installed, 2u);
+        bool open = true;
+        for (int i = 0; i < 50 && open; ++i) {
+            bench.step();
+            open = client.poll();
+        }
+        CHECK(!open);
+        CHECK(!testerGetsIn(bench, 31580, pki, tester));
+    }
+    // Restart without the network: the cache keeps the newest CRL in force.
+    Bench bench(31581, withFetch(serverConfig(pki, false), cache));
+    CHECK(!testerGetsIn(bench, 31581, pki, tester));
+    CHECK_EQ(bench.server.revocation().revokedRejected, 1u);
+    CHECK(testerGetsIn(bench, 31581, pki, pki.tester));  // same CA, not revoked
+}
+
+TEST_CASE("doip tls linux: fetched CRLs must be signed, current and newer than the CRL in force") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    ExtraCredentials extra;
+    const auto& tester = extra.add(
+        makeCredential("tester_cdp2", "backend-keyserver", &pki.ca, false, 10, false, "http://127.0.0.1:31591/ca.crl"));
+    const auto base = files.add(writeCrl("cdp_base5", pki.ca, complete(5)));
+    const auto cache = files.add(tempFile("crl_cache_checks"));
+    test::HttpTestServer http(31591);
+    Bench bench(31582, withFetch(serverConfig(pki, false), cache, base));
+    CHECK(testerGetsIn(bench, 31582, pki, tester));  // the CRL file applies; the URL is learnt on the way
+    CHECK_EQ(bench.server.crlDistributionPoints().size(), 1u);
+    const auto& st = *bench.server.crlFetch();
+    auto crl = [&](const std::string& name, const Credential& issuer, const CrlSpec& spec) {
+        return crlResponse(files.add(writeCrl(name, issuer, spec)));
+    };
+
+    CHECK(fetchUntil(bench, [&] { return st.failures >= 1; }));  // 404
+    test::HttpTestServer::Response moved;
+    moved.status = 302;
+    moved.headers = "Location: http://127.0.0.1:31591/other.crl\r\n";
+    auto before = st.failures;
+    serveAndFetch(bench, http, "/ca.crl", moved);
+    CHECK(st.failures > before);
+    CHECK_EQ(http.hits("/other.crl"), 0u);
+
+    test::HttpTestServer::Response junk;
+    junk.body = "-----BEGIN X509 CRL-----\nnot a crl\n-----END X509 CRL-----\n";
+    before = st.rejected;
+    serveAndFetch(bench, http, "/ca.crl", junk);
+    CHECK(st.rejected > before);
+
+    auto forged = complete(9, {{10, kKeyCompromise}});
+    forged.signer = &pki.rogueCa;  // in our CA's name, another key
+    before = st.rejected;
+    serveAndFetch(bench, http, "/ca.crl", crl("cdp_forged", pki.ca, forged));
+    CHECK(st.rejected > before);
+
+    before = st.rejected;
+    serveAndFetch(bench, http, "/ca.crl", crl("cdp_foreign", pki.rogueCa, complete(9)));  // CA we do not trust
+    CHECK(st.rejected > before);
+
+    auto future = complete(9, {{10, kKeyCompromise}});
+    future.future = true;
+    before = st.rejected;
+    serveAndFetch(bench, http, "/ca.crl", crl("cdp_future", pki.ca, future));
+    CHECK(st.rejected > before);
+
+    before = st.stale;  // an older CRL than the file's (stale mirror, replay)
+    serveAndFetch(bench, http, "/ca.crl", crl("cdp_old", pki.ca, complete(4, {{10, kKeyCompromise}})));
+    CHECK(st.stale > before);
+
+    before = st.deltasAhead;  // a delta for complete CRL 7, the gateway has 5
+    serveAndFetch(bench, http, "/ca.crl", crl("cdp_ahead", pki.ca, delta(8, 7, {{10, kKeyCompromise}})));
+    CHECK(st.deltasAhead > before);
+
+    CHECK_EQ(st.installed, 0u);
+    CHECK(testerGetsIn(bench, 31582, pki, tester));  // none of that was taken
+
+    serveAndFetch(bench, http, "/ca.crl", crl("cdp_new", pki.ca, complete(6, {{10, kKeyCompromise}})));
+    CHECK_EQ(st.installed, 1u);
+    CHECK(!testerGetsIn(bench, 31582, pki, tester));
+    // Now a delta for it fits.
+    serveAndFetch(bench, http, "/ca.crl", crl("cdp_delta", pki.ca, delta(7, 6, {{3, kKeyCompromise}})));
+    CHECK_EQ(st.installed, 2u);
+    CHECK(!testerGetsIn(bench, 31582, pki, pki.tester));
+    CHECK(testerGetsIn(bench, 31582, pki, pki.gateway));
+    CHECK_EQ(st.cacheWriteFailures, 0u);
+}
+
+TEST_CASE("doip tls linux: a fetched complete CRL leads to its delta CRLs") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    ExtraCredentials extra;
+    const auto& tester = extra.add(
+        makeCredential("tester_cdp3", "backend-keyserver", &pki.ca, false, 10, false, "http://127.0.0.1:31592/ca.crl"));
+    const auto cache = files.add(tempFile("crl_cache_freshest"));
+    test::HttpTestServer http(31592);
+    auto c = complete(1);
+    c.freshest = "http://127.0.0.1:31592/delta.crl";  // Freshest CRL extension
+    http.set("/ca.crl", crlResponse(files.add(writeCrl("cdp_fc", pki.ca, c))));
+    http.set("/delta.crl", crlResponse(files.add(writeCrl("cdp_fd", pki.ca, delta(2, 1, {{10, kKeyCompromise}})))));
+    Bench bench(31583, withFetch(serverConfig(pki, false), cache));
+    CHECK(!testerGetsIn(bench, 31583, pki, tester));
+    CHECK(fetchUntil(bench, [&] { return bench.server.crlFetch()->installed == 2; }));
+    CHECK_EQ(bench.server.crlDistributionPoints().size(), 2u);
+    CHECK_EQ(bench.server.revocation().deltaCrls, 1u);
+    CHECK(!testerGetsIn(bench, 31583, pki, tester));
+    CHECK(bench.server.revocation().revokedByDelta >= 1u);
+    CHECK(testerGetsIn(bench, 31583, pki, pki.gateway));
+}
+
+TEST_CASE("doip tls linux: only verified certificates make the gateway fetch") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    ExtraCredentials extra;
+    const std::string evil = "http://127.0.0.1:31593/evil.crl";
+    const auto& rogue = extra.add(makeCredential("rogue_cdp", "rogue-tester", &pki.rogueCa, false, 11, false, evil));
+    const Credential fakeCa{pki.rogueCa.key, pki.ca.cert, "", ""};  // our CA's name, another key
+    const auto& forged =
+        extra.add(makeCredential("forged_cdp", "backend-keyserver", &fakeCa, false, 12, false, evil));
+    const auto& ldap = extra.add(makeCredential("ldap_cdp", "backend-keyserver", &pki.ca, false, 14, false,
+                                                "ldap://ldap.oem.example/cn=CCG%20Tester%20CA"));
+    const auto cache = files.add(tempFile("crl_cache_guard"));
+    test::HttpTestServer http(31593);
+    Bench bench(31584, withFetch(serverConfig(pki, false), cache));
+    CHECK(!testerGetsIn(bench, 31584, pki, rogue));   // foreign CA
+    CHECK(!testerGetsIn(bench, 31584, pki, forged));  // signature does not verify
+    CHECK(!testerGetsIn(bench, 31584, pki, ldap));    // genuine, but not HTTP
+    CHECK(bench.server.crlDistributionPoints().empty());
+    CHECK_EQ(bench.server.crlFetch()->unsupportedUrls, 1u);
+    for (int i = 0; i < 100; ++i) {
+        bench.server.fetchCrls(bench.gw, diag::Clock::now());
+        bench.step();
+    }
+    CHECK_EQ(http.requests(), 0u);
+}
+
+TEST_CASE("doip tls linux: trust file CAs name distribution points") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    ExtraCredentials extra;
+    const auto& second = extra.add(
+        makeCredential("ca_cdp", "CCG Second CA", nullptr, true, 15, false, "http://127.0.0.1:31595/second-ca.crl"));
+    const auto caFile = files.add(tempFile("ca_bundle"));
+    {
+        std::ofstream out(caFile);
+        for (const Credential* c : std::initializer_list<const Credential*>{&pki.ca, &second}) {
+            std::ifstream in(c->certFile);
+            out << in.rdbuf();
+        }
+    }
+    const auto cache = files.add(tempFile("crl_cache_ca"));
+    test::HttpTestServer http(31595);
+    http.set("/second-ca.crl", crlResponse(files.add(writeCrl("cdp_second", second, complete(1)))));
+    auto cfg = withFetch(serverConfig(pki, false), cache);
+    cfg.caFile = caFile;
+    Bench bench(31586, cfg);
+    // Known at start-up, fetched before any tester shows up.
+    CHECK(bench.server.crlDistributionPoints() == std::vector<std::string>{"http://127.0.0.1:31595/second-ca.crl"});
+    CHECK(fetchUntil(bench, [&] { return bench.server.crlFetch()->installed == 1; }));
+    CHECK(http.hits("/second-ca.crl") >= 1u);
+}
+
+TEST_CASE("doip tls linux: ADAS CRL fetched from its distribution point; a newer one ends the connection") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    ExtraCredentials extra;
+    const auto& adas = extra.add(
+        makeCredential("adas_cdp", "adas-dc", &pki.ca, false, 13, false, "http://127.0.0.1:31594/vehicle-ca.crl"));
+    const auto cache = files.add(tempFile("crl_cache_vehicle"));
+    test::HttpTestServer http(31594);
+    http.set("/vehicle-ca.crl", crlResponse(files.add(writeCrl("cdp_v1", pki.ca, complete(1)))));
+    AdasOverTls v(31585, adasServer(adas, pki));
+    auto cfg = gatewayClient(pki);
+    cfg.crl = platform::CrlPolicy{"", true, true, "", fastFetch(cache)};
+    v.connector.enableTls(cfg);
+    auto fetchUntilDone = [&](auto done) {
+        for (int i = 0; i < 1500 && !done(); ++i) {
+            v.connector.fetchCrls(diag::Clock::now());
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return done();
+    };
+    CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::TransportError);  // no CRL yet
+    CHECK_EQ(v.connector.crlDistributionPoints().size(), 1u);
+    CHECK(fetchUntilDone([&] { return v.connector.crlFetch()->installed == 1; }));
+    CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::Ok);
+
+    http.set("/vehicle-ca.crl",
+             crlResponse(files.add(writeCrl("cdp_v2", pki.ca, complete(2, {{13, kKeyCompromise}})))));
+    CHECK(fetchUntilDone([&] { return v.connector.revocation()->sessionsClosed == 1; }));
+    CHECK(!v.client.routingActive(dg::kAdas));
     CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::TransportError);
 }
 

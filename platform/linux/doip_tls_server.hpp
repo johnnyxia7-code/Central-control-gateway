@@ -24,7 +24,8 @@ typedef struct ssl_ctx_st SSL_CTX;
 //    gateway sees a connection only once its handshake has completed
 //  - revocation: client certificates are checked against the tester CRLs
 //    (CrlPolicy); reloadCrl() takes a new CRL file and closes sessions whose
-//    certificate has been revoked meanwhile
+//    certificate has been revoked meanwhile; fetchCrls() does the same with
+//    CRLs downloaded from the certificates' distribution points
 //  - OCSP stapling: the server's own OCSP response (DER file from the
 //    backend) is stapled when the client asks for it; reloadOcsp() takes a
 //    new response
@@ -77,6 +78,16 @@ public:
     // with onTcpClosed). False: the file is unusable, the old CRLs stay.
     bool reloadCrl(diag::DiagGateway& gateway, diag::TimePoint now);
     const RevocationStatistics& revocation() const { return revocation_.statistics(); }
+
+    // CRL distribution points (CrlPolicy::fetch), called regularly from the
+    // poll loop: downloads run in the background; when a newer CRL has been
+    // taken, the store is rebuilt as by reloadCrl(). True then.
+    bool fetchCrls(diag::DiagGateway& gateway, diag::TimePoint now) {
+        return revocation_.fetch(now) && reloadCrl(gateway, now);
+    }
+    const CrlFetchStatistics* crlFetch() const { return revocation_.fetchStatistics(); }
+    std::vector<std::string> crlDistributionPoints() const { return revocation_.distributionPoints(); }
+    bool crlFetchBusy() const { return revocation_.fetchBusy(); }
 
     // Loads a new OCSP response for stapling. False: unusable, the old one stays.
     bool reloadOcsp() { return stapler_.load(); }

@@ -204,6 +204,15 @@ bool DoipTcpConnector::reloadCrl(diag::TimePoint now) {
 #endif
 }
 
+bool DoipTcpConnector::fetchCrls(diag::TimePoint now) {
+#ifdef CCG_HAVE_TLS
+    return revocation_ && revocation_->fetch(now) && reloadCrl(now);
+#else
+    (void)now;
+    return false;
+#endif
+}
+
 void DoipTcpConnector::fail(diag::ConnectionId id) {
     close(id);
     failed_.push_back(id);

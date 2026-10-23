@@ -267,6 +267,31 @@ openssl ca -config ca.cnf -keyfile ca.key -cert ca.pem -gencrl -crlexts delta -c
 complete CRL is still correct, just not small; the production PKI publishes
 only the changes since the base.
 
+#### CRL distribution points (RFC 5280 §4.2.1.13)
+
+When the vehicle is online, the gateway can fetch the CRLs itself instead of
+waiting for the backend to push them: `--tls-crl-fetch CACHE` for testers and
+`--vehicle-crl-fetch CACHE` for ECUs (`platform::CrlFetcher`, driven by
+`RevocationChecker`). The CRL files then become optional.
+
+| Topic | Behaviour |
+|-------|-----------|
+| Where URLs come from | CRL Distribution Points and Freshest CRL of the trust file's CAs (known at start-up); of every peer certificate, in the verify callback; Freshest CRL of fetched complete CRLs (their delta CRLs) |
+| Forged certificates | the revocation check runs before OpenSSL verifies the chain's signatures, so the gateway checks them itself: a certificate's URLs are taken only if every signature from it up to a trust anchor verifies. A peer cannot make the gateway send requests |
+| Transport | HTTP only (RFC 5280: a CRL is signed, so no TLS is needed, and TLS would make revocation depend on revocation). HTTP/1.0 GET, IPv4/IPv6, no redirects, at most 4 MiB, 10 s per download. `ldap://`, `https://` and other schemes are counted and ignored; at most 32 URLs |
+| Threading | downloads run on one worker thread (name resolution blocks); the poll loop hands finished downloads to the checker every second |
+| Checks | the body is DER (or PEM); signed by its issuer, a CA of the trust file; thisUpdate not more than 5 min in the future |
+| Newer only | a complete CRL is taken if newer than the one in force for its issuer: CRL number, else thisUpdate. An unchanged or older CRL (stale mirror, replay) is counted and ignored |
+| Fetched deltas | must fit the complete CRL in force (BaseCRLNumber ≤ its number); a delta for a complete CRL the gateway does not have yet waits for it (counted, retried) |
+| Applying | a taken CRL rebuilds the trust store as a reload does: sessions it revokes are closed. The newest complete CRL per issuer wins among the CRL file and the fetched ones |
+| Cache | taken CRLs are written to the cache file (atomic rename) and loaded at start-up, so a restart offline keeps the newest CRLs; cache entries not signed by a trusted CA are dropped |
+| Schedule | a URL is fetched again at its CRL's nextUpdate, but not before 5 min and not after 6 h (`--crl-fetch-interval`); a failed download is retried after 30 s, doubling up to that interval |
+| No CRL yet | with `requireCrl` the first handshake is refused, but it names the distribution point; the next one, after the download, gets in. A vehicle that must work from the first second needs a CRL file or a filled cache |
+
+Counters (`CrlFetchStatistics`): URLs, unsupported and dropped URLs, downloads,
+failed downloads, refused, unchanged, taken, deltas waiting for their base,
+cache write failures. The process prints them when it takes a CRL.
+
 ### 3.9 OCSP stapling
 
 In addition to the CRLs, each TLS server proves the current status of its own
@@ -435,11 +460,12 @@ refuses the TLS options.
 
 ## 8. Limitations / next steps
 
-- TLS: revocation uses complete and delta CRLs and OCSP stapling. The gateway
-  does not query OCSP responders itself (it is offline). It does not fetch
-  CRLs from distribution points or follow Freshest CRL pointers; the backend
-  delivers the files. Indirect CRLs (issued by another entity than the CA) are
-  not supported for deltas.
+- TLS: revocation uses complete and delta CRLs, fetched from distribution
+  points over HTTP when online, and OCSP stapling. The gateway does not query
+  OCSP responders itself. CRLs over LDAP or HTTPS, HTTP redirects and proxies,
+  indirect CRLs (issued by another entity than the CA), and CRLs partitioned
+  by Issuing Distribution Point are not supported: only the newest complete
+  CRL per issuer is used.
   Must-staple is enforced (§3.9). The tester's certificate grants one level ("verified"), with no roles
   from certificate attributes. There is no confirmation step in routing
   activation (0x05 and 0x11 are never sent).

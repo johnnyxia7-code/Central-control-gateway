@@ -8,7 +8,8 @@
 //                    [--vehicle-ca vehicle-ca.pem --vehicle-cert gw-vehicle.pem --vehicle-key gw-vehicle.key]
 //                    [--doip-plain] [--tls-crl testers.crl] [--vehicle-crl vehicle.crl]
 //                    [--tls-delta-crl testers-delta.crl] [--vehicle-delta-crl vehicle-delta.crl]
-//                    [--crl-optional] [--crl-reject-expired]
+//                    [--tls-crl-fetch testers-cache.crl] [--vehicle-crl-fetch vehicle-cache.crl]
+//                    [--crl-fetch-interval 21600] [--crl-optional] [--crl-reject-expired]
 //                    [--tls-ocsp gw.ocsp] [--vehicle-ocsp-require]
 //
 // DoIP over TLS (ISO 13400-2:2019): testers connect to the TLS port; with
@@ -28,6 +29,12 @@
 // revocations since the complete CRL above; they are signature-checked,
 // applied on top of their base CRL and reloaded when they change. A delta for
 // a newer base CRL than the loaded one is refused (previous state kept).
+// CRL distribution points: with --tls-crl-fetch / --vehicle-crl-fetch the
+// gateway also downloads (HTTP) the CRLs named in the certificates it checks
+// and in its trust file, keeps them in the given cache file, and refreshes
+// them at their nextUpdate (at most every --crl-fetch-interval seconds). Only
+// signed CRLs of a trusted CA that are newer than the ones in force are taken;
+// sessions revoked by them are closed. The CRL files then become optional.
 // OCSP stapling: --tls-ocsp is the OCSP response (DER) for the gateway's
 // tester-facing certificate, fetched by the backend; it is stapled for testers
 // that ask and reloaded when it changes. ECUs are asked for their staple; a
@@ -161,6 +168,8 @@ int main(int argc, char** argv) {
     bool doipPlain = false;
     std::string testerCrl, vehicleCrl;
     std::string testerDeltaCrl, vehicleDeltaCrl;
+    platform::CrlFetchPolicy testerFetch, vehicleFetch;
+    long crlFetchInterval = 0;
     bool crlOptional = false;
     bool crlRejectExpired = false;
     std::string tlsOcsp;
@@ -220,6 +229,13 @@ int main(int argc, char** argv) {
                 testerCrl = value;
             } else if (arg == "--vehicle-crl") {
                 vehicleCrl = value;
+            } else if (arg == "--tls-crl-fetch") {
+                testerFetch.cacheFile = value;
+            } else if (arg == "--vehicle-crl-fetch") {
+                vehicleFetch.cacheFile = value;
+            } else if (arg == "--crl-fetch-interval") {
+                crlFetchInterval = std::stol(value);
+                if (crlFetchInterval < 60) throw std::invalid_argument("--crl-fetch-interval: at least 60 s");
             } else if (arg == "--tls-delta-crl") {
                 testerDeltaCrl = value;
             } else if (arg == "--vehicle-delta-crl") {
@@ -251,6 +267,15 @@ int main(int argc, char** argv) {
         if (!vehicleDeltaCrl.empty() && vehicleCrl.empty()) {
             throw std::invalid_argument("--vehicle-delta-crl needs --vehicle-crl");
         }
+        if (!testerFetch.cacheFile.empty() && tlsCa.empty()) throw std::invalid_argument("--tls-crl-fetch needs --tls-ca");
+        if (!vehicleFetch.cacheFile.empty() && vehicleCa.empty()) {
+            throw std::invalid_argument("--vehicle-crl-fetch needs --vehicle-ca");
+        }
+        if (crlFetchInterval > 0) {
+            testerFetch.refresh = vehicleFetch.refresh = std::chrono::seconds(crlFetchInterval);
+            testerFetch.minInterval = vehicleFetch.minInterval =
+                std::min(testerFetch.minInterval, std::chrono::milliseconds(std::chrono::seconds(crlFetchInterval)));
+        }
         if ((tlsOnly || tlsRequireClientCert || !tlsCa.empty()) && tlsCert.empty()) {
             throw std::invalid_argument("TLS options need --tls-cert and --tls-key");
         }
@@ -264,7 +289,8 @@ int main(int argc, char** argv) {
                      " [--tls-cert PEM --tls-key PEM [--tls-ca PEM] [--tls-require-client-cert] [--tls-only]"
                      " [--tls-port 3496]] [--vehicle-ca PEM [--vehicle-cert PEM --vehicle-key PEM]]"
                      " [--doip-plain] [--tls-crl PEM] [--vehicle-crl PEM] [--tls-delta-crl PEM]"
-                     " [--vehicle-delta-crl PEM] [--crl-optional] [--crl-reject-expired]"
+                     " [--vehicle-delta-crl PEM] [--tls-crl-fetch CACHE] [--vehicle-crl-fetch CACHE]"
+                     " [--crl-fetch-interval S] [--crl-optional] [--crl-reject-expired]"
                      " [--tls-ocsp DER] [--vehicle-ocsp-require]\n";
         return EXIT_FAILURE;
     }
@@ -288,7 +314,7 @@ int main(int argc, char** argv) {
             tc.privateKeyFile = tlsKey;
             tc.caFile = tlsCa;
             tc.requireClientCertificate = tlsRequireClientCert;
-            tc.crl = platform::CrlPolicy{testerCrl, !crlOptional, !crlRejectExpired, testerDeltaCrl};
+            tc.crl = platform::CrlPolicy{testerCrl, !crlOptional, !crlRejectExpired, testerDeltaCrl, testerFetch};
             tc.ocspResponseFile = tlsOcsp;
             tls = std::make_unique<platform::DoipTlsServer>(tlsPort, config.entity.maxTcpConnections, tc);
             transport.tls = tls.get();
@@ -298,6 +324,8 @@ int main(int argc, char** argv) {
                       << (tlsOnly ? ", plain TCP refused for routing activation" : "")
                       << (testerCrl.empty() ? "" : ", revocation: " + testerCrl)
                       << (testerDeltaCrl.empty() ? "" : " + delta " + testerDeltaCrl)
+                      << (testerFetch.cacheFile.empty() ? "" : ", CRL distribution points (cache " +
+                                                                    testerFetch.cacheFile + ")")
                       << (tlsOcsp.empty() ? "" : ", OCSP staple: " + tlsOcsp)
                       << (tls->mustStaple() ? " (certificate is must-staple)" : "") << "\n";
         }
@@ -339,11 +367,14 @@ int main(int argc, char** argv) {
                                             "--vehicle-key), or --doip-plain on the bench");
             }
             doipConnector.enableTls(platform::TlsClientConfig{
-                vehicleCert, vehicleKey, vehicleCa, platform::CrlPolicy{vehicleCrl, !crlOptional, !crlRejectExpired, vehicleDeltaCrl},
+                vehicleCert, vehicleKey, vehicleCa, platform::CrlPolicy{vehicleCrl, !crlOptional, !crlRejectExpired, vehicleDeltaCrl, vehicleFetch},
                 platform::OcspPolicy{true, vehicleOcspRequire}});
-            if (!vehicleCrl.empty()) {
-                std::cout << "[diag] ECU certificate revocation: " << vehicleCrl
-                          << (vehicleDeltaCrl.empty() ? "" : " + delta " + vehicleDeltaCrl) << "\n";
+            if (!vehicleCrl.empty() || !vehicleFetch.cacheFile.empty()) {
+                std::cout << "[diag] ECU certificate revocation: " << (vehicleCrl.empty() ? "-" : vehicleCrl)
+                          << (vehicleDeltaCrl.empty() ? "" : " + delta " + vehicleDeltaCrl)
+                          << (vehicleFetch.cacheFile.empty() ? "" : ", CRL distribution points (cache " +
+                                                                         vehicleFetch.cacheFile + ")")
+                          << "\n";
             }
         }
         diag::DoipClient doipClient(doipCfg, doipConnector);
@@ -386,6 +417,7 @@ int main(int argc, char** argv) {
         auto nextTick = now + std::chrono::milliseconds(1);
         auto nextStats = now + std::chrono::seconds(10);
         auto nextCrlCheck = now + std::chrono::seconds(5);
+        auto nextCrlFetch = now;
         platform::FileWatcher testerCrlWatch(testerCrl);
         platform::FileWatcher vehicleCrlWatch(vehicleCrl);
         platform::FileWatcher testerDeltaWatch(testerDeltaCrl);
@@ -465,6 +497,21 @@ int main(int argc, char** argv) {
             if (now >= nextStats) {
                 printStatistics(gateway.statistics());
                 nextStats = now + std::chrono::seconds(10);
+            }
+            // CRL distribution points: downloads run in the background, newer CRLs apply at once.
+            if (now >= nextCrlFetch) {
+                nextCrlFetch = now + std::chrono::seconds(1);
+                auto report = [](const char* side, const platform::CrlFetchStatistics* f,
+                                 const platform::RevocationStatistics* r) {
+                    std::cout << "[diag] " << side << " CRL fetched from a distribution point (taken " << f->installed
+                              << ", unchanged " << f->stale << ", refused " << f->rejected << ", failed downloads "
+                              << f->failures << ", URLs " << f->urls << "; sessions closed " << r->sessionsClosed
+                              << ")\n";
+                };
+#ifdef CCG_HAVE_TLS
+                if (tls && tls->fetchCrls(gateway, now)) report("tester", tls->crlFetch(), &tls->revocation());
+#endif
+                if (doipConnector.fetchCrls(now)) report("vehicle", doipConnector.crlFetch(), doipConnector.revocation());
             }
             // CRLs replaced by the backend: new handshakes use them, revoked sessions end.
             if (now >= nextCrlCheck) {

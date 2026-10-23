@@ -26,7 +26,8 @@ typedef struct ssl_ctx_st SSL_CTX;
 // route's server name, and presents the gateway's vehicle certificate. The
 // client is told "connected" only once TLS is up. With a CRL policy the ECU
 // certificates are checked for revocation; reloadCrl() takes a new CRL file
-// and closes connections to ECUs whose certificate has been revoked. The ECU
+// and closes connections to ECUs whose certificate has been revoked;
+// fetchCrls() does the same with CRLs from the distribution points. The ECU
 // is asked for an OCSP staple, which is verified (OcspPolicy).
 namespace ccg::platform {
 
@@ -57,6 +58,14 @@ public:
     // file is unusable (old CRLs stay) or no CRL is configured.
     bool reloadCrl(diag::TimePoint now);
     const RevocationStatistics* revocation() const { return revocation_ ? &revocation_->statistics() : nullptr; }
+    // CRL distribution points (CrlPolicy::fetch), called regularly from the
+    // poll loop; true when a newer CRL was taken and applied as by reloadCrl().
+    bool fetchCrls(diag::TimePoint now);
+    const CrlFetchStatistics* crlFetch() const { return revocation_ ? revocation_->fetchStatistics() : nullptr; }
+    std::vector<std::string> crlDistributionPoints() const {
+        return revocation_ ? revocation_->distributionPoints() : std::vector<std::string>{};
+    }
+    bool crlFetchBusy() const { return revocation_ && revocation_->fetchBusy(); }
     const OcspStatistics* ocsp() const { return ocsp_ ? &ocsp_->statistics() : nullptr; }
 
     // diag::IDoipConnector; endpoint "a.b.c.d:port"
