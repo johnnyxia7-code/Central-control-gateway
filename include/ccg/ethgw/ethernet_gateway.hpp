@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -13,6 +14,7 @@
 #include "ccg/can/can_frame.hpp"
 #include "ccg/e2e/can_e2e.hpp"
 #include "ccg/ethgw/routing_config.hpp"
+#include "ccg/secoc/secoc.hpp"
 
 namespace ccg::ethgw {
 
@@ -49,6 +51,20 @@ struct GatewayStatistics {
     std::uint64_t datagramsSent = 0;
     std::uint64_t ethTxFailures = 0;
     std::chrono::milliseconds maxDatagramCollectionDelay{0};
+    // SecOC
+    std::uint64_t secocVerified = 0;
+    std::uint64_t secocMacFailures = 0;
+    std::uint64_t secocFreshnessFailures = 0;
+    std::uint64_t secocProtected = 0;
+    std::uint64_t secocTxFailures = 0;   // crypto error or exhausted freshness counter
+};
+
+// Failed SecOC verification, reported to the intrusion detection (IdsM).
+struct SecurityEvent {
+    std::string pdu;
+    std::size_t channel = 0;
+    secoc::VerifyResult result = secoc::VerifyResult::Ok;
+    std::chrono::steady_clock::time_point time{};
 };
 
 class RoutingConfigError : public std::runtime_error {
@@ -66,8 +82,10 @@ private:
 // Single threaded: all entry points are called from one executor.
 class EthernetGateway {
 public:
-    // Throws RoutingConfigError if validateRoutingConfig() reports problems.
-    EthernetGateway(RoutingConfig config, IGatewayTransmitter& transmitter);
+    // Throws RoutingConfigError if validateRoutingConfig() reports problems or a
+    // secured PDU's key is not available in `crypto`.
+    EthernetGateway(RoutingConfig config, IGatewayTransmitter& transmitter,
+                    secoc::ICryptoService* crypto = nullptr);
 
     void start(TimePoint now);
 
@@ -80,6 +98,9 @@ public:
 
     std::optional<std::size_t> channelIndex(const std::string& name) const;
     const GatewayStatistics& statistics() const { return stats_; }
+    const std::deque<SecurityEvent>& securityEvents() const { return securityEvents_; }
+    // SecOC freshness counters, to be persisted (NvM) and restored at start-up.
+    secoc::FreshnessManager& freshness() { return freshness_; }
     const RoutingConfig& config() const { return config_; }
 
     // Current raw value of a signal in a PDU assembled by the gateway.
@@ -136,13 +157,18 @@ private:
     void transmitAssembled(std::size_t pdu, TimePoint now);
     void forwardPdu(std::size_t target, const std::uint8_t* data, std::size_t length,
                     TimePoint now);
+    bool sendPdu(std::size_t pdu, const std::uint8_t* authentic, std::size_t length, TimePoint now);
     void sendOnChannel(std::size_t pdu, const std::uint8_t* data, std::size_t length,
                        TimePoint now);
+    void reportSecurityEvent(std::size_t pdu, secoc::VerifyResult result, TimePoint now);
     void flushContainer(std::size_t channel, TimePoint now);
 
     RoutingConfig config_;
     IGatewayTransmitter& tx_;
     GatewayStatistics stats_;
+    secoc::FreshnessManager freshness_;
+    std::unique_ptr<secoc::SecOcProcessor> secoc_;
+    std::deque<SecurityEvent> securityEvents_;
     bool started_ = false;
     TimePoint startTime_{};
 

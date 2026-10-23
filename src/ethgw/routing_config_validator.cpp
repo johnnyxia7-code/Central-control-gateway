@@ -29,6 +29,12 @@ std::string str(const SignalRef& ref) { return ref.pdu + "." + ref.signal; }
 
 }  // namespace
 
+std::size_t authenticLength(const PduDefinition& pdu) {
+    if (!pdu.secoc) return pdu.length;
+    const std::size_t overhead = secoc::overheadBytes(*pdu.secoc);
+    return overhead < pdu.length ? pdu.length - overhead : 0;
+}
+
 const char* toString(BusType type) {
     switch (type) {
         case BusType::Can: return "CAN";
@@ -56,6 +62,7 @@ std::vector<std::string> validateRoutingConfig(const RoutingConfig& config) {
     // ----------------------------------------------------------------- PDUs
     std::map<std::string, const PduDefinition*> pdus;
     std::set<std::tuple<std::string, std::uint32_t, bool>> identifiers;
+    std::set<std::uint16_t> dataIds;
     for (const auto& pdu : config.pdus) {
         const std::string where = "PDU '" + pdu.name + "'";
         if (pdu.name.empty() || !pdus.emplace(pdu.name, &pdu).second) {
@@ -97,7 +104,18 @@ std::vector<std::string> validateRoutingConfig(const RoutingConfig& config) {
                 toString(ch->second->type), ")");
             continue;
         }
-        can::checkSignalLayout(where, pdu.length, pdu.signals, pdu.e2e, errors);
+        if (pdu.secoc) {
+            for (const auto& e : secoc::validateSecOcConfig(*pdu.secoc)) add(errors, where, ": ", e);
+            if (!dataIds.insert(pdu.secoc->dataId).second) {
+                add(errors, where, ": SecOC Data ID ", hex(pdu.secoc->dataId), " already used");
+            }
+            if (authenticLength(pdu) == 0) {
+                add(errors, where, ": no room for the authentic PDU next to the SecOC trailer (",
+                    secoc::overheadBytes(*pdu.secoc), " bytes)");
+                continue;
+            }
+        }
+        can::checkSignalLayout(where, authenticLength(pdu), pdu.signals, pdu.e2e, errors);
     }
 
     auto findSignal = [&](const SignalRef& ref) -> const can::SignalSpec* {
@@ -139,10 +157,10 @@ std::vector<std::string> validateRoutingConfig(const RoutingConfig& config) {
             if (!pduRouteTargets.insert(target).second) {
                 add(errors, where, ": PDU '", target, "' is the target of more than one PDU route");
             }
-            if (tgt->second->length < src->second->length) {
-                add(errors, where, ": target '", target, "' (", tgt->second->length,
-                    " bytes) shorter than source '", route.source, "' (", src->second->length,
-                    " bytes)");
+            if (authenticLength(*tgt->second) < authenticLength(*src->second)) {
+                add(errors, where, ": target '", target, "' (", authenticLength(*tgt->second),
+                    " bytes) shorter than source '", route.source, "' (",
+                    authenticLength(*src->second), " bytes)");
             }
             if (tgt->second->e2e) {
                 add(errors, where, ": target '", target,

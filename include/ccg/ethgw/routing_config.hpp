@@ -9,6 +9,7 @@
 
 #include "ccg/can/signal_codec.hpp"
 #include "ccg/e2e/can_e2e.hpp"
+#include "ccg/secoc/secoc.hpp"
 
 // Routing table of the central Ethernet gateway.
 //
@@ -54,6 +55,10 @@ struct PduDefinition {
     std::uint16_t length = 8;
     std::vector<can::SignalSpec> signals;
     std::optional<e2e::CanE2EConfig> e2e;  // checked on reception / applied on assembly
+    // Secured I-PDU (SecOC): verified on reception, authenticated on transmission.
+    // The last overheadBytes() of `length` carry the truncated FV and MAC; signals
+    // and E2E live in the authentic part in front of them.
+    std::optional<secoc::SecOcConfig> secoc;
 
     // Reception (source of signal routes)
     Milliseconds timeout{0};  // deadline monitoring, 0 = off
@@ -98,6 +103,9 @@ struct RoutingConfig {
     std::vector<PduRoute> pduRoutes;
     std::vector<SignalRoute> signalRoutes;
 };
+
+// Length of the authentic part (the whole PDU when it is not secured).
+std::size_t authenticLength(const PduDefinition& pdu);
 
 std::vector<std::string> validateRoutingConfig(const RoutingConfig& config);
 

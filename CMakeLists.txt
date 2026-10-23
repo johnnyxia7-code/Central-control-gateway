@@ -40,7 +40,7 @@ add_library(ccg_ethgw
   src/ethgw/ethernet_gateway.cpp
 )
 target_include_directories(ccg_ethgw PUBLIC include)
-target_link_libraries(ccg_ethgw PUBLIC ccg_s2s)
+target_link_libraries(ccg_ethgw PUBLIC ccg_s2s ccg_secoc)
 ccg_warnings(ccg_ethgw)
 
 # --- diagnostic routing: DoIP <-> UDS on CAN (ISO-TP) -------------------------
@@ -53,6 +53,14 @@ add_library(ccg_diag
 target_include_directories(ccg_diag PUBLIC include)
 target_link_libraries(ccg_diag PUBLIC ccg_s2s)
 ccg_warnings(ccg_diag)
+
+# --- SecOC: AES-128-CMAC authentication, freshness management ---------------
+add_library(ccg_secoc
+  src/crypto/aes_cmac.cpp
+  src/secoc/secoc.cpp
+)
+target_include_directories(ccg_secoc PUBLIC include)
+ccg_warnings(ccg_secoc)
 
 # --- reference vehicle matrices ----------------------------------------------
 add_library(ccg_vehicle_matrix
@@ -90,9 +98,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     platform/linux/someip_udp_binding.cpp
     platform/linux/udp_socket.cpp
     platform/linux/doip_sockets.cpp
+    platform/linux/secoc_storage.cpp
   )
   target_include_directories(ccg_platform_linux PUBLIC platform/linux)
-  target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s ccg_diag)
+  target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s ccg_diag ccg_secoc)
   ccg_warnings(ccg_platform_linux)
 
   add_executable(ccg_s2s_gateway app/s2s_gateway_main.cpp)
@@ -123,12 +132,19 @@ if(CCG_BUILD_TESTS)
     tests/test_isotp.cpp
     tests/test_doip_message.cpp
     tests/test_diag_gateway.cpp
+    tests/test_aes_cmac.cpp
+    tests/test_secoc.cpp
   )
-  target_link_libraries(ccg_tests PRIVATE ccg_vehicle_matrix ccg_sim)
+  target_link_libraries(ccg_tests PRIVATE ccg_vehicle_matrix ccg_sim ccg_secoc)
   if(TARGET ccg_platform_linux)
     target_sources(ccg_tests PRIVATE tests/test_someip_udp_binding.cpp tests/test_udp_socket.cpp
-                                     tests/test_doip_sockets.cpp)
+                                     tests/test_doip_sockets.cpp tests/test_secoc_storage.cpp)
     target_link_libraries(ccg_tests PRIVATE ccg_platform_linux)
+  endif()
+  find_package(OpenSSL 3 QUIET)
+  if(OpenSSL_FOUND)  # test-only cross-check of the software AES-CMAC
+    target_sources(ccg_tests PRIVATE tests/test_cmac_openssl.cpp)
+    target_link_libraries(ccg_tests PRIVATE OpenSSL::Crypto)
   endif()
   ccg_warnings(ccg_tests)
   add_test(NAME ccg_tests COMMAND ccg_tests)

@@ -12,6 +12,7 @@
 #include "ccg/e2e/can_e2e.hpp"
 #include "ccg/ethgw/ethernet_gateway.hpp"
 #include "ccg/ethgw/pdu_header_codec.hpp"
+#include "ccg/secoc/secoc.hpp"
 #include "vehicle_eth_gateway_matrix.hpp"
 
 namespace {
@@ -144,13 +145,63 @@ int main() {
     const auto cfg = config::makeVehicleEthGatewayMatrix();
     SimTransmitter tx(cfg);
     Ecus ecus(cfg);
-    ethgw::EthernetGateway gateway(cfg, tx);
+    secoc::SoftwareCryptoService gatewayKeys;  // the gateway's HSM in the vehicle
+    config::provisionDemoSecOcKeys(gatewayKeys);
+    ethgw::EthernetGateway gateway(cfg, tx, &gatewayKeys);
+
+    // SecOC senders: ADAS domain controller and VCU, each with its own counters.
+    secoc::SoftwareCryptoService ecuKeys;
+    config::provisionDemoSecOcKeys(ecuKeys);
+    secoc::FreshnessManager adasFv, vcuFv;
+    secoc::SecOcProcessor adasSecOc(ecuKeys, adasFv), vcuSecOc(ecuKeys, vcuFv);
+    auto secocOf = [&](const std::string& name) -> const secoc::SecOcConfig& {
+        for (const auto& p : cfg.pdus) {
+            if (p.name == name) return *p.secoc;
+        }
+        throw std::invalid_argument(name);
+    };
+    std::vector<std::uint8_t> lastSteer;
+    std::size_t reportedEvents = 0;
 
     g_t0 = g_now = ethgw::TimePoint{} + 1s;
     gateway.start(g_now);
 
     for (int t = 0; t <= 300; ++t) {
         g_now = g_t0 + std::chrono::milliseconds(t);
+
+        // --- SecOC: secured steering requests from the ADAS domain (every 20 ms until 170 ms)
+        if (t % 20 == 10 && t <= 170) {
+            if (t == 10) log("ETH_ADAS: SecOC-secured ADAS_SteerTorqueReq stream starts");
+            const auto f = ecus.frame("ADAS_SteerTorqueReq",
+                                      {{"ADAS_SteerTqReq", 1.0 + t * 0.01}, {"ADAS_SteerReqActive", 1}});
+            const auto secured = *adasSecOc.protect(secocOf("ADAS_SteerTorqueReq"), f.data.data(), 8);
+            lastSteer = secured;
+            std::vector<std::uint8_t> d;
+            ethgw::appendPdu(d, gw::kAdasSteerTorqueReq, secured.data(), secured.size());
+            gateway.onEthernetDatagram(gw::kEthAdas, d.data(), d.size(), g_now);
+        }
+        if (t == 115 || t == 135) {
+            auto attack = lastSteer;
+            if (t == 115) {
+                log("attacker: steering request with manipulated torque and a fresh-looking counter");
+                attack[1] = 0x7F;   // torque
+                attack[15] += 1;    // FV LSB: newer than the last accepted value
+            } else {
+                log("attacker: replay of the last genuine steering request");
+            }
+            std::vector<std::uint8_t> d;
+            ethgw::appendPdu(d, gw::kAdasSteerTorqueReq, attack.data(), attack.size());
+            gateway.onEthernetDatagram(gw::kEthAdas, d.data(), d.size(), g_now);
+        }
+        if (t == 171) log("ADAS stops sending: request times out after 100 ms -> safe state");
+
+        // --- SecOC: secured power limits from the VCU on PT_CAN (re-authenticated for ETH_ADAS)
+        if (t % 100 == 40) {
+            auto f = ecus.frame("VCU_PowerLimit", {{"VCU_MaxDischrgPwr", 150.0}, {"VCU_MaxChrgPwr", 60.0}});
+            const auto secured = *vcuSecOc.protect(secocOf("VCU_PowerLimit"), f.data.data(), 12);
+            std::copy(secured.begin(), secured.end(), f.data.begin());
+            gateway.onCanFrame(gw::kPtCan, f, g_now);
+        }
 
         if (t % 10 == 0) {
             const double v = 50.0 + t * 0.02;
@@ -193,6 +244,12 @@ int main() {
         }
 
         gateway.mainFunction(g_now);
+
+        const auto& events = gateway.securityEvents();
+        for (; reportedEvents < events.size(); ++reportedEvents) {
+            std::cout << stamp() << "IdsM security event: " << events[reportedEvents].pdu << " "
+                      << secoc::toString(events[reportedEvents].result) << " -> PDU dropped\n";
+        }
     }
 
     const auto& s = gateway.statistics();
@@ -200,7 +257,9 @@ int main() {
               << " unrouted=" << s.unroutedPdus << " e2eErrors=" << s.e2eErrors
               << " forwarded=" << s.pdusForwarded << " signalsRouted=" << s.signalsRouted
               << " assembled=" << s.assembledPdusSent << " canTx=" << s.canFramesSent
-              << " datagramsTx=" << s.datagramsSent
+              << " datagramsTx=" << s.datagramsSent << " secocVerified=" << s.secocVerified
+              << " secocProtected=" << s.secocProtected << " secocMacFail=" << s.secocMacFailures
+              << " secocFreshFail=" << s.secocFreshnessFailures
               << " maxCollectionDelay=" << s.maxDatagramCollectionDelay.count() << " ms\n";
     return 0;
 }

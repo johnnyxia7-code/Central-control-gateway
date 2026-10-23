@@ -66,15 +66,22 @@ struct MockTransmitter final : IGatewayTransmitter {
     }
 };
 
+secoc::SoftwareCryptoService demoCrypto() {
+    secoc::SoftwareCryptoService crypto;
+    config::provisionDemoSecOcKeys(crypto);
+    return crypto;
+}
+
 struct Fixture {
     RoutingConfig cfg;
     MockTransmitter tx;
+    secoc::SoftwareCryptoService crypto = demoCrypto();
     EthernetGateway gw;
     TimePoint now = TimePoint{} + 10s;
     std::map<std::string, e2e::CanE2ESender> senders;
 
     explicit Fixture(RoutingConfig c = config::makeVehicleEthGatewayMatrix())
-        : cfg(c), gw(std::move(c), tx) {
+        : cfg(c), gw(std::move(c), tx, &crypto) {
         gw.start(now);
     }
 
@@ -219,9 +226,10 @@ TEST_CASE("ethgw config: invalid table throws on construction") {
     auto cfg = config::makeVehicleEthGatewayMatrix();
     cfg.pduRoutes[0].source = "Nope";
     MockTransmitter tx;
+    auto crypto = demoCrypto();
     bool thrown = false;
     try {
-        EthernetGateway g(cfg, tx);
+        EthernetGateway g(cfg, tx, &crypto);
     } catch (const RoutingConfigError& e) {
         thrown = true;
         CHECK_EQ(e.errors().size(), 1U);
@@ -275,8 +283,8 @@ TEST_CASE("ethgw: PDUs from several buses share one Ethernet datagram") {
 
 TEST_CASE("ethgw: datagram size limit and urgent PDUs flush the container") {
     auto cfg = config::makeVehicleEthGatewayMatrix();
-    cfg.channels[gw::kEthAdas].maxDatagramSize = 30;  // room for ESP (16) but not ESP + VCU (40)
-    findPdu(cfg, "ADAS_HmiInfo")->length = 16;        // keep every ETH_ADAS PDU within 30 bytes
+    cfg.channels[gw::kEthAdas].maxDatagramSize = 39;  // room for ESP (16) but not ESP + VCU (40)
+    findPdu(cfg, "ADAS_HmiInfo")->length = 16;        // keep every ETH_ADAS PDU within 39 bytes
     findPdu(cfg, "ADAS_HmiInfo_IVI")->length = 16;
     Fixture f(cfg);
     f.rx("ESP_WheelSpeeds", {});
@@ -490,4 +498,171 @@ TEST_CASE("ethgw: E2E fault blocks signal routing but not message routing") {
     CHECK_EQ(f.gw.statistics().e2eRepeated, 1U);
     f.rx("VCU_DriveState", {{"VCU_VehSpd", 42.0}});
     CHECK_EQ(f.raw("GW_VehicleState", "GW_VehSpd"), 420U);
+}
+
+// --------------------------------------------------------------------- SecOC
+
+namespace {
+
+// ECU side of a secured link: own crypto service and freshness counters.
+struct SecureEcu {
+    secoc::SoftwareCryptoService crypto = demoCrypto();
+    secoc::FreshnessManager fvm;
+    secoc::SecOcProcessor proc{crypto, fvm};
+};
+
+Bytes steerRequest(double torqueNm, bool active) {
+    Bytes a(8, 0x00);
+    can::SignalSpec tq;
+    tq.startBit = 0;
+    tq.length = 16;
+    tq.isSigned = true;
+    tq.factor = 0.01;
+    can::insertRaw(a.data(), tq, can::physicalToRaw(tq, torqueNm));
+    a[2] = active ? 0x01 : 0x00;
+    return a;
+}
+
+void sendSteer(Fixture& f, const Bytes& secured) {
+    const auto d = datagram({{gw::kAdasSteerTorqueReq, secured}});
+    f.gw.onEthernetDatagram(gw::kEthAdas, d.data(), d.size(), f.now);
+}
+
+}  // namespace
+
+TEST_CASE("secoc gateway: verify on ETH_ADAS, re-authenticate for CHS_CAN") {
+    Fixture f;
+    SecureEcu adas, eps;
+    const auto& rxCfg = *f.def("ADAS_SteerTorqueReq").secoc;
+    const auto& txCfg = *f.def("GW_SteerTorqueReq").secoc;
+
+    for (int i = 0; i < 3; ++i) {
+        const auto authentic = steerRequest(2.5 + i, true);
+        const auto secured = *adas.proc.protect(rxCfg, authentic.data(), authentic.size());
+        REQUIRE(secured.size() == 24);
+        sendSteer(f, secured);
+        f.advance(10ms);
+    }
+    const auto frames = f.tx.canFrames(gw::kChsCan, gw::kGwSteerTorqueReq);
+    REQUIRE(frames.size() == 3);
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        CHECK_EQ(frames[i].length, 8);
+        CHECK(eps.proc.verify(txCfg, frames[i].data.data(), 4) == secoc::VerifyResult::Ok);
+        CHECK_EQ(f.field("GW_SteerTorqueReq", "GW_SteerTqReq", frames[i].data.data()), 250U + 100U * i);
+        CHECK_EQ(f.field("GW_SteerTorqueReq", "GW_SteerReqActive", frames[i].data.data()), 1U);
+        CHECK_EQ(frames[i].data[4], i + 1);  // truncated FV of the gateway's own counter
+    }
+    CHECK_EQ(f.gw.statistics().secocVerified, 3U);
+    CHECK_EQ(f.gw.statistics().secocProtected, 3U);
+    CHECK(f.gw.securityEvents().empty());
+    CHECK_EQ(f.gw.freshness().snapshot().tx.at(0x01B0), 3U);
+}
+
+TEST_CASE("secoc gateway: tampered, replayed and forged PDUs are dropped") {
+    Fixture f;
+    SecureEcu adas;
+    const auto& cfg = *f.def("ADAS_SteerTorqueReq").secoc;
+    const auto request = steerRequest(1.0, true);
+    const auto valid = *adas.proc.protect(cfg, request.data(), request.size());
+
+    auto tampered = valid;
+    tampered[0] ^= 0x40;  // torque changed on the wire
+    sendSteer(f, tampered);
+    sendSteer(f, valid);
+    sendSteer(f, valid);  // replay
+
+    secoc::SoftwareCryptoService wrong;
+    wrong.setKey("K_ADAS_GW", crypto::Block{});  // attacker without the real key
+    secoc::FreshnessManager fvm;
+    fvm.restore({{{0x1003, 50}}, {}}, 0);
+    secoc::SecOcProcessor attacker(wrong, fvm);
+    sendSteer(f, *attacker.protect(cfg, request.data(), request.size()));
+
+    CHECK_EQ(f.tx.canFrames(gw::kChsCan, gw::kGwSteerTorqueReq).size(), 1U);  // only the genuine one
+    const auto& s = f.gw.statistics();
+    CHECK_EQ(s.secocVerified, 1U);
+    CHECK_EQ(s.secocMacFailures, 2U);
+    CHECK_EQ(s.secocFreshnessFailures, 1U);
+    const auto& events = f.gw.securityEvents();
+    REQUIRE(events.size() == 3);
+    CHECK(events[0].pdu == "ADAS_SteerTorqueReq");
+    CHECK(events[0].result == secoc::VerifyResult::MacFailure);
+    CHECK(events[1].result == secoc::VerifyResult::FreshnessFailure);
+    CHECK_EQ(events[2].channel, gw::kEthAdas);
+}
+
+TEST_CASE("secoc gateway: unauthenticated source falls back to the safe state") {
+    Fixture f;
+    SecureEcu adas, eps;
+    const auto& cfg = *f.def("ADAS_SteerTorqueReq").secoc;
+    const auto request = steerRequest(3.0, true);
+    sendSteer(f, *adas.proc.protect(cfg, request.data(), request.size()));
+    for (int i = 0; i < 10; ++i) {  // only forged frames afterwards
+        auto forged = *adas.proc.protect(cfg, request.data(), request.size());
+        forged[23] ^= 0x01;
+        f.advance(10ms);
+        sendSteer(f, forged);
+    }
+    f.advance(10ms);
+    const auto frames = f.tx.canFrames(gw::kChsCan, gw::kGwSteerTorqueReq);
+    REQUIRE(frames.size() == 2);  // genuine request + timeout substitution
+    const auto* last = frames.back().data.data();
+    CHECK_EQ(f.field("GW_SteerTorqueReq", "GW_SteerReqActive", last), 0U);
+    CHECK_EQ(f.field("GW_SteerTorqueReq", "GW_SteerTqReq", last), 0U);
+    CHECK(eps.proc.verify(*f.def("GW_SteerTorqueReq").secoc, frames[0].data.data(), 4) ==
+          secoc::VerifyResult::Ok);
+    CHECK(eps.proc.verify(*f.def("GW_SteerTorqueReq").secoc, last, 4) == secoc::VerifyResult::Ok);
+}
+
+TEST_CASE("secoc gateway: secured CAN FD message routed and re-authenticated for Ethernet") {
+    Fixture f;
+    SecureEcu vcu, adas;
+    const auto& rxCfg = *f.def("VCU_PowerLimit").secoc;
+    Bytes authentic(12);
+    for (std::size_t i = 0; i < authentic.size(); ++i) authentic[i] = static_cast<std::uint8_t>(0xA0 + i);
+    const auto secured = *vcu.proc.protect(rxCfg, authentic.data(), authentic.size());
+    can::CanFrame frame;
+    frame.id = gw::kVcuPowerLimit;
+    frame.fd = true;
+    frame.length = 16;
+    std::copy(secured.begin(), secured.end(), frame.data.begin());
+    f.gw.onCanFrame(gw::kPtCan, frame, f.now);
+    f.advance(5ms);
+
+    const auto pdus = f.tx.ethPdus(gw::kEthAdas, gw::kVcuPowerLimitAdas);
+    REQUIRE(pdus.size() == 1);
+    REQUIRE(pdus[0].size() == 28);
+    CHECK(Bytes(pdus[0].begin(), pdus[0].begin() + 12) == authentic);
+    const auto& txCfg = *f.def("VCU_PowerLimit_ADAS").secoc;
+    CHECK(adas.proc.verify(txCfg, pdus[0].data(), 12) == secoc::VerifyResult::Ok);
+    // The VCU's 4-byte profile-1 trailer stays on PT_CAN; ETH_ADAS gets a new 16-byte one.
+    CHECK(Bytes(pdus[0].begin() + 12, pdus[0].begin() + 16) != Bytes(secured.begin() + 12, secured.end()));
+    CHECK_EQ(f.gw.statistics().secocVerified, 1U);
+    CHECK_EQ(f.gw.statistics().secocProtected, 1U);
+}
+
+TEST_CASE("secoc gateway: configuration checks") {
+    auto cfg = config::makeVehicleEthGatewayMatrix();
+    findPdu(cfg, "GW_SteerTorqueReq")->length = 4;                      // no room for 4 B trailer
+    findPdu(cfg, "VCU_PowerLimit_ADAS")->secoc->dataId = 0x1003;        // duplicate Data ID
+    findPdu(cfg, "VCU_PowerLimit")->signals[1].startBit = 96;           // reaches into the trailer
+    findPdu(cfg, "ADAS_SteerTorqueReq")->secoc->macTxBits = 4;
+    findPdu(cfg, "VCU_PowerLimit_ADAS")->length = 20;                   // authentic 4 < source 12
+    const auto errors = validateRoutingConfig(cfg);
+    CHECK(contains(errors, "PDU 'GW_SteerTorqueReq': no room for the authentic PDU"));
+    CHECK(contains(errors, "PDU 'VCU_PowerLimit_ADAS': SecOC Data ID 0x1003 already used"));
+    CHECK(contains(errors, "PDU 'VCU_PowerLimit': signal 'VCU_MaxChrgPwr' does not fit into 12 bytes"));
+    CHECK(contains(errors, "PDU 'ADAS_SteerTorqueReq': SecOC macTxBits must be 8..128"));
+    CHECK(contains(errors, "target 'VCU_PowerLimit_ADAS' (4 bytes) shorter than source 'VCU_PowerLimit' (12 bytes)"));
+
+    MockTransmitter tx;
+    bool thrown = false;
+    try {
+        EthernetGateway g(config::makeVehicleEthGatewayMatrix(), tx);  // no crypto service
+    } catch (const RoutingConfigError& e) {
+        thrown = true;
+        CHECK(contains(e.errors(), "PDU 'ADAS_SteerTorqueReq': SecOC key 'K_ADAS_GW' not available"));
+        CHECK_EQ(e.errors().size(), 4U);
+    }
+    CHECK(thrown);
 }

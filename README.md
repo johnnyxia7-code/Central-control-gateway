@@ -1,6 +1,6 @@
 # Central Control Gateway – HPC
 
-Gateway functions for a vehicle HPC (high performance computer): signal-to-service, Ethernet routing and diagnostic routing.
+Gateway functions for a vehicle HPC (high performance computer): signal-to-service, Ethernet routing with SecOC, and diagnostic routing.
 
 ## Signal-to-Service (S2S)
 
@@ -38,8 +38,20 @@ DoIP edge node for the external tester, routing UDS requests to the ECUs on CAN.
 
 Design: [docs/DIAG_GATEWAY_DESIGN.md](docs/DIAG_GATEWAY_DESIGN.md)
 
-All three functions check their configuration at start-up and come with a
-Linux process and a deterministic virtual-time simulator.
+## SecOC (Secure Onboard Communication)
+
+Authenticity, integrity and replay protection for security-relevant PDUs routed by the Ethernet gateway.
+
+- **AUTOSAR SecOC** secured I-PDUs: authentic PDU + truncated freshness value + truncated AES-128-CMAC over Data ID, PDU and complete freshness value
+- **Verification** of received secured PDUs before routing: tampered, forged and replayed PDUs are dropped and reported as security events (IdsM)
+- **Re-authentication** with the target domain's key and profile (e.g. Ethernet 64-bit FV/MAC → CAN profile 1 "24Bit-CMAC-8Bit-FV")
+- **Freshness value manager** with FV reconstruction from truncated values, acceptance window, multiple verify attempts, persistence with restart margin
+- Crypto service interface for the HSM, software AES-128-CMAC verified against FIPS-197, RFC 4493 and OpenSSL
+
+Design: [docs/SECOC_DESIGN.md](docs/SECOC_DESIGN.md)
+
+All functions check their configuration at start-up and come with a Linux
+process and a deterministic virtual-time simulator.
 
 ## Build & test
 
@@ -68,7 +80,8 @@ sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
 ./build/ccg_s2s_gateway --can vcan0 --port 30490 --subscriber 127.0.0.1:30501
 
 ./build/ccg_eth_gateway --bind PT_CAN=can0 --bind CHS_CAN=can1 --bind BODY_CAN=can2 \
-    --bind ETH_ADAS=udp:30500:192.168.10.20:30500 --bind ETH_IVI=udp:30501:192.168.10.30:30501
+    --bind ETH_ADAS=udp:30500:192.168.10.20:30500 --bind ETH_IVI=udp:30501:192.168.10.30:30501 \
+    --keys secoc.keys --fv-store freshness.dat      # or --demo-keys on the bench
 
 ./build/ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2   # DoIP on TCP/UDP 13400
 ```
@@ -76,10 +89,10 @@ sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
 ## Layout
 
 ```
-include/ccg/   public headers (can, e2e, someip, s2s, ethgw, isotp, doip, diag)
-src/           portable core libraries (ccg_s2s, ccg_ethgw, ccg_diag)
+include/ccg/   public headers (can, e2e, someip, s2s, ethgw, isotp, doip, diag, crypto, secoc)
+src/           portable core libraries (ccg_s2s, ccg_ethgw, ccg_diag, ccg_secoc)
 config/        reference S2S matrix, Ethernet routing table, diagnostic routing table
-platform/linux SocketCAN, UDP, SOME/IP-over-UDP and DoIP socket bindings
+platform/linux SocketCAN, UDP, SOME/IP-over-UDP and DoIP sockets, SecOC key file / freshness store
 sim/           simulated UDS ECU for tests and the diagnostic simulator
 app/           gateway processes and simulators
 tests/         unit and integration tests

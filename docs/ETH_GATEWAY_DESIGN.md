@@ -60,6 +60,11 @@ onCanFrame(channel, frame) / onEthernetDatagram(channel, bytes)
                  evaluate target PDUs (trigger / change)
 ```
 
+**SecOC first.** A PDU configured as a secured I-PDU is verified (MAC and
+freshness) before any routing; failures are dropped and reported as security
+events. Secured target PDUs are re-authenticated by the gateway. Details in
+`SECOC_DESIGN.md`.
+
 **E2E stays end-to-end.** The gateway forwards routed PDUs unchanged, including
 CRC and counter, and never re-protects them. A PDU-route target with an E2E
 configuration is rejected. Signal routing does check E2E, because it ends the
@@ -179,7 +184,7 @@ ccg_eth_gateway --bind PT_CAN=can0 --bind CHS_CAN=can1 --bind BODY_CAN=can2 \
   the target bus allows are rejected by the validator.
 - Ethernet framing is SoAd PDU header over UDP only; IEEE 1722 ACF-CAN and TCP
   socket connections are not implemented.
-- No SecOC, no VLAN/QoS configuration. Diagnostic routing (DoIP ↔ UDS on CAN) is a separate function, see `DIAG_GATEWAY_DESIGN.md`.
+- No VLAN/QoS configuration. SecOC is described in `SECOC_DESIGN.md`, diagnostic routing (DoIP ↔ UDS on CAN) in `DIAG_GATEWAY_DESIGN.md`.
 - No Tx queue for a busy CAN controller: a failed transmission is counted
   (`canTxFailures`), not retried.
 - The routing table is written by hand; a series project generates it from the communication matrix.

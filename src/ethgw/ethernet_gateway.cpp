@@ -39,11 +39,21 @@ bool isCyclic(TxMode mode) { return mode == TxMode::Cyclic || mode == TxMode::Cy
 RoutingConfigError::RoutingConfigError(std::vector<std::string> errors)
     : std::runtime_error(joinErrors(errors)), errors_(std::move(errors)) {}
 
-EthernetGateway::EthernetGateway(RoutingConfig config, IGatewayTransmitter& transmitter)
+EthernetGateway::EthernetGateway(RoutingConfig config, IGatewayTransmitter& transmitter,
+                                 secoc::ICryptoService* crypto)
     : config_(std::move(config)), tx_(transmitter) {
     auto errors = validateRoutingConfig(config_);
+    for (const auto& pdu : config_.pdus) {
+        if (pdu.secoc && (crypto == nullptr || !crypto->hasKey(pdu.secoc->keyId))) {
+            errors.push_back("PDU '" + pdu.name + "': SecOC key '" + pdu.secoc->keyId +
+                             "' not available in the crypto service");
+        }
+    }
     if (!errors.empty()) {
         throw RoutingConfigError(std::move(errors));
+    }
+    if (crypto != nullptr) {
+        secoc_ = std::make_unique<secoc::SecOcProcessor>(*crypto, freshness_);
     }
     buildRuntime();
 }
@@ -60,7 +70,7 @@ void EthernetGateway::buildRuntime() {
         auto& st = pdus_[p];
         pduByName_[cfg.name] = p;
         st.channel = channelByName_.at(cfg.channel);
-        st.buffer.assign(cfg.length, cfg.padding);
+        st.buffer.assign(authenticLength(cfg), cfg.padding);  // authentic part only
         for (const auto& spec : cfg.signals) {
             can::insertRaw(st.buffer.data(), spec, spec.initRaw);
         }
@@ -168,10 +178,22 @@ void EthernetGateway::processPdu(std::size_t index, const std::uint8_t* data, st
     }
     ++stats_.pdusReceived;
 
-    // Message routing: the PDU is forwarded unchanged, E2E stays end-to-end.
+    // SecOC: a secured PDU is only routed once its authenticity and freshness
+    // are verified; from here on only the authentic part is used.
+    const std::size_t authentic = authenticLength(cfg);
+    if (cfg.secoc) {
+        const auto result = secoc_->verify(*cfg.secoc, data, authentic);
+        if (result != secoc::VerifyResult::Ok) {
+            reportSecurityEvent(index, result, now);
+            return;
+        }
+        ++stats_.secocVerified;
+    }
+
+    // Message routing: the (authentic) PDU is forwarded unchanged, E2E stays end-to-end.
     for (const std::size_t r : pdus_[index].pduRoutes) {
         for (const std::size_t target : pduRouteTargets_[r]) {
-            forwardPdu(target, data, cfg.length, now);
+            forwardPdu(target, data, authentic, now);
         }
     }
 
@@ -189,7 +211,7 @@ void EthernetGateway::routeSignals(std::size_t index, const std::uint8_t* data, 
     auto& st = pdus_[index];
 
     if (st.e2eRx) {
-        switch (st.e2eRx->check(data, cfg.length)) {
+        switch (st.e2eRx->check(data, authenticLength(cfg))) {
             case e2e::CheckStatus::Ok:
             case e2e::CheckStatus::OkSomeLost:
                 break;
@@ -317,7 +339,9 @@ void EthernetGateway::transmitAssembled(std::size_t index, TimePoint now) {
     if (st.e2eTx) {
         st.e2eTx->protect(st.buffer.data(), st.buffer.size());
     }
-    sendOnChannel(index, st.buffer.data(), st.buffer.size(), now);
+    if (!sendPdu(index, st.buffer.data(), st.buffer.size(), now)) {
+        return;  // SecOC could not authenticate: nothing sent, retried on the next trigger
+    }
     ++stats_.assembledPdusSent;
     st.transmitted = true;
     st.lastTx = now;
@@ -332,10 +356,42 @@ void EthernetGateway::transmitAssembled(std::size_t index, TimePoint now) {
 void EthernetGateway::forwardPdu(std::size_t target, const std::uint8_t* data, std::size_t length,
                                  TimePoint now) {
     const auto& cfg = config_.pdus[target];
-    std::vector<std::uint8_t> payload(cfg.length, cfg.padding);
-    std::memcpy(payload.data(), data, std::min<std::size_t>(length, cfg.length));
-    sendOnChannel(target, payload.data(), payload.size(), now);
-    ++stats_.pdusForwarded;
+    std::vector<std::uint8_t> payload(authenticLength(cfg), cfg.padding);
+    std::memcpy(payload.data(), data, std::min(length, payload.size()));
+    if (sendPdu(target, payload.data(), payload.size(), now)) {
+        ++stats_.pdusForwarded;
+    }
+}
+
+bool EthernetGateway::sendPdu(std::size_t index, const std::uint8_t* authentic, std::size_t length,
+                              TimePoint now) {
+    const auto& cfg = config_.pdus[index];
+    if (!cfg.secoc) {
+        sendOnChannel(index, authentic, length, now);
+        return true;
+    }
+    // The gateway re-authenticates with the key and freshness of the target PDU.
+    const auto secured = secoc_->protect(*cfg.secoc, authentic, length);
+    if (!secured) {
+        ++stats_.secocTxFailures;
+        return false;
+    }
+    ++stats_.secocProtected;
+    sendOnChannel(index, secured->data(), secured->size(), now);
+    return true;
+}
+
+void EthernetGateway::reportSecurityEvent(std::size_t index, secoc::VerifyResult result,
+                                          TimePoint now) {
+    if (result == secoc::VerifyResult::FreshnessFailure) {
+        ++stats_.secocFreshnessFailures;
+    } else {
+        ++stats_.secocMacFailures;
+    }
+    if (securityEvents_.size() >= 64) {
+        securityEvents_.pop_front();
+    }
+    securityEvents_.push_back({config_.pdus[index].name, pdus_[index].channel, result, now});
 }
 
 void EthernetGateway::sendOnChannel(std::size_t index, const std::uint8_t* data,

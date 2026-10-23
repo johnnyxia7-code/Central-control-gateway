@@ -49,6 +49,30 @@ e2e::CanE2EConfig e2eConfig(std::uint16_t dataId, std::uint8_t crcByte, std::uin
     return cfg;
 }
 
+// AUTOSAR SecOC profile 1 ("24Bit-CMAC-8Bit-FV") for classic CAN / CAN FD.
+secoc::SecOcConfig secocCan(std::uint16_t dataId, std::string keyId) {
+    secoc::SecOcConfig c;
+    c.dataId = dataId;
+    c.keyId = std::move(keyId);
+    c.freshnessBits = 64;
+    c.freshnessTxBits = 8;
+    c.macTxBits = 24;
+    c.verifyAttempts = 2;  // tolerate up to 511 lost PDUs
+    return c;
+}
+
+// Ethernet: full 64-bit freshness value and 64-bit MAC.
+secoc::SecOcConfig secocEth(std::uint16_t dataId, std::string keyId) {
+    secoc::SecOcConfig c;
+    c.dataId = dataId;
+    c.keyId = std::move(keyId);
+    c.freshnessBits = 64;
+    c.freshnessTxBits = 64;
+    c.macTxBits = 64;
+    c.acceptanceWindow = 1000;
+    return c;
+}
+
 SignalRoute route(std::string srcPdu, std::string srcSig, std::string dstPdu, std::string dstSig,
                   Conversion conversion, Substitution substitution, bool triggering = true) {
     SignalRoute r;
@@ -114,6 +138,28 @@ RoutingConfig makeVehicleEthGatewayMatrix() {
         };
         cfg.pdus.push_back(p);
     }
+    {
+        // Secured steering torque request from the ADAS domain (8 B authentic + 16 B SecOC).
+        auto p = pdu("ADAS_SteerTorqueReq", "ETH_ADAS", gw::kAdasSteerTorqueReq, 24);
+        p.timeout = 100ms;
+        p.signals = {
+            sig("ADAS_SteerTqReq", 0, 16, true, 0.01, 0, -10, 10, 0x8000),
+            sig("ADAS_SteerReqActive", 16, 1, false, 1, 0, 0, 1),
+        };
+        p.secoc = secocEth(0x1003, "K_ADAS_GW");
+        cfg.pdus.push_back(p);
+    }
+    {
+        // Secured power limits from the VCU (CAN FD: 12 B authentic + 4 B SecOC).
+        auto p = pdu("VCU_PowerLimit", "PT_CAN", gw::kVcuPowerLimit, 16);
+        p.fd = true;
+        p.signals = {
+            sig("VCU_MaxDischrgPwr", 0, 16, false, 0.1, 0, 0, 500),
+            sig("VCU_MaxChrgPwr", 16, 16, false, 0.1, 0, 0, 500),
+        };
+        p.secoc = secocCan(0x0130, "K_VCU_GW");
+        cfg.pdus.push_back(p);
+    }
     cfg.pdus.push_back(pdu("ADAS_LatCtrlReq", "ETH_ADAS", gw::kAdasLatCtrlReq, 8));
     cfg.pdus.push_back(pdu("ADAS_HmiInfo", "ETH_ADAS", gw::kAdasHmiInfo, 32));
 
@@ -127,6 +173,12 @@ RoutingConfig makeVehicleEthGatewayMatrix() {
         cfg.pdus.push_back(p);
     }
     cfg.pdus.push_back(pdu("ADAS_HmiInfo_IVI", "ETH_IVI", gw::kAdasHmiInfo, 32));
+    {
+        // Re-authenticated for the ADAS domain with the gateway's key (12 B + 16 B SecOC).
+        auto p = pdu("VCU_PowerLimit_ADAS", "ETH_ADAS", gw::kVcuPowerLimitAdas, 28);
+        p.secoc = secocEth(0x2130, "K_GW_ADAS");
+        cfg.pdus.push_back(p);
+    }
 
     // ------------------------------------------- assembled PDUs (frame assembly)
     {
@@ -156,6 +208,17 @@ RoutingConfig makeVehicleEthGatewayMatrix() {
         cfg.pdus.push_back(p);
     }
     {
+        // Steering request towards the EPS, re-authenticated for CHS_CAN (4 B + 4 B SecOC).
+        auto p = pdu("GW_SteerTorqueReq", "CHS_CAN", gw::kGwSteerTorqueReq, 8);
+        p.txMode = TxMode::OnUpdate;
+        p.signals = {
+            sig("GW_SteerTqReq", 0, 16, true, 0.01, 0, -10, 10, 0x8000),
+            sig("GW_SteerReqActive", 16, 1, false, 1, 0, 0, 1),
+        };
+        p.secoc = secocCan(0x01B0, "K_GW_CHS");
+        cfg.pdus.push_back(p);
+    }
+    {
         auto p = pdu("GW_ADAS_VehicleInfo", "ETH_ADAS", gw::kGwAdasVehicleInfo, 16);
         p.txMode = TxMode::Cyclic;
         p.cycleTime = 20ms;
@@ -178,6 +241,7 @@ RoutingConfig makeVehicleEthGatewayMatrix() {
         {"DriveState PT->ADAS,IVI", "VCU_DriveState", {"VCU_DriveState_ADAS", "VCU_DriveState_IVI"}},
         {"LatCtrlReq ADAS->CHS", "ADAS_LatCtrlReq", {"ADAS_LatCtrlReq_CHS"}},
         {"HmiInfo ADAS->IVI", "ADAS_HmiInfo", {"ADAS_HmiInfo_IVI"}},
+        {"PowerLimit PT->ADAS (SecOC re-authentication)", "VCU_PowerLimit", {"VCU_PowerLimit_ADAS"}},
     };
 
     // -------------------------------------------------------- signal routing
@@ -208,9 +272,28 @@ RoutingConfig makeVehicleEthGatewayMatrix() {
         route("BCM_Status", "BCM_IgnState", "GW_ADAS_VehicleInfo", "GW_IgnState", Raw, Inval),
         route("VCU_DriveState", "VCU_AccelPedal", "GW_ADAS_VehicleInfo", "GW_AccelPedal", Raw,
               Inval),
+        // Secured steering request ETH_ADAS -> CHS_CAN: verify, re-authenticate; on timeout
+        // or authentication failure the request falls back to "inactive, 0 Nm".
+        route("ADAS_SteerTorqueReq", "ADAS_SteerTqReq", "GW_SteerTorqueReq", "GW_SteerTqReq", Raw,
+              Init),
+        route("ADAS_SteerTorqueReq", "ADAS_SteerReqActive", "GW_SteerTorqueReq",
+              "GW_SteerReqActive", Raw, Init),
     };
 
     return cfg;
+}
+
+void provisionDemoSecOcKeys(secoc::SoftwareCryptoService& crypto) {
+    // Deterministic test keys - not for production use.
+    auto key = [](std::uint8_t seed) {
+        crypto::Block k{};
+        for (std::size_t i = 0; i < k.size(); ++i) k[i] = static_cast<std::uint8_t>(seed * 31 + i * 7);
+        return k;
+    };
+    crypto.setKey("K_ADAS_GW", key(1));
+    crypto.setKey("K_GW_ADAS", key(2));
+    crypto.setKey("K_VCU_GW", key(3));
+    crypto.setKey("K_GW_CHS", key(4));
 }
 
 }  // namespace ccg::config
