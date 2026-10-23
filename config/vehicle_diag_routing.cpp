@@ -48,4 +48,25 @@ diag::DiagRoutingConfig makeVehicleDiagRouting() {
     return cfg;
 }
 
+diag::DoipClientConfig makeVehicleDoipClient() {
+    diag::DoipClientConfig c;
+    c.sourceAddress = dg::kInternalTester;
+    c.protocolVersion = 0x02;
+    c.maxMessageSize = 4095;
+    c.ecus = {{"ADAS", dg::kAdas, dg::kAdasEndpoint}};
+    return c;
+}
+
+diag::DiagRoutingConfig makeAdasDoipEntity() {
+    diag::DiagRoutingConfig cfg;
+    auto& e = cfg.entity;
+    e.vin = "WCCG0HPC0RT000001";
+    e.logicalAddress = dg::kAdas;
+    e.eid = {0x02, 0x00, 0x5E, 0x10, 0x00, 0x20};
+    e.gid = {0x02, 0x00, 0x5E, 0x10, 0x00, 0x01};  // group: the gateway
+    e.maxTcpConnections = 2;
+    e.announceCount = 0;
+    return cfg;
+}
+
 }  // namespace ccg::config

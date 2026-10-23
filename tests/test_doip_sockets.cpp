@@ -3,11 +3,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <vector>
 
+#include "ccg/diag/doip_client.hpp"
 #include "ccg/doip/doip_message.hpp"
+#include "doip_ecu.hpp"
 #include "doip_sockets.hpp"
+#include "doip_tcp_connector.hpp"
 #include "test_framework.hpp"
+#include "vehicle_diag_routing.hpp"
+#include "vehicle_key_master.hpp"
 
 using namespace ccg;
 
@@ -89,4 +95,76 @@ TEST_CASE("doip sockets: UDP request and unicast answer") {
     std::uint8_t buf[8];
     CHECK_EQ(::recv(tester, buf, sizeof buf, 0), 2);
     ::close(tester);
+}
+
+namespace {
+
+// Server side of the simulated ADAS entity on a real TCP socket.
+struct TcpPort final : diag::IDiagTransport {
+    platform::DoipTcpServer* server = nullptr;
+    void sendTcp(diag::ConnectionId c, const std::vector<std::uint8_t>& d) override { server->send(c, d); }
+    void closeTcp(diag::ConnectionId c) override { server->close(c); }
+    void sendUdp(const diag::UdpPeer&, const std::vector<std::uint8_t>&) override {}
+    void broadcastUdp(const std::vector<std::uint8_t>&) override {}
+    bool transmitCan(std::size_t, const can::CanFrame&) override { return false; }
+};
+
+}  // namespace
+
+TEST_CASE("doip sockets: gateway DoIP client reaches a DoIP entity over TCP") {
+    constexpr std::uint16_t kPort = 31402;
+    platform::DoipTcpServer server(kPort, 2);
+    TcpPort port;
+    port.server = &server;
+    sim::DoipEcu adas(config::makeAdasDoipEntity(), config::makeEcuKeySlots(config::dg::kAdas), port);
+    auto clientCfg = config::makeVehicleDoipClient();
+    clientCfg.ecus[0].endpoint = "127.0.0.1:" + std::to_string(kPort);
+    platform::DoipTcpConnector connector;
+    diag::DoipClient client(clientCfg, connector);
+    connector.attach(client);
+    auto now = diag::Clock::now();
+    adas.entity().start(now);
+
+    std::vector<std::pair<diag::ClientResult, std::vector<std::uint8_t>>> results;
+    client.request(config::dg::kAdas, {0x22, 0xF2, 0xA1}, now,
+                   [&](diag::ClientResult r, std::vector<std::uint8_t> d) { results.emplace_back(r, std::move(d)); });
+    std::vector<std::uint8_t> buffer;
+    for (int i = 0; i < 400 && results.empty(); ++i) {
+        auto fds = connector.pollFds();
+        fds.push_back({server.listenFd(), POLLIN, 0});
+        const auto sockets = server.sockets();
+        for (const auto& s : sockets) fds.push_back({s.fd, POLLIN, 0});
+        ::poll(fds.data(), fds.size(), 5);
+        now = diag::Clock::now();
+        connector.process(fds, now);
+        for (const auto id : server.acceptPending()) adas.entity().onTcpConnected(id, now);
+        for (const auto& s : sockets) {
+            while (server.read(s.id, buffer) == platform::DoipTcpServer::ReadResult::Data) {
+                adas.entity().onTcpData(s.id, buffer.data(), buffer.size(), now);
+            }
+        }
+        client.mainFunction(now);
+        adas.entity().mainFunction(now);
+    }
+    REQUIRE(results.size() == 1u);
+    CHECK(results[0].first == diag::ClientResult::Ok);
+    REQUIRE(results[0].second.size() == 3u + 15u);
+    CHECK(std::equal(adas.keys().config().uid.begin(), adas.keys().config().uid.end(), results[0].second.begin() + 3));
+    CHECK(client.routingActive(config::dg::kAdas));
+
+    // Nobody listening: the connection attempt fails and is reported.
+    clientCfg.ecus[0].endpoint = "127.0.0.1:31403";
+    platform::DoipTcpConnector refused;
+    diag::DoipClient lonely(clientCfg, refused);
+    refused.attach(lonely);
+    results.clear();
+    lonely.request(config::dg::kAdas, {0x3E, 0x00}, now,
+                   [&](diag::ClientResult r, std::vector<std::uint8_t> d) { results.emplace_back(r, std::move(d)); });
+    for (int i = 0; i < 100 && results.empty(); ++i) {
+        auto fds = refused.pollFds();
+        ::poll(fds.data(), fds.size(), 5);
+        refused.process(fds, diag::Clock::now());
+    }
+    REQUIRE(results.size() == 1u);
+    CHECK(results[0].first == diag::ClientResult::TransportError);
 }

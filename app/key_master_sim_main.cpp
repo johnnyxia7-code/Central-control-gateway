@@ -1,9 +1,10 @@
 // Deterministic bench simulation of the gateway as in-vehicle SecOC key master:
 // the backend starts a key renewal campaign over DoIP; the gateway generates
-// the keys and distributes them over ISO-TP to VCU, EPS and BCM with the SHE
-// update protocol. EPS is not powered at first, so its key groups are discarded
-// everywhere and renewed in a second campaign. SecOC traffic and the FV sync
-// keep working throughout.
+// the keys and distributes them with the SHE update protocol - over ISO-TP to
+// VCU, EPS and BCM on CAN, and as DoIP client to the ADAS domain controller on
+// ETH_ADAS. EPS is not powered at first, so its key groups are discarded
+// everywhere and renewed in a second campaign. SecOC traffic (both directions
+// with ADAS) and the FV sync keep working throughout.
 #include <algorithm>
 #include <deque>
 #include <iomanip>
@@ -15,11 +16,15 @@
 #include <vector>
 
 #include "ccg/diag/diag_gateway.hpp"
+#include "ccg/diag/doip_client.hpp"
 #include "ccg/doip/doip_message.hpp"
 #include "ccg/ethgw/ethernet_gateway.hpp"
+#include "ccg/ethgw/pdu_header_codec.hpp"
 #include "ccg/keym/key_management_service.hpp"
 #include "ccg/keym/key_master.hpp"
 #include "ccg/secoc/fv_sync.hpp"
+#include "doip_ecu.hpp"
+#include "doip_link.hpp"
 #include "ecu_key_store.hpp"
 #include "uds_ecu.hpp"
 #include "vehicle_diag_routing.hpp"
@@ -62,6 +67,7 @@ std::string ecuName(std::uint16_t a) {
         case dg::kVcu: return "VCU";
         case dg::kEps: return "EPS";
         case dg::kBcm: return "BCM";
+        case dg::kAdas: return "ADAS";
         default: return "-";
     }
 }
@@ -86,14 +92,19 @@ struct DiagBus final : diag::IDiagTransport {
     }
 };
 
-// SecOC side: FV sync messages reach the FV slaves of VCU and EPS.
+// SecOC side: FV sync messages reach the FV slaves of VCU, EPS and ADAS;
+// ETH_ADAS datagrams reach the ADAS domain controller.
 struct SecOcBus final : ethgw::IGatewayTransmitter {
     std::function<void(std::size_t, const can::CanFrame&)> onCan;
+    std::function<void(std::size_t, const Bytes&)> onEthernet;
     bool transmitCan(std::size_t ch, const can::CanFrame& f) override {
         if (onCan) onCan(ch, f);
         return true;
     }
-    bool transmitEthernet(std::size_t, const Bytes&) override { return true; }
+    bool transmitEthernet(std::size_t ch, const Bytes& d) override {
+        if (onEthernet) onEthernet(ch, d);
+        return true;
+    }
 };
 
 }  // namespace
@@ -108,7 +119,13 @@ int main() {
     config::provisionDemoKeyStore(gatewayKeys, g_now);
     keym::KeyManagementService keyService(gatewayKeys);
     keym::DeterministicRandom random(config::demoKey(0x77));  // HSM TRNG on the target
-    keym::KeyMaster master(config::makeVehicleKeyMaster(), gatewayKeys, diagGw, random);
+    sim::DoipLink ethernet;  // ETH_ADAS (TCP to the ADAS DoIP entity)
+    diag::DoipClient doipClient(config::makeVehicleDoipClient(), ethernet);
+    ethernet.attach(doipClient);
+    diag::DiagClientRouter diagClients;  // CAN ECUs via ISO-TP, Ethernet ECUs via DoIP
+    diagClients.add(diagGw);
+    diagClients.add(doipClient);
+    keym::KeyMaster master(config::makeVehicleKeyMaster(), gatewayKeys, diagClients, random);
     master.setTrace([](const std::string& t) { std::cout << stamp() << t << "\n"; });
     diagGw.addLocalService(keyService);
     diagGw.addLocalService(master);
@@ -150,6 +167,13 @@ int main() {
     auto& epsKeys = ecus.at(dg::kEps).hsm->keys();
     ecus.at(dg::kEps).ecu->setSilent(true);  // ignition: EPS not powered yet
 
+    // --- ADAS domain controller on ETH_ADAS: DoIP entity with its HSM
+    sim::DoipEcu adas(config::makeAdasDoipEntity(), config::makeEcuKeySlots(dg::kAdas),
+                      ethernet.port(dg::kAdasEndpoint));
+    ethernet.bind(dg::kAdasEndpoint, adas.entity());
+    config::provisionDemoEcuKeyStore(adas.keys(), g_now);  // plant
+    auto& adasKeys = adas.keys();
+
     // --- SecOC in the ECUs, with their HSM keys
     secoc::FreshnessManager vcuFv, epsFv;
     vcuFv.setLayout(ethCfg.freshnessSync->layout);
@@ -157,6 +181,10 @@ int main() {
     secoc::FreshnessSyncSlave vcuSync(ethCfg.freshnessSync->message, vcuKeys, vcuFv);
     secoc::FreshnessSyncSlave epsSync(ethCfg.freshnessSync->message, epsKeys, epsFv);
     secoc::SecOcProcessor vcuSecOc(vcuKeys, vcuFv);
+    secoc::FreshnessManager adasFv;  // ADAS: counter-mode FV on Ethernet + FV slave
+    adasFv.setLayout(ethCfg.freshnessSync->layout);
+    secoc::FreshnessSyncSlave adasSync(ethCfg.freshnessSync->message, adasKeys, adasFv);
+    secoc::SecOcProcessor adasSecOc(adasKeys, adasFv);
     bool epsPowered = false;
     std::map<std::string, std::map<std::string, int>> syncResults;  // ECU -> result -> count
     secocBus.onCan = [&](std::size_t ch, const can::CanFrame& f) {
@@ -167,9 +195,42 @@ int main() {
         }
     };
     const secoc::SecOcConfig* powerLimit = nullptr;
+    const secoc::SecOcConfig* powerLimitAdas = nullptr;
+    const secoc::SecOcConfig* steerRequest = nullptr;
     for (const auto& p : ethCfg.pdus) {
         if (p.name == "VCU_PowerLimit") powerLimit = &*p.secoc;
+        if (p.name == "VCU_PowerLimit_ADAS") powerLimitAdas = &*p.secoc;
+        if (p.name == "ADAS_SteerTorqueReq") steerRequest = &*p.secoc;
     }
+    auto keyGeneration = [](keym::KeyManager& keys, const std::string& keyId) {
+        for (const auto& s : keys.status()) {
+            if (s.keyId == keyId) return s.counter;
+        }
+        return 0u;
+    };
+    secocBus.onEthernet = [&](std::size_t, const Bytes& d) {
+        for (const auto& pdu : ethgw::decodeDatagram(d.data(), d.size()).pdus) {
+            if (pdu.headerId == gw::kFvSyncEth) {
+                ++syncResults["ADAS"][secoc::toString(adasSync.onSyncMessage(pdu.data, pdu.length))];
+            } else if (pdu.headerId == gw::kVcuPowerLimitAdas) {
+                std::cout << stamp() << "  -> VCU_PowerLimit_ADAS re-authenticated by the gateway (K_GW_ADAS generation "
+                          << keyGeneration(gatewayKeys, "K_GW_ADAS") << "): ADAS SecOC "
+                          << secoc::toString(adasSecOc.verify(*powerLimitAdas, pdu.data, 12)) << "\n";
+            }
+        }
+    };
+    auto adasSendsSteerRequest = [&] {
+        const Bytes authentic(8, 0x00);
+        const auto secured = adasSecOc.protect(*steerRequest, authentic.data(), authentic.size());
+        if (!secured) return;
+        Bytes datagram;
+        ethgw::appendPdu(datagram, gw::kAdasSteerTorqueReq, secured->data(), secured->size());
+        const auto before = eth.statistics().secocVerified;
+        eth.onEthernetDatagram(gw::kEthAdas, datagram.data(), datagram.size(), g_now);
+        std::cout << stamp() << "ADAS_SteerTorqueReq (ADAS K_ADAS_GW generation "
+                  << keyGeneration(adasKeys, "K_ADAS_GW") << ") -> gateway SecOC "
+                  << (eth.statistics().secocVerified > before ? "VERIFIED" : "REJECTED") << "\n";
+    };
     auto vcuSendsPowerLimit = [&] {
         Bytes authentic(12, 0x00);
         authentic[1] = 0xDC;
@@ -221,6 +282,7 @@ int main() {
     };
 
     diagGw.start(g_now);
+    adas.entity().start(g_now);
     eth.start(g_now);
     for (int t = 0; t <= 4000; ++t) {
         g_now = g_t0 + std::chrono::milliseconds(t);
@@ -265,7 +327,11 @@ int main() {
                 break;
         }
         if (t % 1000 == 50) vcuSendsPowerLimit();
+        if (t % 1000 == 60) adasSendsSteerRequest();
         diagGw.mainFunction(g_now);
+        doipClient.mainFunction(g_now);
+        adas.entity().mainFunction(g_now);
+        ethernet.pump(g_now);
         eth.mainFunction(g_now);
         for (auto& [a, e] : ecus) e.ecu->mainFunction(g_now);
         for (int guard = 0; guard < 1000 && (!diagBus.canOut.empty() || !ecuOut.empty()); ++guard) {
@@ -284,23 +350,27 @@ int main() {
         }
         master.mainFunction(g_now);
         gatewayKeys.mainFunction(g_now);
+        ethernet.pump(g_now);
     }
 
-    std::cout << "\nkey generations (gateway / VCU / EPS / BCM):\n";
+    std::cout << "\nkey generations (gateway / ECUs):\n";
     for (const auto& g : master.config().groups) {
         std::cout << "  " << std::left << std::setw(12) << g.keyId << std::right;
         for (const auto& s : gatewayKeys.status()) {
             if (s.slot == g.gatewaySlot) std::cout << " gateway " << s.counter;
         }
         for (const auto& m : g.ecus) {
-            for (const auto& s : ecus.at(m.ecu).hsm->keys().status()) {
+            auto& keys = m.ecu == dg::kAdas ? adasKeys : ecus.at(m.ecu).hsm->keys();
+            for (const auto& s : keys.status()) {
                 if (s.slot == m.slot) std::cout << "  " << ecuName(m.ecu) << " " << s.counter;
             }
         }
         std::cout << "\n";
     }
-    std::cout << "statistics: UDS CAN frames from the gateway=" << diagBus.udsFrames
-              << " secoc verified=" << eth.statistics().secocVerified
+    const auto& d = doipClient.statistics();
+    std::cout << "statistics: UDS CAN frames from the gateway=" << diagBus.udsFrames << " | DoIP client connects="
+              << d.connects << " activations=" << d.activations << " requests=" << d.requests
+              << " | secoc verified=" << eth.statistics().secocVerified
               << " macFailures=" << eth.statistics().secocMacFailures << "\n";
     return 0;
 }

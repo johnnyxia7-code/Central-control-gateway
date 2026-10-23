@@ -98,6 +98,30 @@ public:
     // the next request itself (do that from the client's own main function).
     virtual void request(std::uint16_t target, std::vector<std::uint8_t> uds, TimePoint now,
                          Callback callback) = 0;
+    // True if this client has a route to `target`.
+    virtual bool reaches(std::uint16_t target) const = 0;
+};
+
+// Sends each request through the first client that reaches the target (CAN
+// ECUs via the diagnostic gateway, Ethernet ECUs via the DoIP client).
+class DiagClientRouter final : public IDiagClient {
+public:
+    void add(IDiagClient& client) { clients_.push_back(&client); }
+    void request(std::uint16_t target, std::vector<std::uint8_t> uds, TimePoint now, Callback callback) override {
+        for (auto* c : clients_) {
+            if (c->reaches(target)) return c->request(target, std::move(uds), now, std::move(callback));
+        }
+        callback(ClientResult::UnknownTarget, {});
+    }
+    bool reaches(std::uint16_t target) const override {
+        for (const auto* c : clients_) {
+            if (c->reaches(target)) return true;
+        }
+        return false;
+    }
+
+private:
+    std::vector<IDiagClient*> clients_;
 };
 
 class DiagConfigError : public std::runtime_error {
@@ -137,6 +161,7 @@ public:
     // ECU are refused (diagnostic NACK) and its responses go to the callback.
     void request(std::uint16_t target, std::vector<std::uint8_t> uds, TimePoint now,
                  Callback callback) override;
+    bool reaches(std::uint16_t target) const override { return ecuByAddress_.count(target) > 0; }
 
     std::optional<std::size_t> channelIndex(const std::string& name) const;
     bool isRoutingActive(ConnectionId connection) const;

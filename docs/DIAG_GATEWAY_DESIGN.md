@@ -190,6 +190,15 @@ ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
   for the final response (NRC 0x78 extends P2 to P2*) and reports busy,
   unknown target, transport error or timeout. While such a request is open,
   tester requests to the same ECU get NACK 0x08.
+- **DoIP client** (`diag::DoipClient`): reaches the ECUs on the vehicle
+  Ethernet that are DoIP entities themselves (ADAS 0x1010 at
+  192.168.10.20:13400, `--doip ADAS=IP:PORT`). It connects over TCP and
+  activates routing with source address 0x0F00 (in-vehicle test equipment).
+  Each request is a diagnostic message followed by the ACK and the response.
+  The client handles NACKs, NRC 0x78, alive checks and reconnects, and keeps
+  one connection per ECU. `diag::DiagClientRouter` gives gateway functions one
+  `IDiagClient` for both CAN and Ethernet ECUs. On Linux the sockets are
+  handled by `platform::DoipTcpConnector` in the same `poll()` loop.
 
 ## 8. Limitations / next steps
 
@@ -197,6 +206,7 @@ ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
   routing activation (codes 0x04, 0x05, 0x11 are never sent).
 - One outstanding physical request per ECU; a second one is refused with NACK
   0x08 rather than queued.
-- No DoIP routing to other Ethernet ECUs (DoIP-to-DoIP), only to CAN.
+- External testers are not routed to Ethernet ECUs (DoIP-to-DoIP); the DoIP
+  client serves gateway-internal functions (key master) only.
 - No extended or mixed ISO-TP addressing, and no LIN diagnostics.
 - The UDS server of the gateway itself is minimal (session, tester present, three DIDs).

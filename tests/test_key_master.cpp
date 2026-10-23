@@ -5,9 +5,12 @@
 #include <vector>
 
 #include "ccg/diag/diag_gateway.hpp"
+#include "ccg/diag/doip_client.hpp"
 #include "ccg/doip/doip_message.hpp"
 #include "ccg/keym/key_management_service.hpp"
 #include "ccg/keym/key_master.hpp"
+#include "doip_ecu.hpp"
+#include "doip_link.hpp"
 #include "ecu_key_store.hpp"
 #include "test_framework.hpp"
 #include "uds_ecu.hpp"
@@ -45,9 +48,13 @@ struct Vehicle {
     diag::TimePoint now = diag::TimePoint{} + 100s;
     Bus bus;
     diag::DiagGateway gw{config::makeVehicleDiagRouting(), bus};
+    sim::DoipLink ethernet;  // ETH_ADAS
+    diag::DoipClient doip{config::makeVehicleDoipClient(), ethernet};
+    diag::DiagClientRouter router;
     keym::KeyManager gatewayKeys{config::makeVehicleKeySlots()};
     keym::DeterministicRandom random{config::demoKey(0x77)};
-    keym::KeyMaster master{config::makeVehicleKeyMaster(), gatewayKeys, gw, random};
+    keym::KeyMaster master{config::makeVehicleKeyMaster(), gatewayKeys, router, random};
+    std::unique_ptr<sim::DoipEcu> adas;
     keym::KeyManagementService keyService{gatewayKeys};
 
     struct EcuOnBus {
@@ -60,6 +67,18 @@ struct Vehicle {
     std::vector<std::string> trace;
 
     explicit Vehicle(const Provision& provision = {}) {
+        router.add(gw);
+        router.add(doip);
+        ethernet.attach(doip);
+        adas = std::make_unique<sim::DoipEcu>(config::makeAdasDoipEntity(), config::makeEcuKeySlots(dg::kAdas),
+                                              ethernet.port(dg::kAdasEndpoint));
+        ethernet.bind(dg::kAdasEndpoint, adas->entity());
+        if (provision) {
+            provision(dg::kAdas, adas->keys());
+        } else {
+            config::provisionDemoEcuKeyStore(adas->keys(), now);
+        }
+        adas->entity().start(now);
         config::provisionDemoKeyStore(gatewayKeys, now);
         gw.addLocalService(keyService);
         gw.addLocalService(master);
@@ -94,7 +113,7 @@ struct Vehicle {
         gw.start(now);
     }
 
-    keym::KeyManager& ecuKeys(std::uint16_t ecu) { return ecus.at(ecu).hsm->keys(); }
+    keym::KeyManager& ecuKeys(std::uint16_t ecu) { return ecu == dg::kAdas ? adas->keys() : ecus.at(ecu).hsm->keys(); }
 
     void deliver() {
         for (int guard = 0; guard < 100000 && (!bus.canOut.empty() || !ecuOut.empty()); ++guard) {
@@ -116,11 +135,15 @@ struct Vehicle {
     void tick() {
         now += 1ms;
         gw.mainFunction(now);
+        doip.mainFunction(now);
+        adas->entity().mainFunction(now);
         for (auto& [addr, e] : ecus) e.ecu->mainFunction(now);
         deliver();
+        ethernet.pump(now);
         master.mainFunction(now);
         gatewayKeys.mainFunction(now);
         deliver();
+        ethernet.pump(now);
     }
 
     void advance(std::chrono::milliseconds d) {
@@ -235,7 +258,7 @@ TEST_CASE("key master: campaign distributes and activates every key group") {
     Vehicle v;
     const auto oldVcuMac = mac(v.ecuKeys(dg::kVcu), "K_VCU_GW");
     REQUIRE(v.runCampaign());
-    for (std::size_t g = 0; g < 3; ++g) {
+    for (std::size_t g = 0; g < 5; ++g) {
         CHECK(v.master.results()[g].result == GroupResult::Activated);
         CHECK_EQ(v.master.results()[g].generation, 2u);
     }
@@ -248,6 +271,11 @@ TEST_CASE("key master: campaign distributes and activates every key group") {
     CHECK(fv == mac(v.ecuKeys(dg::kVcu), "K_FV_MASTER"));
     CHECK(fv == mac(v.ecuKeys(dg::kEps), "K_FV_MASTER"));
     CHECK(fv == mac(v.ecuKeys(dg::kBcm), "K_FV_MASTER"));
+    CHECK(fv == mac(v.ecuKeys(dg::kAdas), "K_FV_MASTER"));
+    // ADAS keys over DoIP on ETH_ADAS
+    CHECK(mac(v.gatewayKeys, "K_ADAS_GW") == mac(v.ecuKeys(dg::kAdas), "K_ADAS_GW"));
+    CHECK(mac(v.gatewayKeys, "K_GW_ADAS") == mac(v.ecuKeys(dg::kAdas), "K_GW_ADAS"));
+    CHECK(mac(v.gatewayKeys, "K_ADAS_GW") != mac(v.gatewayKeys, "K_GW_ADAS"));
     // All keys active, previous keys in their grace period, nothing pending.
     const auto vcu = Vehicle::status(v.ecuKeys(dg::kVcu), kKey1);
     CHECK(vcu.active && !vcu.pending && vcu.previous);
@@ -255,8 +283,8 @@ TEST_CASE("key master: campaign distributes and activates every key group") {
     const auto gw = Vehicle::status(v.gatewayKeys, ks::kFvMaster);
     CHECK(gw.active && !gw.pending && gw.previous);
     CHECK_EQ(gw.counter, 2u);
-    // The other keys of the gateway are untouched.
-    CHECK_EQ(Vehicle::status(v.gatewayKeys, ks::kAdasGw).counter, 1u);
+    CHECK_EQ(Vehicle::status(v.gatewayKeys, ks::kAdasGw).counter, 2u);
+    CHECK(v.doip.routingActive(dg::kAdas));
 
     // Next campaign: next generation, different keys again.
     REQUIRE(v.runCampaign({0}));
@@ -376,13 +404,13 @@ TEST_CASE("key master: campaign over UDS on the gateway address") {
     CHECK(request({0x31, 0x01, 0xF2, 0x10}) == (Bytes{0x7F, 0x31, 0x22}));  // already running
     v.advance(10ms);
     auto results = request({0x31, 0x03, 0xF2, 0x10});
-    REQUIRE(results.size() == 6u + 3u * 8u);
+    REQUIRE(results.size() == 6u + 5u * 8u);
     CHECK_EQ(results[4], static_cast<std::uint8_t>(keym::KeyMaster::State::Running));
     for (int i = 0; i < 20000 && v.master.state() == keym::KeyMaster::State::Running; ++i) v.tick();
     results = request({0x31, 0x03, 0xF2, 0x10});
-    REQUIRE(results.size() == 6u + 3u * 8u);
+    REQUIRE(results.size() == 6u + 5u * 8u);
     CHECK_EQ(results[4], static_cast<std::uint8_t>(keym::KeyMaster::State::Finished));
-    CHECK_EQ(results[5], 3);
+    CHECK_EQ(results[5], 5);
     CHECK_EQ(results[6], static_cast<std::uint8_t>(GroupResult::Activated));       // group 0
     CHECK_EQ(results[10], 2);                                                       // generation
     CHECK_EQ(results[14], static_cast<std::uint8_t>(GroupResult::NotRun));          // group 1
@@ -398,4 +426,45 @@ TEST_CASE("key master: no campaign without the key master secret") {
     CHECK(!v.gatewayKeys.hasKey("K_KEY_MASTER"));  // the secret is never a SecOC key
     CHECK(v.gatewayKeys.deriveEcuMasterKey(v.ecuKeys(dg::kVcu).config().uid) ==
           keym::deriveEcuMasterKey(config::demoKeyMasterSecret(), v.ecuKeys(dg::kVcu).config().uid));
+}
+
+TEST_CASE("key master: ADAS unreachable on Ethernet, its groups wait; renewed when it is back") {
+    Vehicle v;
+    v.ethernet.setReachable(dg::kAdasEndpoint, false);
+    REQUIRE(v.runCampaign());
+    const auto& r = v.master.results();
+    CHECK(r[0].result == GroupResult::Activated);  // CAN-only groups go ahead
+    CHECK(r[1].result == GroupResult::Activated);
+    for (const std::size_t g : {2u, 3u, 4u}) {
+        CHECK(r[g].result == GroupResult::EcuUnreachable);
+        CHECK_EQ(r[g].failedEcu, dg::kAdas);
+    }
+    CHECK_EQ(v.doip.statistics().connectFailures, 1u);
+    // K_FV_MASTER went to the CAN ECUs and was discarded there again.
+    for (const auto ecu : {dg::kVcu, dg::kEps, dg::kBcm}) {
+        const auto slot = ecu == dg::kBcm ? kKey1 : kKey2;
+        CHECK(!Vehicle::status(v.ecuKeys(ecu), slot).pending);
+        CHECK_EQ(Vehicle::status(v.ecuKeys(ecu), slot).counter, 1u);
+    }
+    CHECK_EQ(Vehicle::status(v.gatewayKeys, ks::kAdasGw).counter, 1u);
+    CHECK(mac(v.gatewayKeys, "K_FV_MASTER") == mac(v.ecuKeys(dg::kAdas), "K_FV_MASTER"));
+
+    v.ethernet.setReachable(dg::kAdasEndpoint, true);
+    REQUIRE(v.runCampaign({2, 3, 4}));
+    for (const std::size_t g : {2u, 3u, 4u}) CHECK(r[g].result == GroupResult::Activated);
+    CHECK(mac(v.gatewayKeys, "K_ADAS_GW") == mac(v.ecuKeys(dg::kAdas), "K_ADAS_GW"));
+    CHECK(mac(v.gatewayKeys, "K_GW_ADAS") == mac(v.ecuKeys(dg::kAdas), "K_GW_ADAS"));
+    CHECK(mac(v.gatewayKeys, "K_FV_MASTER") == mac(v.ecuKeys(dg::kAdas), "K_FV_MASTER"));
+    CHECK(mac(v.gatewayKeys, "K_FV_MASTER") == mac(v.ecuKeys(dg::kEps), "K_FV_MASTER"));
+}
+
+TEST_CASE("key master: an ADAS group renewal uses one DoIP connection and routing activation") {
+    Vehicle v;
+    REQUIRE(v.runCampaign({3}));
+    CHECK(v.master.results()[3].result == GroupResult::Activated);
+    // Session, UID, status, session, load, session, activate: one connection, one activation.
+    CHECK_EQ(v.doip.statistics().connects, 1u);
+    CHECK_EQ(v.doip.statistics().activations, 1u);
+    CHECK_EQ(v.doip.statistics().responses, 7u);
+    CHECK_EQ(v.doip.statistics().nacks, 0u);
 }

@@ -9,10 +9,11 @@
 namespace ccg::config {
 
 // Key groups the gateway distributes as in-vehicle key master:
-//   0 K_VCU_GW     gateway KEY_3 + VCU KEY_1
-//   1 K_GW_CHS     gateway KEY_4 + EPS KEY_1
-//   2 K_FV_MASTER  gateway KEY_5 + VCU KEY_2, EPS KEY_2, BCM KEY_1
-// The ADAS keys (Ethernet, DoIP-native ECU) stay with the backend.
+//   0 K_VCU_GW     gateway KEY_3 + VCU KEY_1                         (ISO-TP on PT_CAN)
+//   1 K_GW_CHS     gateway KEY_4 + EPS KEY_1                         (ISO-TP on CHS_CAN)
+//   2 K_FV_MASTER  gateway KEY_5 + VCU KEY_2, EPS KEY_2, BCM KEY_1, ADAS KEY_3
+//   3 K_ADAS_GW    gateway KEY_1 + ADAS KEY_1                        (DoIP on ETH_ADAS)
+//   4 K_GW_ADAS    gateway KEY_2 + ADAS KEY_2                        (DoIP on ETH_ADAS)
 keym::KeyMasterConfig makeVehicleKeyMaster();
 
 // ECUs taking part in the key distribution and their HSM key slots.

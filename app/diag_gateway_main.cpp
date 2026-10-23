@@ -2,13 +2,14 @@
 //
 //   ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2
 //                    [--port 13400] [--broadcast 255.255.255.255]
-//                    [--key-store /var/lib/ccg/keys [--demo-keys]]
+//                    [--key-store /var/lib/ccg/keys [--demo-keys]] [--doip ADAS=192.168.10.20:13400]
 //
 // With --key-store the gateway's own diagnostic address also serves the SecOC
 // key management routines (SHE key update, activation, key status); the file
 // is the gateway's key store and is followed by ccg_eth_gateway. The gateway
 // is also the in-vehicle key master: RoutineControl 31 01 F210 distributes new
-// SecOC keys to the ECUs (31 03 F210: results).
+// SecOC keys to the ECUs (31 03 F210: results) - to CAN ECUs over ISO-TP and
+// to Ethernet ECUs (ADAS) as DoIP client (--doip overrides their endpoints).
 #include <poll.h>
 
 #include <algorithm>
@@ -22,9 +23,11 @@
 #include <vector>
 
 #include "ccg/diag/diag_gateway.hpp"
+#include "ccg/diag/doip_client.hpp"
 #include "ccg/keym/key_management_service.hpp"
 #include "ccg/keym/key_master.hpp"
 #include "doip_sockets.hpp"
+#include "doip_tcp_connector.hpp"
 #include "key_store.hpp"
 #include "socketcan_transport.hpp"
 #include "system_random.hpp"
@@ -91,6 +94,7 @@ int main(int argc, char** argv) {
     std::string broadcast = "255.255.255.255";
     std::string keyStore;
     bool demoKeys = false;
+    std::map<std::string, std::string> doipEndpoints;
     try {
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -110,6 +114,10 @@ int main(int argc, char** argv) {
                 broadcast = value;
             } else if (arg == "--key-store") {
                 keyStore = value;
+            } else if (arg == "--doip") {
+                const auto eq = value.find('=');
+                if (eq == std::string::npos) throw std::invalid_argument("expected ECU=IP:PORT");
+                doipEndpoints[value.substr(0, eq)] = value.substr(eq + 1);
             } else {
                 throw std::invalid_argument("unknown argument " + arg);
             }
@@ -117,7 +125,7 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\nusage: " << argv[0]
                   << " --can CHANNEL=IFACE ... [--port 13400] [--broadcast ADDR]"
-                     " [--key-store FILE [--demo-keys]]\n";
+                     " [--key-store FILE [--demo-keys]] [--doip ECU=IP:PORT]\n";
         return EXIT_FAILURE;
     }
 
@@ -148,6 +156,20 @@ int main(int argc, char** argv) {
         diag::DiagGateway gateway(std::move(config), transport);
         auto now = diag::Clock::now();
 
+        // DoIP client towards the Ethernet ECUs (ADAS): gateway-internal UDS.
+        auto doipCfg = config::makeVehicleDoipClient();
+        for (auto& ecu : doipCfg.ecus) {
+            const auto it = doipEndpoints.find(ecu.name);
+            if (it != doipEndpoints.end()) ecu.endpoint = it->second;
+            std::cout << "[diag] DoIP ECU " << ecu.name << " at " << ecu.endpoint << "\n";
+        }
+        platform::DoipTcpConnector doipConnector;
+        diag::DoipClient doipClient(doipCfg, doipConnector);
+        doipConnector.attach(doipClient);
+        diag::DiagClientRouter diagClients;  // CAN ECUs first, then Ethernet ECUs
+        diagClients.add(gateway);
+        diagClients.add(doipClient);
+
         // SecOC key management; the key store file stands in for the HSM key NvM.
         std::unique_ptr<keym::KeyManager> keys;
         std::unique_ptr<keym::KeyManagementService> keyService;
@@ -171,7 +193,7 @@ int main(int argc, char** argv) {
             keyEventsSeen = keys->eventCount();
             keyService = std::make_unique<keym::KeyManagementService>(*keys, saveKeys);
             gateway.addLocalService(*keyService);
-            keyMaster = std::make_unique<keym::KeyMaster>(config::makeVehicleKeyMaster(), *keys, gateway, random);
+            keyMaster = std::make_unique<keym::KeyMaster>(config::makeVehicleKeyMaster(), *keys, diagClients, random);
             keyMaster->setTrace([](const std::string& t) { std::cout << "[keym] " << t << "\n"; });
             gateway.addLocalService(*keyMaster);
         }
@@ -186,6 +208,9 @@ int main(int argc, char** argv) {
             for (const auto& [fd, ch] : canFds) fds.push_back({fd, POLLIN, 0});
             const auto sockets = tcp.sockets();
             for (const auto& s : sockets) fds.push_back({s.fd, POLLIN, 0});
+            const std::size_t doipBase = fds.size();
+            const auto doipFds = doipConnector.pollFds();
+            fds.insert(fds.end(), doipFds.begin(), doipFds.end());
 
             now = diag::Clock::now();
             const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(nextTick - now).count();
@@ -218,8 +243,11 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            doipConnector.process(std::vector<pollfd>(fds.begin() + static_cast<std::ptrdiff_t>(doipBase), fds.end()),
+                                  now);
             if (now >= nextTick) {
                 gateway.mainFunction(now);
+                doipClient.mainFunction(now);
                 if (keys) {
                     keyMaster->mainFunction(now);
                     keys->mainFunction(now);  // previous keys expire after the grace period

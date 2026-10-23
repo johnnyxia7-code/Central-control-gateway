@@ -17,7 +17,8 @@ The key manager of the gateway (`ccg_keym`):
   activation, then a grace period in which the previous key is still accepted,
 - offers all this as UDS routines on the gateway's own DoIP address,
 - acts as **in-vehicle key master**: generates the SecOC keys it shares with
-  the CAN ECUs and distributes them with the same SHE protocol over ISO-TP
+  the ECUs and distributes them with the same SHE protocol, over ISO-TP to the
+  CAN ECUs and as DoIP client to the ADAS domain controller on Ethernet
   (section 7).
 
 ```
@@ -182,9 +183,41 @@ holding it.
 |---|-----|--------------|-----------|
 | 0 | K_VCU_GW | KEY_3 | VCU 0x0010 KEY_1 |
 | 1 | K_GW_CHS | KEY_4 | EPS 0x0021 KEY_1 |
-| 2 | K_FV_MASTER | KEY_5 | VCU KEY_2, EPS KEY_2, BCM 0x0030 KEY_1 |
+| 2 | K_FV_MASTER | KEY_5 | VCU KEY_2, EPS KEY_2, BCM 0x0030 KEY_1, ADAS 0x1010 KEY_3 |
+| 3 | K_ADAS_GW | KEY_1 | ADAS KEY_1 |
+| 4 | K_GW_ADAS | KEY_2 | ADAS KEY_2 |
 
-The ADAS keys stay with the backend (DoIP-native ECU on Ethernet).
+**Transport per ECU** (`diag::DiagClientRouter`): CAN ECUs are reached over
+ISO-TP through the diagnostic gateway, Ethernet ECUs through the gateway's
+DoIP client (`diag::DoipClient`). The key master is the same for both.
+
+```
+gateway (DoIP client, SA 0x0F00)                     ADAS domain controller (DoIP entity 0x1010)
+   TCP connect 192.168.10.20:13400  ------------------>
+   0x0005 routing activation (SA 0x0F00, type 00) ---->
+   <------------------------------------------------- 0x0006 response, code 0x10
+   0x8001 diag message 0F00 -> 1010: 31 01 F200 M1..M3 ->
+   <------------------------------------------------- 0x8002 diagnostic ACK
+   <------------------------------------------------- 0x8001 1010 -> 0F00: 71 01 F200 00 M4 M5
+```
+
+- **Source address 0x0F00**: ISO 13400-2 reserves 0x0F00–0x0F7F for in-vehicle
+  test equipment. The ADAS entity accepts it like any tester (tester range
+  0x0E00–0x0FFF).
+- **Connection**: opened on the first request and then kept (one connection,
+  one routing activation per campaign). Alive check requests from the entity
+  are answered, so another tester cannot take the socket away. If the entity
+  closes the idle connection, the next request reconnects.
+- **Timing**: TCP connect 2 s; A_DoIP_Ctrl 2 s for the routing activation
+  response and the diagnostic ACK; P2 1 s after the ACK; P2* 5.5 s after NRC
+  0x78.
+- **Errors**: a refused activation, a diagnostic NACK, a header NACK, a closed
+  or refused connection, or a missing ACK fail the request. The key master
+  reports the group as `ECU_UNREACHABLE`, discards it on the other members,
+  and renews it in a later campaign.
+- **No TLS needed for the keys**: the SHE container is encrypted and
+  authenticated end to end, so the plain DoIP transport (port 13400) only
+  carries ciphertext.
 
 **Campaign** (started with `31 01 F210 [group ..]` or `KeyMaster::start`):
 
@@ -213,17 +246,19 @@ The ADAS keys stay with the backend (DoIP-native ECU on Ethernet).
   `GATEWAY_KEY_ERROR`, `ACTIVATION_FAILED`, `NOT_RUN`; plus the generation and
   the ECU that failed. A failed group simply runs again in a later campaign
   (e.g. at the next ignition when the ECU is powered).
-- **Diagnostic client**: the requests use the gateway's own ISO-TP channels
+- **Diagnostic client**: CAN requests use the gateway's own ISO-TP channels
   (`diag::IDiagClient`, implemented by `DiagGateway`). While the key master
-  talks to an ECU, tester requests to that ECU are refused with a diagnostic
-  NACK. P2 is 1 s, and 5.5 s after NRC 0x78.
+  talks to a CAN ECU, tester requests to that ECU are refused with a
+  diagnostic NACK. P2 is 1 s, and 5.5 s after NRC 0x78. Ethernet requests use
+  the DoIP client described above.
 - **Key generation**: `keym::IRandom`. The Linux process uses `getrandom()`
   (`platform::SystemRandom`) and the target uses the HSM TRNG.
   `DeterministicRandom` is for tests and simulation only.
 
 ```
-ccg_key_master_sim   # EPS unpowered: K_VCU_GW renewed, EPS groups discarded everywhere;
-                     # EPS powered: remaining groups renewed; SecOC and FV sync never break
+ccg_key_master_sim   # EPS unpowered: K_VCU_GW and the ADAS keys (over DoIP) renewed, EPS groups
+                     # discarded everywhere; EPS powered: remaining groups renewed; SecOC in both
+                     # directions with ADAS and the FV sync (CAN and ETH_ADAS) never break
 ```
 
 ## 8. Bench processes
@@ -232,7 +267,8 @@ ccg_key_master_sim   # EPS unpowered: K_VCU_GW renewed, EPS groups discarded eve
 # diagnostic gateway owns the key store (first start: --demo-keys provisions TEST keys)
 # and runs the key master (31 01 F210); new gateway keys reach ccg_eth_gateway via the store
 ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
-                 --key-store /var/lib/ccg/keys --demo-keys
+                 --key-store /var/lib/ccg/keys --demo-keys \
+                 --doip ADAS=192.168.10.20:13400      # Ethernet ECU endpoint (default from the table)
 
 # Ethernet gateway follows it: reloads the key store when it changes
 ccg_eth_gateway --bind ... --key-store /var/lib/ccg/keys --fv-store /var/lib/ccg/freshness
@@ -242,7 +278,7 @@ ccg_key_tool --uid 000000000000004343470000000001 --slot 6 --auth-slot 1 \
              --auth-key <MASTER_ECU_KEY> --key <new key> --counter 2 [--check <response>]
 
 ccg_keym_sim      # forged and replayed containers, update, activation, rollover, retired key
-ccg_key_master_sim  # gateway as key master distributing keys to VCU, EPS, BCM
+ccg_key_master_sim  # gateway as key master distributing keys to VCU, EPS, BCM (CAN) and ADAS (DoIP)
 ```
 
 Key store file (mode 0600, written to a temporary file, `fsync`ed, renamed):

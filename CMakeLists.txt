@@ -49,6 +49,7 @@ add_library(ccg_diag
   src/doip/doip_message.cpp
   src/diag/diag_config_validator.cpp
   src/diag/diag_gateway.cpp
+  src/diag/doip_client.cpp
 )
 target_include_directories(ccg_diag PUBLIC include)
 target_link_libraries(ccg_diag PUBLIC ccg_s2s)
@@ -87,7 +88,7 @@ target_link_libraries(ccg_vehicle_matrix PUBLIC ccg_s2s ccg_ethgw ccg_diag ccg_k
 ccg_warnings(ccg_vehicle_matrix)
 
 # --- simulated ECUs for tests and bench simulations --------------------------
-add_library(ccg_sim sim/uds_ecu.cpp sim/ecu_key_store.cpp)
+add_library(ccg_sim sim/uds_ecu.cpp sim/ecu_key_store.cpp sim/doip_link.cpp)
 target_include_directories(ccg_sim PUBLIC sim)
 target_link_libraries(ccg_sim PUBLIC ccg_diag ccg_keym)
 ccg_warnings(ccg_sim)
@@ -128,6 +129,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     platform/linux/secoc_storage.cpp
     platform/linux/key_store.cpp
     platform/linux/system_random.cpp
+    platform/linux/doip_tcp_connector.cpp
   )
   target_include_directories(ccg_platform_linux PUBLIC platform/linux)
   target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s ccg_diag ccg_secoc ccg_keym)
@@ -167,6 +169,7 @@ if(CCG_BUILD_TESTS)
     tests/test_she.cpp
     tests/test_key_manager.cpp
     tests/test_key_master.cpp
+    tests/test_doip_client.cpp
   )
   target_link_libraries(ccg_tests PRIVATE ccg_vehicle_matrix ccg_sim ccg_secoc)
   if(TARGET ccg_platform_linux)
