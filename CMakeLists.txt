@@ -43,14 +43,32 @@ target_include_directories(ccg_ethgw PUBLIC include)
 target_link_libraries(ccg_ethgw PUBLIC ccg_s2s)
 ccg_warnings(ccg_ethgw)
 
+# --- diagnostic routing: DoIP <-> UDS on CAN (ISO-TP) -------------------------
+add_library(ccg_diag
+  src/isotp/isotp_channel.cpp
+  src/doip/doip_message.cpp
+  src/diag/diag_config_validator.cpp
+  src/diag/diag_gateway.cpp
+)
+target_include_directories(ccg_diag PUBLIC include)
+target_link_libraries(ccg_diag PUBLIC ccg_s2s)
+ccg_warnings(ccg_diag)
+
 # --- reference vehicle matrices ----------------------------------------------
 add_library(ccg_vehicle_matrix
   config/vehicle_s2s_matrix.cpp
   config/vehicle_eth_gateway_matrix.cpp
+  config/vehicle_diag_routing.cpp
 )
 target_include_directories(ccg_vehicle_matrix PUBLIC config)
-target_link_libraries(ccg_vehicle_matrix PUBLIC ccg_s2s ccg_ethgw)
+target_link_libraries(ccg_vehicle_matrix PUBLIC ccg_s2s ccg_ethgw ccg_diag)
 ccg_warnings(ccg_vehicle_matrix)
+
+# --- simulated ECUs for tests and bench simulations --------------------------
+add_library(ccg_sim sim/uds_ecu.cpp)
+target_include_directories(ccg_sim PUBLIC sim)
+target_link_libraries(ccg_sim PUBLIC ccg_diag)
+ccg_warnings(ccg_sim)
 
 # --- bench simulation (virtual time, no hardware) ----------------------------
 add_executable(ccg_s2s_sim app/s2s_sim_main.cpp)
@@ -61,15 +79,20 @@ add_executable(ccg_eth_gw_sim app/eth_gw_sim_main.cpp)
 target_link_libraries(ccg_eth_gw_sim PRIVATE ccg_vehicle_matrix)
 ccg_warnings(ccg_eth_gw_sim)
 
+add_executable(ccg_diag_sim app/diag_sim_main.cpp)
+target_link_libraries(ccg_diag_sim PRIVATE ccg_vehicle_matrix ccg_sim)
+ccg_warnings(ccg_diag_sim)
+
 # --- Linux gateway process (SocketCAN + SOME/IP over UDP) --------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_library(ccg_platform_linux
     platform/linux/socketcan_transport.cpp
     platform/linux/someip_udp_binding.cpp
     platform/linux/udp_socket.cpp
+    platform/linux/doip_sockets.cpp
   )
   target_include_directories(ccg_platform_linux PUBLIC platform/linux)
-  target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s)
+  target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s ccg_diag)
   ccg_warnings(ccg_platform_linux)
 
   add_executable(ccg_s2s_gateway app/s2s_gateway_main.cpp)
@@ -79,6 +102,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(ccg_eth_gateway app/eth_gateway_main.cpp)
   target_link_libraries(ccg_eth_gateway PRIVATE ccg_platform_linux ccg_vehicle_matrix)
   ccg_warnings(ccg_eth_gateway)
+
+  add_executable(ccg_diag_gateway app/diag_gateway_main.cpp)
+  target_link_libraries(ccg_diag_gateway PRIVATE ccg_platform_linux ccg_vehicle_matrix)
+  ccg_warnings(ccg_diag_gateway)
 endif()
 
 # --- tests --------------------------------------------------------------------
@@ -93,10 +120,14 @@ if(CCG_BUILD_TESTS)
     tests/test_s2s_gateway.cpp
     tests/test_pdu_header_codec.cpp
     tests/test_eth_gateway.cpp
+    tests/test_isotp.cpp
+    tests/test_doip_message.cpp
+    tests/test_diag_gateway.cpp
   )
-  target_link_libraries(ccg_tests PRIVATE ccg_vehicle_matrix)
+  target_link_libraries(ccg_tests PRIVATE ccg_vehicle_matrix ccg_sim)
   if(TARGET ccg_platform_linux)
-    target_sources(ccg_tests PRIVATE tests/test_someip_udp_binding.cpp tests/test_udp_socket.cpp)
+    target_sources(ccg_tests PRIVATE tests/test_someip_udp_binding.cpp tests/test_udp_socket.cpp
+                                     tests/test_doip_sockets.cpp)
     target_link_libraries(ccg_tests PRIVATE ccg_platform_linux)
   endif()
   ccg_warnings(ccg_tests)

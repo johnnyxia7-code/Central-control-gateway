@@ -179,7 +179,7 @@ ccg_eth_gateway --bind PT_CAN=can0 --bind CHS_CAN=can1 --bind BODY_CAN=can2 \
   the target bus allows are rejected by the validator.
 - Ethernet framing is SoAd PDU header over UDP only; IEEE 1722 ACF-CAN and TCP
   socket connections are not implemented.
-- No diagnostic (DoIP ↔ UDS on CAN) routing, no SecOC, no VLAN/QoS configuration.
+- No SecOC, no VLAN/QoS configuration. Diagnostic routing (DoIP ↔ UDS on CAN) is a separate function, see `DIAG_GATEWAY_DESIGN.md`.
 - No Tx queue for a busy CAN controller: a failed transmission is counted
   (`canTxFailures`), not retried.
 - The routing table is written by hand; a series project generates it from the communication matrix.

@@ -1,6 +1,6 @@
 # Central Control Gateway – HPC
 
-Gateway functions for a vehicle HPC (high performance computer):
+Gateway functions for a vehicle HPC (high performance computer): signal-to-service, Ethernet routing and diagnostic routing.
 
 ## Signal-to-Service (S2S)
 
@@ -27,8 +27,19 @@ Routes messages and signals between CAN, CAN FD and Ethernet channels.
 
 Design: [docs/ETH_GATEWAY_DESIGN.md](docs/ETH_GATEWAY_DESIGN.md)
 
-Both functions check their configuration at start-up and come with a Linux
-process and a deterministic virtual-time simulator.
+## Diagnostic gateway (DoIP → UDS on CAN)
+
+DoIP edge node for the external tester, routing UDS requests to the ECUs on CAN.
+
+- **DoIP (ISO 13400-2)**: vehicle identification and announcements, entity status, power mode (UDP); routing activation with alive-check socket handling, inactivity timers, header NACKs, diagnostic message ACK/NACK (TCP)
+- **ISO-TP (ISO 15765-2)** on CAN and CAN FD: single/first/consecutive/flow-control frames, escape lengths > 4095 bytes, block size and STmin, N_As/N_Bs/N_Cr timeouts, FC.WAIT, overflow
+- **Routing** by logical address to the ECU's CAN channel and IDs; functional requests (0xE400) on 0x7DF on every bus; responses including NRC 0x78 *response pending* go back to the requesting tester
+- Local UDS server for the gateway's own address (session control, tester present, VIN / serial number)
+
+Design: [docs/DIAG_GATEWAY_DESIGN.md](docs/DIAG_GATEWAY_DESIGN.md)
+
+All three functions check their configuration at start-up and come with a
+Linux process and a deterministic virtual-time simulator.
 
 ## Build & test
 
@@ -47,6 +58,7 @@ Bench simulations (no hardware, print the traffic the gateway produces):
 ```sh
 ./build/ccg_s2s_sim
 ./build/ccg_eth_gw_sim
+./build/ccg_diag_sim
 ```
 
 On a Linux HPC / bench PC with (virtual) CAN interfaces:
@@ -57,15 +69,18 @@ sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
 
 ./build/ccg_eth_gateway --bind PT_CAN=can0 --bind CHS_CAN=can1 --bind BODY_CAN=can2 \
     --bind ETH_ADAS=udp:30500:192.168.10.20:30500 --bind ETH_IVI=udp:30501:192.168.10.30:30501
+
+./build/ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2   # DoIP on TCP/UDP 13400
 ```
 
 ## Layout
 
 ```
-include/ccg/   public headers (can, e2e, someip, s2s, ethgw)
-src/           portable core libraries (ccg_s2s, ccg_ethgw)
-config/        reference S2S matrix and Ethernet gateway routing table
-platform/linux SocketCAN, UDP and SOME/IP-over-UDP bindings
+include/ccg/   public headers (can, e2e, someip, s2s, ethgw, isotp, doip, diag)
+src/           portable core libraries (ccg_s2s, ccg_ethgw, ccg_diag)
+config/        reference S2S matrix, Ethernet routing table, diagnostic routing table
+platform/linux SocketCAN, UDP, SOME/IP-over-UDP and DoIP socket bindings
+sim/           simulated UDS ECU for tests and the diagnostic simulator
 app/           gateway processes and simulators
 tests/         unit and integration tests
 docs/          design descriptions
