@@ -23,6 +23,7 @@ endfunction()
 # --- portable S2S core (no OS dependencies) ---------------------------------
 add_library(ccg_s2s
   src/can/signal_codec.cpp
+  src/can/signal_layout.cpp
   src/e2e/can_e2e.cpp
   src/someip/someip_message.cpp
   src/s2s/data_type.cpp
@@ -32,10 +33,23 @@ add_library(ccg_s2s
 target_include_directories(ccg_s2s PUBLIC include)
 ccg_warnings(ccg_s2s)
 
-# --- reference vehicle matrix ------------------------------------------------
-add_library(ccg_vehicle_matrix config/vehicle_s2s_matrix.cpp)
+# --- Ethernet gateway: message/signal routing, frame (de)composition ---------
+add_library(ccg_ethgw
+  src/ethgw/pdu_header_codec.cpp
+  src/ethgw/routing_config_validator.cpp
+  src/ethgw/ethernet_gateway.cpp
+)
+target_include_directories(ccg_ethgw PUBLIC include)
+target_link_libraries(ccg_ethgw PUBLIC ccg_s2s)
+ccg_warnings(ccg_ethgw)
+
+# --- reference vehicle matrices ----------------------------------------------
+add_library(ccg_vehicle_matrix
+  config/vehicle_s2s_matrix.cpp
+  config/vehicle_eth_gateway_matrix.cpp
+)
 target_include_directories(ccg_vehicle_matrix PUBLIC config)
-target_link_libraries(ccg_vehicle_matrix PUBLIC ccg_s2s)
+target_link_libraries(ccg_vehicle_matrix PUBLIC ccg_s2s ccg_ethgw)
 ccg_warnings(ccg_vehicle_matrix)
 
 # --- bench simulation (virtual time, no hardware) ----------------------------
@@ -43,11 +57,16 @@ add_executable(ccg_s2s_sim app/s2s_sim_main.cpp)
 target_link_libraries(ccg_s2s_sim PRIVATE ccg_vehicle_matrix)
 ccg_warnings(ccg_s2s_sim)
 
+add_executable(ccg_eth_gw_sim app/eth_gw_sim_main.cpp)
+target_link_libraries(ccg_eth_gw_sim PRIVATE ccg_vehicle_matrix)
+ccg_warnings(ccg_eth_gw_sim)
+
 # --- Linux gateway process (SocketCAN + SOME/IP over UDP) --------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_library(ccg_platform_linux
     platform/linux/socketcan_transport.cpp
     platform/linux/someip_udp_binding.cpp
+    platform/linux/udp_socket.cpp
   )
   target_include_directories(ccg_platform_linux PUBLIC platform/linux)
   target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s)
@@ -56,24 +75,30 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(ccg_s2s_gateway app/s2s_gateway_main.cpp)
   target_link_libraries(ccg_s2s_gateway PRIVATE ccg_platform_linux ccg_vehicle_matrix)
   ccg_warnings(ccg_s2s_gateway)
+
+  add_executable(ccg_eth_gateway app/eth_gateway_main.cpp)
+  target_link_libraries(ccg_eth_gateway PRIVATE ccg_platform_linux ccg_vehicle_matrix)
+  ccg_warnings(ccg_eth_gateway)
 endif()
 
 # --- tests --------------------------------------------------------------------
 if(CCG_BUILD_TESTS)
   enable_testing()
-  add_executable(ccg_s2s_tests
+  add_executable(ccg_tests
     tests/test_main.cpp
     tests/test_signal_codec.cpp
     tests/test_e2e.cpp
     tests/test_someip.cpp
     tests/test_config_validator.cpp
     tests/test_s2s_gateway.cpp
+    tests/test_pdu_header_codec.cpp
+    tests/test_eth_gateway.cpp
   )
-  target_link_libraries(ccg_s2s_tests PRIVATE ccg_vehicle_matrix)
+  target_link_libraries(ccg_tests PRIVATE ccg_vehicle_matrix)
   if(TARGET ccg_platform_linux)
-    target_sources(ccg_s2s_tests PRIVATE tests/test_someip_udp_binding.cpp)
-    target_link_libraries(ccg_s2s_tests PRIVATE ccg_platform_linux)
+    target_sources(ccg_tests PRIVATE tests/test_someip_udp_binding.cpp tests/test_udp_socket.cpp)
+    target_link_libraries(ccg_tests PRIVATE ccg_platform_linux)
   endif()
-  ccg_warnings(ccg_s2s_tests)
-  add_test(NAME ccg_s2s_tests COMMAND ccg_s2s_tests)
+  ccg_warnings(ccg_tests)
+  add_test(NAME ccg_tests COMMAND ccg_tests)
 endif()
