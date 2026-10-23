@@ -43,6 +43,10 @@ inline constexpr std::uint32_t kAdasSteerTorqueReq = 0x00001003;  // ETH_ADAS ->
 inline constexpr std::uint32_t kGwSteerTorqueReq = 0x1B0;         // gateway -> CHS_CAN
 inline constexpr std::uint32_t kVcuPowerLimit = 0x130;            // PT_CAN (FD) -> gateway
 inline constexpr std::uint32_t kVcuPowerLimitAdas = 0x00000130;   // gateway -> ETH_ADAS
+
+// Freshness value sync message of the FV master (gateway), one per bus
+inline constexpr std::uint32_t kFvSyncCan = 0x0F0;         // PT_CAN, CHS_CAN, BODY_CAN
+inline constexpr std::uint32_t kFvSyncEth = 0x0000F000;    // ETH_ADAS
 }  // namespace gw
 
 }  // namespace ccg::config

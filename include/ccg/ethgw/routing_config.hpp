@@ -9,6 +9,7 @@
 
 #include "ccg/can/signal_codec.hpp"
 #include "ccg/e2e/can_e2e.hpp"
+#include "ccg/secoc/fv_sync.hpp"
 #include "ccg/secoc/secoc.hpp"
 
 // Routing table of the central Ethernet gateway.
@@ -97,11 +98,20 @@ struct SignalRoute {
     bool triggering = true;  // an update of this signal may trigger the target PDU
 };
 
+// The gateway as freshness value (FV) master: trip and reset counter for all
+// SecOC PDUs with FreshnessMode::TripReset, distributed in sync messages.
+struct FreshnessSyncConfig {
+    secoc::TripResetLayout layout;
+    secoc::SyncMessageConfig message;
+    std::vector<std::string> syncPdus;  // the sync message is sent in each of them (one per bus)
+};
+
 struct RoutingConfig {
     std::vector<Channel> channels;
     std::vector<PduDefinition> pdus;
     std::vector<PduRoute> pduRoutes;
     std::vector<SignalRoute> signalRoutes;
+    std::optional<FreshnessSyncConfig> freshnessSync;
 };
 
 // Length of the authentic part (the whole PDU when it is not secured).

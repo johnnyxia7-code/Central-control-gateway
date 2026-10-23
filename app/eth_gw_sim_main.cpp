@@ -2,6 +2,7 @@
 // reference routing table. Runs in virtual time and prints the traffic the
 // gateway produces on every channel.
 #include <cstdio>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -12,6 +13,7 @@
 #include "ccg/e2e/can_e2e.hpp"
 #include "ccg/ethgw/ethernet_gateway.hpp"
 #include "ccg/ethgw/pdu_header_codec.hpp"
+#include "ccg/secoc/fv_sync.hpp"
 #include "ccg/secoc/secoc.hpp"
 #include "vehicle_eth_gateway_matrix.hpp"
 
@@ -56,8 +58,11 @@ public:
                   << std::right << "0x" << std::hex << std::uppercase << f.id << std::dec
                   << (f.fd ? " FD" : "") << " [" << hexBytes(f.data.data(), f.length) << "]"
                   << describe(channel, f.id, f.data.data()) << "\n";
+        if (onCan) onCan(channel, f);  // receiving ECUs on the bus
         return true;
     }
+
+    std::function<void(std::size_t, const can::CanFrame&)> onCan;
 
     bool transmitEthernet(std::size_t channel, const std::vector<std::uint8_t>& d) override {
         const auto decoded = ethgw::decodeDatagram(d.data(), d.size());
@@ -79,6 +84,17 @@ public:
 private:
     // Decodes assembled PDUs (those with signals that the gateway writes).
     std::string describe(std::size_t channel, std::uint32_t id, const std::uint8_t* data) const {
+        const bool ethernet = cfg_.channels[channel].type == ethgw::BusType::Ethernet;
+        if ((!ethernet && id == gw::kFvSyncCan) || (ethernet && id == gw::kFvSyncEth)) {
+            // trip counter (16 bit) | reset counter (20 bit) | MAC (28 bit)
+            const std::uint64_t v = (static_cast<std::uint64_t>(data[0]) << 32) |
+                                    (static_cast<std::uint64_t>(data[1]) << 24) |
+                                    (static_cast<std::uint64_t>(data[2]) << 16) |
+                                    (static_cast<std::uint64_t>(data[3]) << 8) | data[4];
+            std::ostringstream os;
+            os << "  FV sync: trip=" << (v >> 24) << " reset=" << ((v >> 4) & 0xFFFFF);
+            return os.str();
+        }
         for (const auto& p : cfg_.pdus) {
             if (p.channel != cfg_.channels[channel].name || p.id != id || p.name.rfind("GW_", 0) != 0) {
                 continue;
@@ -142,7 +158,8 @@ void log(const std::string& text) { std::cout << stamp() << "---- " << text << "
 }  // namespace
 
 int main() {
-    const auto cfg = config::makeVehicleEthGatewayMatrix();
+    auto cfg = config::makeVehicleEthGatewayMatrix();
+    cfg.freshnessSync->message.resetCycle = 100ms;  // shortened from 1 s so the demo shows several periods
     SimTransmitter tx(cfg);
     Ecus ecus(cfg);
     secoc::SoftwareCryptoService gatewayKeys;  // the gateway's HSM in the vehicle
@@ -152,8 +169,26 @@ int main() {
     // SecOC senders: ADAS domain controller and VCU, each with its own counters.
     secoc::SoftwareCryptoService ecuKeys;
     config::provisionDemoSecOcKeys(ecuKeys);
-    secoc::FreshnessManager adasFv, vcuFv;
-    secoc::SecOcProcessor adasSecOc(ecuKeys, adasFv), vcuSecOc(ecuKeys, vcuFv);
+    secoc::FreshnessManager adasFv, vcuFv, epsFv;
+    secoc::SecOcProcessor adasSecOc(ecuKeys, adasFv), vcuSecOc(ecuKeys, vcuFv), epsSecOc(ecuKeys, epsFv);
+
+    // VCU (PT_CAN) and EPS (CHS_CAN) are FV slaves of the gateway.
+    vcuFv.setLayout(cfg.freshnessSync->layout);
+    epsFv.setLayout(cfg.freshnessSync->layout);
+    secoc::FreshnessSyncSlave vcuSync(cfg.freshnessSync->message, ecuKeys, vcuFv);
+    secoc::FreshnessSyncSlave epsSync(cfg.freshnessSync->message, ecuKeys, epsFv);
+    const secoc::SecOcConfig* steerCfg = nullptr;
+    for (const auto& p : cfg.pdus) {
+        if (p.name == "GW_SteerTorqueReq") steerCfg = &*p.secoc;
+    }
+    tx.onCan = [&](std::size_t channel, const can::CanFrame& f) {
+        if (f.id == gw::kFvSyncCan && channel == gw::kPtCan) vcuSync.onSyncMessage(f.data.data(), f.length);
+        if (f.id == gw::kFvSyncCan && channel == gw::kChsCan) epsSync.onSyncMessage(f.data.data(), f.length);
+        if (f.id == gw::kGwSteerTorqueReq && channel == gw::kChsCan) {
+            std::cout << "            EPS (FV slave): " << secoc::toString(epsSecOc.verify(*steerCfg, f.data.data(), 4))
+                      << " with trip " << epsFv.tripCounter() << ", reset " << epsFv.resetCounter() << "\n";
+        }
+    };
     auto secocOf = [&](const std::string& name) -> const secoc::SecOcConfig& {
         for (const auto& p : cfg.pdus) {
             if (p.name == name) return *p.secoc;
@@ -260,6 +295,7 @@ int main() {
               << " datagramsTx=" << s.datagramsSent << " secocVerified=" << s.secocVerified
               << " secocProtected=" << s.secocProtected << " secocMacFail=" << s.secocMacFailures
               << " secocFreshFail=" << s.secocFreshnessFailures
+              << " fvSyncSent=" << s.fvSyncMessagesSent
               << " maxCollectionDelay=" << s.maxDatagramCollectionDelay.count() << " ms\n";
     return 0;
 }

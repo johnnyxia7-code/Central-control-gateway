@@ -49,15 +49,18 @@ e2e::CanE2EConfig e2eConfig(std::uint16_t dataId, std::uint8_t crcByte, std::uin
     return cfg;
 }
 
-// AUTOSAR SecOC profile 1 ("24Bit-CMAC-8Bit-FV") for classic CAN / CAN FD.
+// CAN / CAN FD: synchronised freshness value from the gateway's FV master
+// (trip | reset | message counter). Transmitted: 2-bit reset flag + 6-bit message
+// counter, 24-bit MAC - a 4-byte trailer like AUTOSAR profile 1.
 secoc::SecOcConfig secocCan(std::uint16_t dataId, std::string keyId) {
     secoc::SecOcConfig c;
     c.dataId = dataId;
     c.keyId = std::move(keyId);
-    c.freshnessBits = 64;
+    c.freshnessMode = secoc::FreshnessMode::TripReset;
+    c.freshnessBits = 62;  // trip 16 + reset 20 + message 26 (layout below)
     c.freshnessTxBits = 8;
     c.macTxBits = 24;
-    c.verifyAttempts = 2;  // tolerate up to 511 lost PDUs
+    c.verifyAttempts = 2;  // tolerate up to 127 lost PDUs within a reset period
     return c;
 }
 
@@ -235,6 +238,27 @@ RoutingConfig makeVehicleEthGatewayMatrix() {
         cfg.pdus.push_back(p);
     }
 
+    // ------------------------------------- freshness value master (sync messages)
+    for (const char* channel : {"PT_CAN", "CHS_CAN", "BODY_CAN"}) {
+        cfg.pdus.push_back(pdu(std::string("GW_FvSync_") + channel, channel, gw::kFvSyncCan, 8));
+    }
+    {
+        auto p = pdu("GW_FvSync_ETH_ADAS", "ETH_ADAS", gw::kFvSyncEth, 8);
+        p.urgent = true;  // not held back by the datagram collection time
+        cfg.pdus.push_back(p);
+    }
+    {
+        FreshnessSyncConfig sync;
+        sync.layout = secoc::TripResetLayout{16, 20, 2, 26};
+        sync.message.dataId = 0x00F0;
+        sync.message.keyId = "K_FV_MASTER";
+        sync.message.macTxBits = 28;  // 16 + 20 + 28 = 64 bits: one classic CAN frame
+        sync.message.resetCycle = 1000ms;
+        sync.syncPdus = {"GW_FvSync_PT_CAN", "GW_FvSync_CHS_CAN", "GW_FvSync_BODY_CAN",
+                         "GW_FvSync_ETH_ADAS"};
+        cfg.freshnessSync = sync;
+    }
+
     // ------------------------------------------------------- message routing
     cfg.pduRoutes = {
         {"WheelSpeeds CHS->ADAS,PT", "ESP_WheelSpeeds", {"ESP_WheelSpeeds_ADAS", "ESP_WheelSpeeds_PT"}},
@@ -294,6 +318,7 @@ void provisionDemoSecOcKeys(secoc::SoftwareCryptoService& crypto) {
     crypto.setKey("K_GW_ADAS", key(2));
     crypto.setKey("K_VCU_GW", key(3));
     crypto.setKey("K_GW_CHS", key(4));
+    crypto.setKey("K_FV_MASTER", key(5));
 }
 
 }  // namespace ccg::config

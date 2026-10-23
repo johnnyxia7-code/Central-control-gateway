@@ -182,6 +182,21 @@ int main(int argc, char** argv) {
         const auto period = std::chrono::milliseconds(periodMs);
         auto now = ethgw::Clock::now();
         gateway.start(now);
+        if (!gateway.freshnessMasterActive()) {
+            std::cout << "[ethgw] WARNING: FV master inactive (trip counter exhausted) - "
+                         "synchronised SecOC PDUs cannot be sent\n";
+        }
+        // FV master: a new trip counter must reach NvM before anything uses it.
+        auto persistTripCounter = [&] {
+            if (!gateway.freshness().takePersistRequest()) return;
+            if (fvStore.empty()) {
+                std::cout << "[ethgw] WARNING: trip counter " << gateway.freshness().storedTrip()
+                          << " not persisted (no --fv-store) - bench only\n";
+            } else if (!platform::saveFreshness(fvStore, gateway.freshness().snapshot())) {
+                throw std::runtime_error("cannot persist the FV master trip counter to " + fvStore);
+            }
+        };
+        persistTripCounter();
         auto nextTick = now + period;
         auto nextStats = now + std::chrono::seconds(10);
         std::vector<std::uint8_t> datagram;
@@ -209,6 +224,7 @@ int main(int argc, char** argv) {
             }
             if (now >= nextTick) {
                 gateway.mainFunction(now);
+                persistTripCounter();  // reset counter overflow starts a new trip
                 nextTick += period;
                 if (nextTick <= now) nextTick = now + period;
             }

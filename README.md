@@ -45,7 +45,8 @@ Authenticity, integrity and replay protection for security-relevant PDUs routed 
 - **AUTOSAR SecOC** secured I-PDUs: authentic PDU + truncated freshness value + truncated AES-128-CMAC over Data ID, PDU and complete freshness value
 - **Verification** of received secured PDUs before routing: tampered, forged and replayed PDUs are dropped and reported as security events (IdsM)
 - **Re-authentication** with the target domain's key and profile (e.g. Ethernet 64-bit FV/MAC → CAN profile 1 "24Bit-CMAC-8Bit-FV")
-- **Freshness value manager** with FV reconstruction from truncated values, acceptance window, multiple verify attempts, persistence with restart margin
+- **Freshness value manager**: counter mode (Ethernet) and synchronised trip/reset/message counter mode (CAN), FV reconstruction from truncated values, acceptance window, multiple verify attempts, persistence
+- **Freshness value synchronisation master**: the gateway owns trip and reset counter (trip counter persisted at every power-up) and broadcasts authenticated sync messages on every bus; ECUs follow as FV slaves
 - Crypto service interface for the HSM, software AES-128-CMAC verified against FIPS-197, RFC 4493 and OpenSSL
 
 Design: [docs/SECOC_DESIGN.md](docs/SECOC_DESIGN.md)

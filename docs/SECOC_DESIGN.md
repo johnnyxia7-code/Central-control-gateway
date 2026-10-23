@@ -56,13 +56,22 @@ The reference table uses two profiles:
 
 | Bus | Profile | Trailer |
 |-----|---------|---------|
-| CAN / CAN FD | AUTOSAR profile 1 "24Bit-CMAC-8Bit-FV" (64-bit counter, 8 LSBs sent, 24-bit MAC, 2 verify attempts) | 4 bytes |
+| CAN / CAN FD | synchronised FV from the gateway's FV master (§4): 2-bit reset flag + 6-bit message counter sent, 24-bit MAC, 2 verify attempts | 4 bytes |
 | Ethernet | full 64-bit counter, 64-bit MAC, acceptance window 1000 | 16 bytes |
 
 ## 3. Freshness value management
 
-A counter-based freshness value manager (`secoc::FreshnessManager`) keeps one
-Tx and one Rx counter per Data ID.
+The freshness value manager (`secoc::FreshnessManager`) supports two modes per
+PDU (`SecOcConfig::freshnessMode`):
+
+| Mode | Complete FV | Transmitted | Used for |
+|------|-------------|-------------|----------|
+| `Counter` | one monotonic counter per Data ID | its LSBs (or all of it) | Ethernet PDUs |
+| `TripReset` | trip counter ‖ reset counter ‖ message counter | reset flag ‖ message counter LSBs | CAN PDUs, with the gateway as FV master (§4) |
+
+### 3.1 Counter mode
+
+One Tx and one Rx counter per Data ID.
 
 - **Transmission:** the counter is incremented for every secured PDU. When it
   would overflow `freshnessBits` the PDU is no longer sent (`secocTxFailures`);
@@ -95,7 +104,82 @@ Tx and one Rx counter per Data ID.
 | Replay, truncated FV | `VERIFICATION_FAILURE` (the FV is rebuilt into the next epoch, so the MAC no longer matches) |
 | Counter far ahead of the window | `FRESHNESS_FAILURE` |
 
-## 4. Gateway integration (`ccg_ethgw`)
+### 3.2 Synchronised mode (trip / reset / message counter)
+
+```
+complete FV = TripCounter (16) | ResetCounter (20) | MessageCounter (26)   = 62 bits
+truncated   = ResetFlag (2 LSBs of ResetCounter) | MessageCounter LSBs (6) =  8 bits
+```
+
+- **Trip and reset counter:** shared by all PDUs and owned by the FV master.
+  ECUs only adopt them from verified sync messages (§4).
+- **Transmission:** the message counter is per Data ID. It restarts at 1 in
+  every reset period and must not overflow inside a period. Without a valid
+  sync, an ECU cannot send synchronised PDUs.
+- **Reception:**
+  - The reset counter is chosen among *current*, *−1* and *+1* by matching
+    the reset flag. This tolerates a sender that sent just before a sync, or
+    that received the sync before the receiver did.
+  - The message counter is rebuilt from its LSBs relative to the last
+    accepted value of the same reset period, or from 0 in a new period.
+  - The complete FV must be newer than the last accepted one, and the MAC must
+    match. With `verifyAttempts > 1` the next message counter epoch is tried as well.
+- **No per-message persistence:** a power cycle increments the trip counter,
+  so every FV of the new trip is larger than any old one. Messages recorded
+  before a restart are rebuilt with the new trip counter and fail the MAC.
+
+## 4. Freshness value synchronisation master (`secoc::FreshnessSyncMaster`)
+
+The central gateway is the FV master of the vehicle. It is the one ECU that
+owns the trip and reset counters, and it distributes them to every bus.
+
+```
+ power-up        TripCounter = stored + 1 ── persisted to NvM before first use
+                 ResetCounter = 0             └─ sync message on every bus
+ every 1 s       ResetCounter + 1         ─── sync message on every bus
+ reset overflow  TripCounter + 1, ResetCounter = 0 (persisted)
+ trip overflow   master inactive: synchronised SecOC stops (key / counter renewal)
+```
+
+**Sync message** (`GW_FvSync_*`, CAN ID 0x0F0 on PT_CAN, CHS_CAN and BODY_CAN,
+header ID 0xF000 on ETH_ADAS), 8 bytes:
+
+```
+| TripCounter (16) | ResetCounter (20) | MAC (28 MSBs) |
+MAC = AES-128-CMAC(K_FV_MASTER, DataID 0x00F0 | TripCounter (4 B) | ResetCounter (4 B))
+```
+
+- **Ordering:** sent in the first gateway cycle after start-up, then once per
+  reset cycle, before any secured PDU of that cycle is built. `requestSync()`
+  resends the current counters, for example when an ECU wakes up.
+- **Ethernet:** the sync PDU is marked `urgent`, so it is not held back by the
+  datagram collection time.
+- **Gateway's own PDUs:** the gateway uses the same counters for its
+  `TripReset` PDUs (for example `GW_SteerTorqueReq`) and for verifying the
+  ECUs' PDUs (for example `VCU_PowerLimit`).
+
+**FV slave** (`secoc::FreshnessSyncSlave`, in the ECUs, the tests and the
+simulator) accepts a sync message only if:
+- its length is complete (otherwise `LENGTH_ERROR`);
+- the MAC matches (otherwise `MAC_FAILURE`; a forged message cannot move the counters);
+- trip ‖ reset is **newer** than the slave's current values (otherwise
+  `STALE`; old sync messages cannot be replayed).
+
+**Persistence of the trip counter.** The trip counter is the root of
+freshness for every CAN PDU. If an old value were ever reused, recorded
+messages of that trip would become valid again. Therefore:
+- `FreshnessManager::takePersistRequest()` reports every new trip counter
+  (start-up and reset counter overflow);
+- the gateway process writes the snapshot to `--fv-store` (atomic rename)
+  **before** the next cycle. It refuses to continue if that write fails;
+- the snapshot file has a `trip <n>` line next to the Tx/Rx counters.
+
+**Restore after an ECU exchange or NvM loss.** Slaves only follow increasing
+counters. A gateway whose stored trip counter went backwards would therefore
+be ignored until the counters are re-aligned. That is a workshop operation
+(key and counter renewal), not something done automatically.
+
+## 5. Gateway integration (`ccg_ethgw`)
 
 `PduDefinition::secoc` marks a PDU as a secured I-PDU. Signals and E2E live in
 the authentic part; the validator checks that they do not reach into the trailer.
@@ -125,7 +209,7 @@ authenticated.
 byte for byte, MAC included. This allows end-to-end SecOC between two ECUs
 when the gateway is not a party to the key.
 
-## 5. Crypto service
+## 6. Crypto service
 
 `secoc::ICryptoService` corresponds to the AUTOSAR Csm and works with key slots
 (`hasKey`, `generateMac`):
@@ -146,13 +230,14 @@ MAC comparison runs in constant time over the truncated bits.
 The gateway refuses to start (`RoutingConfigError`) if a secured PDU's key is
 not available.
 
-## 6. Reference configuration
+## 7. Reference configuration
 
 | PDU | Bus | Role | Profile | Key | Data ID | Length (authentic + trailer) |
 |-----|-----|------|---------|-----|---------|------------------------------|
 | ADAS_SteerTorqueReq | ETH_ADAS 0x1003 | received | Ethernet | K_ADAS_GW | 0x1003 | 8 + 16 |
-| GW_SteerTorqueReq | CHS_CAN 0x1B0 | assembled, on update | profile 1 | K_GW_CHS | 0x01B0 | 4 + 4 |
-| VCU_PowerLimit | PT_CAN 0x130 (FD) | received | profile 1 | K_VCU_GW | 0x0130 | 12 + 4 |
+| GW_SteerTorqueReq | CHS_CAN 0x1B0 | assembled, on update | synchronised | K_GW_CHS | 0x01B0 | 4 + 4 |
+| VCU_PowerLimit | PT_CAN 0x130 (FD) | received | synchronised | K_VCU_GW | 0x0130 | 12 + 4 |
+| GW_FvSync_* | PT/CHS/BODY_CAN 0x0F0, ETH_ADAS 0xF000 | FV master sync message | – | K_FV_MASTER | 0x00F0 | 8 |
 | VCU_PowerLimit_ADAS | ETH_ADAS 0x130 | message routing target | Ethernet | K_GW_ADAS | 0x2130 | 12 + 16 |
 
 ```
@@ -160,11 +245,10 @@ ccg_eth_gateway --bind ... --keys /etc/ccg/secoc.keys --fv-store /var/lib/ccg/fr
 ccg_eth_gw_sim     # genuine stream, tampered request, replay, timeout -> safe state
 ```
 
-## 7. Limitations / next steps
+## 8. Limitations / next steps
 
-- Counter-based freshness only. A global freshness master (trip/reset counter
-  with synchronisation messages, AUTOSAR "FVM" / JASPAR profile 3) and
-  timestamp-based freshness are not implemented.
+- Timestamp-based freshness (time synchronisation) is not implemented, and
+  neither are secondary FV masters or FV master redundancy.
 - No secured I-PDU header (dynamic length) and no secured container PDUs. The
   authentic part has a fixed length.
 - No key management. Key update (e.g. via UDS 0x31/0x2E into the HSM) and key

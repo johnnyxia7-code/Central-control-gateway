@@ -14,6 +14,7 @@
 #include "ccg/can/can_frame.hpp"
 #include "ccg/e2e/can_e2e.hpp"
 #include "ccg/ethgw/routing_config.hpp"
+#include "ccg/secoc/fv_sync.hpp"
 #include "ccg/secoc/secoc.hpp"
 
 namespace ccg::ethgw {
@@ -57,6 +58,8 @@ struct GatewayStatistics {
     std::uint64_t secocFreshnessFailures = 0;
     std::uint64_t secocProtected = 0;
     std::uint64_t secocTxFailures = 0;   // crypto error or exhausted freshness counter
+    // Freshness value master
+    std::uint64_t fvSyncMessagesSent = 0;  // one per sync PDU
 };
 
 // Failed SecOC verification, reported to the intrusion detection (IdsM).
@@ -99,8 +102,12 @@ public:
     std::optional<std::size_t> channelIndex(const std::string& name) const;
     const GatewayStatistics& statistics() const { return stats_; }
     const std::deque<SecurityEvent>& securityEvents() const { return securityEvents_; }
-    // SecOC freshness counters, to be persisted (NvM) and restored at start-up.
+    // SecOC freshness counters, to be persisted (NvM) and restored before start().
+    // With an FV master the snapshot must be stored whenever
+    // freshness().takePersistRequest() reports a new trip counter.
     secoc::FreshnessManager& freshness() { return freshness_; }
+    // False if the FV master is configured but its trip counter is exhausted.
+    bool freshnessMasterActive() const { return fvMaster_ && fvMaster_->active(); }
     const RoutingConfig& config() const { return config_; }
 
     // Current raw value of a signal in a PDU assembled by the gateway.
@@ -168,6 +175,8 @@ private:
     GatewayStatistics stats_;
     secoc::FreshnessManager freshness_;
     std::unique_ptr<secoc::SecOcProcessor> secoc_;
+    std::unique_ptr<secoc::FreshnessSyncMaster> fvMaster_;
+    std::vector<std::size_t> syncPdus_;
     std::deque<SecurityEvent> securityEvents_;
     bool started_ = false;
     TimePoint startTime_{};

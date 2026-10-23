@@ -54,6 +54,7 @@ TEST_CASE("secoc storage: freshness counters survive a restart") {
     secoc::FreshnessManager before;
     for (int i = 0; i < 5; ++i) before.nextTx(0x01B0, 64);
     before.acceptRx(0x1003, 77);
+    before.setStoredTrip(9);
     REQUIRE(platform::saveFreshness(path, before.snapshot()));
 
     const auto loaded = platform::loadFreshness(path);
@@ -62,5 +63,6 @@ TEST_CASE("secoc storage: freshness counters survive a restart") {
     after.restore(*loaded, 1000);
     CHECK_EQ(*after.nextTx(0x01B0, 64), 1006U);
     CHECK_EQ(after.latestRx(0x1003), 77U);
+    CHECK_EQ(after.storedTrip(), 9U);  // FV master trip counter
     std::remove(path.c_str());
 }

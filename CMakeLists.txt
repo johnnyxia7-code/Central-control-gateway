@@ -58,6 +58,7 @@ ccg_warnings(ccg_diag)
 add_library(ccg_secoc
   src/crypto/aes_cmac.cpp
   src/secoc/secoc.cpp
+  src/secoc/fv_sync.cpp
 )
 target_include_directories(ccg_secoc PUBLIC include)
 ccg_warnings(ccg_secoc)
@@ -134,6 +135,7 @@ if(CCG_BUILD_TESTS)
     tests/test_diag_gateway.cpp
     tests/test_aes_cmac.cpp
     tests/test_secoc.cpp
+    tests/test_fv_sync.cpp
   )
   target_link_libraries(ccg_tests PRIVATE ccg_vehicle_matrix ccg_sim ccg_secoc)
   if(TARGET ccg_platform_linux)

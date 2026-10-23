@@ -61,7 +61,13 @@ std::optional<secoc::FreshnessManager::Snapshot> loadFreshness(const std::string
     std::string kind;
     unsigned long id = 0;
     unsigned long long value = 0;
-    while (in >> kind >> id >> value) {
+    while (in >> kind) {
+        if (kind == "trip") {
+            if (!(in >> value)) break;
+            snapshot.trip = value;
+            continue;
+        }
+        if (!(in >> id >> value)) break;
         auto& map = kind == "tx" ? snapshot.tx : snapshot.rx;
         map[static_cast<std::uint16_t>(id)] = value;
     }
@@ -73,6 +79,7 @@ bool saveFreshness(const std::string& path, const secoc::FreshnessManager::Snaps
     {
         std::ofstream out(tmp, std::ios::trunc);
         if (!out) return false;
+        out << "trip " << snapshot.trip << "\n";
         for (const auto& [id, v] : snapshot.tx) out << "tx " << id << " " << v << "\n";
         for (const auto& [id, v] : snapshot.rx) out << "rx " << id << " " << v << "\n";
         out.flush();

@@ -97,18 +97,109 @@ void FreshnessManager::acceptRx(std::uint16_t dataId, std::uint64_t value) { rx_
 
 void FreshnessManager::restore(const Snapshot& snapshot, std::uint64_t txMargin) {
     rx_ = snapshot.rx;
+    storedTrip_ = snapshot.trip;
     tx_.clear();
     for (const auto& [id, value] : snapshot.tx) {
         tx_[id] = value > ~std::uint64_t{0} - txMargin ? ~std::uint64_t{0} : value + txMargin;
     }
 }
 
+void FreshnessManager::setTripReset(std::uint32_t trip, std::uint32_t reset) {
+    trip_ = trip;
+    reset_ = reset;
+    synchronized_ = true;
+}
+
+void FreshnessManager::setStoredTrip(std::uint64_t trip) {
+    storedTrip_ = trip;
+    persistRequest_ = true;
+}
+
+bool FreshnessManager::takePersistRequest() {
+    const bool request = persistRequest_;
+    persistRequest_ = false;
+    return request;
+}
+
+std::optional<FreshnessManager::TxFreshness> FreshnessManager::nextTxSynchronized(std::uint16_t dataId,
+                                                                                std::uint8_t txBits) {
+    if (!synchronized_ || txBits <= layout_.resetFlagBits) {
+        return std::nullopt;
+    }
+    const std::uint64_t epoch = (static_cast<std::uint64_t>(trip_) << layout_.resetBits) | reset_;
+    auto& st = syncTx_[dataId];
+    if (st.epoch != epoch) {  // new reset period: message counter starts again
+        st.epoch = epoch;
+        st.message = 0;
+    }
+    if (st.message >= maxValue(layout_.messageBits)) {
+        return std::nullopt;  // wait for the next reset counter
+    }
+    ++st.message;
+    const std::uint8_t messageTxBits = static_cast<std::uint8_t>(txBits - layout_.resetFlagBits);
+    const std::uint64_t flag = reset_ & maxValue(layout_.resetFlagBits);
+    return TxFreshness{(epoch << layout_.messageBits) | st.message,
+                       (flag << messageTxBits) | (st.message & maxValue(messageTxBits))};
+}
+
+std::optional<std::uint64_t> FreshnessManager::rxSynchronizedCandidate(std::uint16_t dataId,
+                                                                       std::uint64_t truncated,
+                                                                       std::uint8_t txBits,
+                                                                       std::uint8_t attempt) const {
+    if (!synchronized_ || txBits <= layout_.resetFlagBits) {
+        return std::nullopt;
+    }
+    const std::uint8_t messageTxBits = static_cast<std::uint8_t>(txBits - layout_.resetFlagBits);
+    const std::uint64_t flagMask = maxValue(layout_.resetFlagBits);
+    const std::uint64_t flag = (truncated >> messageTxBits) & flagMask;
+    const std::uint64_t messageLow = truncated & maxValue(messageTxBits);
+
+    // Reset counter: the current one, or one period older / newer (sync skew
+    // between sender and receiver).
+    std::optional<std::uint64_t> reset;
+    const std::uint64_t current = reset_;
+    for (const std::int64_t delta : {0, -1, 1}) {
+        if (delta < 0 && current == 0) continue;
+        const std::uint64_t r = current + static_cast<std::uint64_t>(delta);
+        if (r > maxValue(layout_.resetBits)) continue;
+        if ((r & flagMask) == flag) {
+            reset = r;
+            break;
+        }
+    }
+    if (!reset) {
+        return std::nullopt;
+    }
+    const std::uint64_t epoch = (static_cast<std::uint64_t>(trip_) << layout_.resetBits) | *reset;
+
+    // Message counter relative to the last accepted value of the same period.
+    const std::uint64_t last = latestRx(dataId);
+    const std::uint64_t base = (last >> layout_.messageBits) == epoch ? (last & maxValue(layout_.messageBits)) : 0;
+    std::uint64_t message;
+    if (messageTxBits >= layout_.messageBits) {
+        message = messageLow;
+    } else {
+        const std::uint64_t mask = maxValue(messageTxBits);
+        const std::uint64_t msb = base & ~mask;
+        message = messageLow > (base & mask) ? (msb | messageLow) : ((msb + mask + 1) | messageLow);
+        message += static_cast<std::uint64_t>(attempt) * (mask + 1);
+    }
+    if (message == 0 || message > maxValue(layout_.messageBits)) {
+        return std::nullopt;
+    }
+    return (epoch << layout_.messageBits) | message;
+}
+
 // --- protect / verify ------------------------------------------------------------
+
+std::size_t SecOcProcessor::completeFreshnessBits(const SecOcConfig& c) const {
+    return c.freshnessMode == FreshnessMode::TripReset ? freshness_.layout().totalBits() : c.freshnessBits;
+}
 
 bool SecOcProcessor::authenticator(const SecOcConfig& c, const std::uint8_t* authentic,
                                    std::size_t length, std::uint64_t fv, crypto::Block& mac) {
     std::vector<std::uint8_t> dta;
-    const std::size_t fvBytes = (c.freshnessBits + 7u) / 8u;
+    const std::size_t fvBytes = (completeFreshnessBits(c) + 7u) / 8u;
     dta.reserve(2 + length + fvBytes);
     dta.push_back(static_cast<std::uint8_t>(c.dataId >> 8));
     dta.push_back(static_cast<std::uint8_t>(c.dataId));
@@ -122,20 +213,39 @@ bool SecOcProcessor::authenticator(const SecOcConfig& c, const std::uint8_t* aut
 std::optional<std::vector<std::uint8_t>> SecOcProcessor::protect(const SecOcConfig& c,
                                                                  const std::uint8_t* authentic,
                                                                  std::size_t length) {
-    const auto fv = freshness_.nextTx(c.dataId, c.freshnessBits);
-    if (!fv) {
-        return std::nullopt;
+    std::uint64_t complete;
+    std::uint64_t truncated;
+    if (c.freshnessMode == FreshnessMode::TripReset) {
+        const auto fv = freshness_.nextTxSynchronized(c.dataId, c.freshnessTxBits);
+        if (!fv) return std::nullopt;
+        complete = fv->complete;
+        truncated = fv->truncated;
+    } else {
+        const auto fv = freshness_.nextTx(c.dataId, c.freshnessBits);
+        if (!fv) return std::nullopt;
+        complete = *fv;
+        truncated = *fv;  // LSBs are taken below
     }
     crypto::Block mac;
-    if (!authenticator(c, authentic, length, *fv, mac)) {
+    if (!authenticator(c, authentic, length, complete, mac)) {
         return std::nullopt;
     }
     std::vector<std::uint8_t> out(authentic, authentic + length);
     out.resize(length + overheadBytes(c), 0x00);
     BitWriter w(out, length * 8);
-    for (int i = c.freshnessTxBits - 1; i >= 0; --i) w.put((*fv >> i) & 1);
+    for (int i = c.freshnessTxBits - 1; i >= 0; --i) w.put((truncated >> i) & 1);
     for (std::size_t i = 0; i < c.macTxBits; ++i) w.put((mac[i / 8] >> (7 - i % 8)) & 1);
     return out;
+}
+
+bool SecOcProcessor::matches(const SecOcConfig& c, const std::uint8_t* authentic, std::size_t length,
+                             std::uint64_t fv, const crypto::Block& receivedMac, VerifyResult& error) {
+    crypto::Block mac;
+    if (!authenticator(c, authentic, length, fv, mac)) {
+        error = VerifyResult::CryptoError;
+        return false;
+    }
+    return crypto::equalBits(mac.data(), receivedMac.data(), c.macTxBits);
 }
 
 VerifyResult SecOcProcessor::verify(const SecOcConfig& c, const std::uint8_t* secured,
@@ -147,9 +257,26 @@ VerifyResult SecOcProcessor::verify(const SecOcConfig& c, const std::uint8_t* se
     for (std::size_t i = 0; i < c.macTxBits; ++i) {
         if (r.get()) receivedMac[i / 8] = static_cast<std::uint8_t>(receivedMac[i / 8] | (0x80 >> (i % 8)));
     }
-
-    // Rebuild the complete freshness value from the latest accepted one.
     const std::uint64_t latest = freshness_.latestRx(c.dataId);
+    VerifyResult error = VerifyResult::MacFailure;
+
+    if (c.freshnessMode == FreshnessMode::TripReset) {
+        for (std::uint8_t attempt = 0; attempt < c.verifyAttempts; ++attempt) {
+            const auto candidate =
+                freshness_.rxSynchronizedCandidate(c.dataId, receivedFv, c.freshnessTxBits, attempt);
+            if (!candidate || *candidate <= latest) {
+                return attempt == 0 ? VerifyResult::FreshnessFailure : error;
+            }
+            if (matches(c, secured, authenticLength, *candidate, receivedMac, error)) {
+                freshness_.acceptRx(c.dataId, *candidate);
+                return VerifyResult::Ok;
+            }
+            if (error == VerifyResult::CryptoError) return error;
+        }
+        return error;
+    }
+
+    // Counter mode: rebuild the complete freshness value from the latest accepted one.
     const bool fullFv = c.freshnessTxBits >= c.freshnessBits;
     std::uint64_t candidate;
     std::uint64_t step = 0;
@@ -164,26 +291,20 @@ VerifyResult SecOcProcessor::verify(const SecOcConfig& c, const std::uint8_t* se
         candidate = receivedFv > (latest & mask) ? (msb | receivedFv) : ((msb + mask + 1) | receivedFv);
         step = mask + 1;
     }
-
-    VerifyResult result = VerifyResult::MacFailure;
     for (std::uint8_t attempt = 0; attempt < c.verifyAttempts; ++attempt) {
         if (candidate <= latest || candidate > maxValue(c.freshnessBits) ||
             (c.acceptanceWindow != 0 && candidate - latest > c.acceptanceWindow)) {
-            return attempt == 0 ? VerifyResult::FreshnessFailure : result;
+            return attempt == 0 ? VerifyResult::FreshnessFailure : error;
         }
-        crypto::Block mac;
-        if (!authenticator(c, secured, authenticLength, candidate, mac)) {
-            return VerifyResult::CryptoError;
-        }
-        if (crypto::equalBits(mac.data(), receivedMac.data(), c.macTxBits)) {
+        if (matches(c, secured, authenticLength, candidate, receivedMac, error)) {
             freshness_.acceptRx(c.dataId, candidate);
             return VerifyResult::Ok;
         }
-        result = VerifyResult::MacFailure;
+        if (error == VerifyResult::CryptoError) return error;
         if (fullFv) break;
         candidate += step;  // try the next counter epoch (lost PDUs)
     }
-    return result;
+    return error;
 }
 
 }  // namespace ccg::secoc

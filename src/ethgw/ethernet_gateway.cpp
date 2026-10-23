@@ -49,11 +49,22 @@ EthernetGateway::EthernetGateway(RoutingConfig config, IGatewayTransmitter& tran
                              "' not available in the crypto service");
         }
     }
+    if (config_.freshnessSync) {
+        const auto& keyId = config_.freshnessSync->message.keyId;
+        if (crypto == nullptr || !crypto->hasKey(keyId)) {
+            errors.push_back("freshness sync: key '" + keyId + "' not available in the crypto service");
+        }
+    }
     if (!errors.empty()) {
         throw RoutingConfigError(std::move(errors));
     }
     if (crypto != nullptr) {
         secoc_ = std::make_unique<secoc::SecOcProcessor>(*crypto, freshness_);
+    }
+    if (config_.freshnessSync) {
+        freshness_.setLayout(config_.freshnessSync->layout);
+        fvMaster_ = std::make_unique<secoc::FreshnessSyncMaster>(config_.freshnessSync->message,
+                                                                 *crypto, freshness_);
     }
     buildRuntime();
 }
@@ -102,6 +113,12 @@ void EthernetGateway::buildRuntime() {
         rxIndex_[rxKey(pdus_[rt.sourcePdu].channel, cfg.id, cfg.extended)] = rt.sourcePdu;
     }
 
+    if (config_.freshnessSync) {
+        for (const auto& name : config_.freshnessSync->syncPdus) {
+            syncPdus_.push_back(pduByName_.at(name));
+        }
+    }
+
     for (std::size_t p = 0; p < pdus_.size(); ++p) {
         const auto& cfg = config_.pdus[p];
         auto& st = pdus_[p];
@@ -117,6 +134,9 @@ void EthernetGateway::buildRuntime() {
 void EthernetGateway::start(TimePoint now) {
     started_ = true;
     startTime_ = now;
+    if (fvMaster_) {
+        fvMaster_->start(now);  // new trip counter; inactive if exhausted
+    }
     for (std::size_t p = 0; p < pdus_.size(); ++p) {
         if (pdus_[p].assembled && isCyclic(config_.pdus[p].txMode)) {
             pdus_[p].nextCyclic = now + config_.pdus[p].cycleTime;
@@ -453,6 +473,20 @@ void EthernetGateway::flushContainer(std::size_t channel, TimePoint now) {
 void EthernetGateway::mainFunction(TimePoint now) {
     if (!started_) {
         return;
+    }
+
+    // FV master: reset counter and sync message on every bus, before any secured
+    // PDU of this cycle is built with the new counters.
+    if (fvMaster_) {
+        if (const auto sync = fvMaster_->mainFunction(now)) {
+            for (const std::size_t p : syncPdus_) {
+                const auto& cfg = config_.pdus[p];
+                std::vector<std::uint8_t> payload(cfg.length, cfg.padding);
+                std::copy(sync->begin(), sync->end(), payload.begin());
+                sendOnChannel(p, payload.data(), payload.size(), now);
+                ++stats_.fvSyncMessagesSent;
+            }
+        }
     }
 
     // Deadline monitoring of signal-routing sources.

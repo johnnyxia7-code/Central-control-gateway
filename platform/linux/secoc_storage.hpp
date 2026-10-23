@@ -13,7 +13,8 @@ namespace ccg::platform {
 // Returns the number of keys loaded.
 std::size_t loadKeyFile(const std::string& path, secoc::SoftwareCryptoService& crypto);
 
-// Lines "tx|rx <data id> <counter>". nullopt if the file does not exist.
+// Lines "trip <counter>" (FV master) and "tx|rx <data id> <counter>".
+// nullopt if the file does not exist.
 std::optional<secoc::FreshnessManager::Snapshot> loadFreshness(const std::string& path);
 
 // Written to "<path>.tmp" and renamed, so a power loss never leaves a torn file.

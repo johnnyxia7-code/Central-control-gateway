@@ -198,6 +198,52 @@ std::vector<std::string> validateRoutingConfig(const RoutingConfig& config) {
         }
     }
 
+    // ------------------------------------------------ freshness synchronisation
+    const auto& sync = config.freshnessSync;
+    for (const auto& pdu : config.pdus) {
+        if (!pdu.secoc || pdu.secoc->freshnessMode != secoc::FreshnessMode::TripReset) continue;
+        if (!sync) {
+            add(errors, "PDU '", pdu.name,
+                "': synchronised freshness needs the FV master configuration (freshnessSync)");
+            continue;
+        }
+        const auto flag = sync->layout.resetFlagBits;
+        if (pdu.secoc->freshnessTxBits <= flag ||
+            pdu.secoc->freshnessTxBits > flag + sync->layout.messageBits) {
+            add(errors, "PDU '", pdu.name, "': freshnessTxBits must be reset flag (", int{flag},
+                ") + 1..", int{sync->layout.messageBits}, " message counter bits");
+        }
+    }
+    if (sync) {
+        for (const auto& e : secoc::validateFreshnessSync(sync->layout, sync->message)) {
+            add(errors, "freshness sync: ", e);
+        }
+        if (dataIds.count(sync->message.dataId)) {
+            add(errors, "freshness sync: Data ID ", hex(sync->message.dataId), " already used by a PDU");
+        }
+        if (sync->syncPdus.empty()) {
+            add(errors, "freshness sync: no sync message PDU");
+        }
+        const std::size_t length = secoc::syncMessageLength(sync->layout, sync->message);
+        std::set<std::string> seen;
+        for (const auto& name : sync->syncPdus) {
+            const auto it = pdus.find(name);
+            if (it == pdus.end()) {
+                add(errors, "freshness sync: unknown PDU '", name, "'");
+                continue;
+            }
+            if (!seen.insert(name).second) add(errors, "freshness sync: PDU '", name, "' listed twice");
+            if (it->second->length < length) {
+                add(errors, "freshness sync: PDU '", name, "' (", it->second->length,
+                    " bytes) shorter than the sync message (", length, " bytes)");
+            }
+            if (it->second->secoc) add(errors, "freshness sync: PDU '", name, "' must not be a SecOC PDU");
+            if (received.count(name) || pduRouteTargets.count(name) || assembledTargets.count(name)) {
+                add(errors, "freshness sync: PDU '", name, "' is also used by a route");
+            }
+        }
+    }
+
     for (const auto& name : received) {
         if (pduRouteTargets.count(name) || assembledTargets.count(name)) {
             add(errors, "PDU '", name, "' is both received and transmitted by the gateway");

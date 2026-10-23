@@ -1,4 +1,6 @@
 #include <map>
+#include <set>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -80,9 +82,35 @@ struct Fixture {
     TimePoint now = TimePoint{} + 10s;
     std::map<std::string, e2e::CanE2ESender> senders;
 
-    explicit Fixture(RoutingConfig c = config::makeVehicleEthGatewayMatrix())
+    // Start-up cycle output (FV master sync messages), kept out of tx for the tests.
+    std::vector<MockTransmitter::CanTx> startupCan;
+    std::vector<MockTransmitter::EthTx> startupEth;
+
+    explicit Fixture(RoutingConfig c = config::makeVehicleEthGatewayMatrix(),
+                     const secoc::FreshnessManager::Snapshot* nvm = nullptr)
         : cfg(c), gw(std::move(c), tx, &crypto) {
+        if (nvm) gw.freshness().restore(*nvm, 0);
         gw.start(now);
+        gw.mainFunction(now);  // first cycle: FV sync message on every bus
+        startupCan = std::move(tx.can);
+        startupEth = std::move(tx.eth);
+        tx.can.clear();
+        tx.eth.clear();
+    }
+
+    // Latest FV sync message sent on a CAN channel (start-up or later).
+    Bytes lastSync(std::size_t channel) const {
+        for (auto it = tx.can.rbegin(); it != tx.can.rend(); ++it) {
+            if (it->channel == channel && it->frame.id == gw::kFvSyncCan) {
+                return Bytes(it->frame.data.begin(), it->frame.data.begin() + it->frame.length);
+            }
+        }
+        for (const auto& c : startupCan) {
+            if (c.channel == channel && c.frame.id == gw::kFvSyncCan) {
+                return Bytes(c.frame.data.begin(), c.frame.data.begin() + c.frame.length);
+            }
+        }
+        return {};
     }
 
     void advance(Milliseconds duration) {
@@ -509,6 +537,19 @@ struct SecureEcu {
     secoc::SoftwareCryptoService crypto = demoCrypto();
     secoc::FreshnessManager fvm;
     secoc::SecOcProcessor proc{crypto, fvm};
+    std::unique_ptr<secoc::FreshnessSyncSlave> slave;
+
+    SecureEcu() {
+        const auto routing = config::makeVehicleEthGatewayMatrix();
+        fvm.setLayout(routing.freshnessSync->layout);
+        slave = std::make_unique<secoc::FreshnessSyncSlave>(routing.freshnessSync->message, crypto, fvm);
+    }
+
+    // FV slave: takes the trip/reset counter from the gateway's sync message on `channel`.
+    secoc::SyncResult sync(const Fixture& f, std::size_t channel) {
+        const auto msg = f.lastSync(channel);
+        return slave->onSyncMessage(msg.data(), msg.size());
+    }
 };
 
 Bytes steerRequest(double torqueNm, bool active) {
@@ -533,6 +574,7 @@ void sendSteer(Fixture& f, const Bytes& secured) {
 TEST_CASE("secoc gateway: verify on ETH_ADAS, re-authenticate for CHS_CAN") {
     Fixture f;
     SecureEcu adas, eps;
+    REQUIRE(eps.sync(f, gw::kChsCan) == secoc::SyncResult::Accepted);
     const auto& rxCfg = *f.def("ADAS_SteerTorqueReq").secoc;
     const auto& txCfg = *f.def("GW_SteerTorqueReq").secoc;
 
@@ -550,12 +592,12 @@ TEST_CASE("secoc gateway: verify on ETH_ADAS, re-authenticate for CHS_CAN") {
         CHECK(eps.proc.verify(txCfg, frames[i].data.data(), 4) == secoc::VerifyResult::Ok);
         CHECK_EQ(f.field("GW_SteerTorqueReq", "GW_SteerTqReq", frames[i].data.data()), 250U + 100U * i);
         CHECK_EQ(f.field("GW_SteerTorqueReq", "GW_SteerReqActive", frames[i].data.data()), 1U);
-        CHECK_EQ(frames[i].data[4], i + 1);  // truncated FV of the gateway's own counter
+        CHECK_EQ(frames[i].data[4], i + 1);  // reset flag 0 | message counter i + 1
     }
     CHECK_EQ(f.gw.statistics().secocVerified, 3U);
     CHECK_EQ(f.gw.statistics().secocProtected, 3U);
     CHECK(f.gw.securityEvents().empty());
-    CHECK_EQ(f.gw.freshness().snapshot().tx.at(0x01B0), 3U);
+    CHECK_EQ(f.gw.freshness().tripCounter(), 1U);  // first power cycle of the FV master
 }
 
 TEST_CASE("secoc gateway: tampered, replayed and forged PDUs are dropped") {
@@ -594,6 +636,7 @@ TEST_CASE("secoc gateway: tampered, replayed and forged PDUs are dropped") {
 TEST_CASE("secoc gateway: unauthenticated source falls back to the safe state") {
     Fixture f;
     SecureEcu adas, eps;
+    REQUIRE(eps.sync(f, gw::kChsCan) == secoc::SyncResult::Accepted);
     const auto& cfg = *f.def("ADAS_SteerTorqueReq").secoc;
     const auto request = steerRequest(3.0, true);
     sendSteer(f, *adas.proc.protect(cfg, request.data(), request.size()));
@@ -617,6 +660,7 @@ TEST_CASE("secoc gateway: unauthenticated source falls back to the safe state") 
 TEST_CASE("secoc gateway: secured CAN FD message routed and re-authenticated for Ethernet") {
     Fixture f;
     SecureEcu vcu, adas;
+    REQUIRE(vcu.sync(f, gw::kPtCan) == secoc::SyncResult::Accepted);
     const auto& rxCfg = *f.def("VCU_PowerLimit").secoc;
     Bytes authentic(12);
     for (std::size_t i = 0; i < authentic.size(); ++i) authentic[i] = static_cast<std::uint8_t>(0xA0 + i);
@@ -662,7 +706,136 @@ TEST_CASE("secoc gateway: configuration checks") {
     } catch (const RoutingConfigError& e) {
         thrown = true;
         CHECK(contains(e.errors(), "PDU 'ADAS_SteerTorqueReq': SecOC key 'K_ADAS_GW' not available"));
-        CHECK_EQ(e.errors().size(), 4U);
+        CHECK(contains(e.errors(), "freshness sync: key 'K_FV_MASTER' not available"));
+        CHECK_EQ(e.errors().size(), 5U);
     }
     CHECK(thrown);
+}
+
+// ------------------------------------------------------- freshness value master
+
+namespace {
+
+std::pair<std::uint32_t, std::uint32_t> decodeSync(const Bytes& m) {
+    const std::uint64_t v = (static_cast<std::uint64_t>(m[0]) << 32) | (static_cast<std::uint64_t>(m[1]) << 24) |
+                            (static_cast<std::uint64_t>(m[2]) << 16) | (static_cast<std::uint64_t>(m[3]) << 8) | m[4];
+    return {static_cast<std::uint32_t>(v >> 24), static_cast<std::uint32_t>((v >> 4) & 0xFFFFF)};
+}
+
+}  // namespace
+
+TEST_CASE("fv master: sync message on every bus at start-up and every reset cycle") {
+    Fixture f;
+    std::set<std::size_t> channels;
+    for (const auto& c : f.startupCan) {
+        CHECK_EQ(c.frame.id, gw::kFvSyncCan);
+        CHECK_EQ(c.frame.length, 8);
+        channels.insert(c.channel);
+    }
+    CHECK_EQ(channels.size(), 3U);  // PT_CAN, CHS_CAN, BODY_CAN
+    REQUIRE(f.startupEth.size() == 1);  // urgent: not held back by the 5 ms collection
+    const auto eth = decodeDatagram(f.startupEth[0].datagram.data(), f.startupEth[0].datagram.size());
+    REQUIRE(eth.pdus.size() == 1);
+    CHECK_EQ(eth.pdus[0].headerId, gw::kFvSyncEth);
+    const auto [trip, reset] = decodeSync(f.lastSync(gw::kChsCan));
+    CHECK_EQ(trip, 1U);
+    CHECK_EQ(reset, 0U);
+    CHECK(f.gw.freshnessMasterActive());
+    CHECK(f.gw.freshness().takePersistRequest());  // trip counter 1 must be stored
+
+    f.advance(999ms);
+    for (const auto ch : {gw::kPtCan, gw::kChsCan, gw::kBodyCan}) {
+        CHECK(f.tx.canFrames(ch, gw::kFvSyncCan).empty());
+    }
+    f.advance(1ms);
+    CHECK_EQ(decodeSync(f.lastSync(gw::kBodyCan)).second, 1U);
+    f.advance(1000ms);
+    CHECK_EQ(decodeSync(f.lastSync(gw::kPtCan)).second, 2U);
+    CHECK_EQ(f.gw.statistics().fvSyncMessagesSent, 12U);  // 3 cycles x 4 buses
+}
+
+TEST_CASE("fv master: ECUs follow the reset counter, one missed sync is tolerated") {
+    Fixture f;
+    SecureEcu adas, eps;
+    const auto& rxCfg = *f.def("ADAS_SteerTorqueReq").secoc;
+    const auto& txCfg = *f.def("GW_SteerTorqueReq").secoc;
+    REQUIRE(eps.sync(f, gw::kChsCan) == secoc::SyncResult::Accepted);
+
+    std::size_t verified = 0;
+    std::size_t checked = 0;
+    for (int period = 0; period < 4; ++period) {
+        for (int i = 0; i < 20; ++i) {  // every 50 ms, within the 100 ms Rx timeout
+            const auto a = steerRequest(0.25 * i, true);
+            sendSteer(f, *adas.proc.protect(rxCfg, a.data(), a.size()));
+            f.advance(50ms);
+        }
+        const auto frames = f.tx.canFrames(gw::kChsCan, gw::kGwSteerTorqueReq);
+        for (; checked < frames.size(); ++checked) {
+            if (eps.proc.verify(txCfg, frames[checked].data.data(), 4) == secoc::VerifyResult::Ok) ++verified;
+        }
+        if (period != 1) {  // the EPS misses the sync message after period 1
+            const auto r = eps.sync(f, gw::kChsCan);
+            CHECK(r == secoc::SyncResult::Accepted);
+        }
+    }
+    CHECK_EQ(checked, 80U);
+    CHECK_EQ(verified, 80U);
+    CHECK_EQ(eps.fvm.resetCounter(), 4U);
+}
+
+TEST_CASE("fv master: restart increments the trip counter, recorded frames are rejected") {
+    Bytes recorded;
+    secoc::FreshnessManager::Snapshot nvm;
+    auto routing = config::makeVehicleEthGatewayMatrix();
+    const auto cfgVcu = *findPdu(routing, "VCU_PowerLimit")->secoc;
+    {
+        Fixture first;
+        SecureEcu vcu;
+        REQUIRE(vcu.sync(first, gw::kPtCan) == secoc::SyncResult::Accepted);
+        const Bytes a(12, 0x42);
+        recorded = *vcu.proc.protect(cfgVcu, a.data(), a.size());
+        can::CanFrame frame;
+        frame.id = gw::kVcuPowerLimit;
+        frame.fd = true;
+        frame.length = 16;
+        std::copy(recorded.begin(), recorded.end(), frame.data.begin());
+        first.gw.onCanFrame(gw::kPtCan, frame, first.now);
+        CHECK_EQ(first.gw.statistics().secocVerified, 1U);
+        nvm = first.gw.freshness().snapshot();  // stored in NvM at shutdown
+    }
+    Fixture second(config::makeVehicleEthGatewayMatrix(), &nvm);
+    CHECK_EQ(second.gw.freshness().tripCounter(), 2U);
+    CHECK_EQ(decodeSync(second.lastSync(gw::kPtCan)).first, 2U);
+
+    can::CanFrame replay;
+    replay.id = gw::kVcuPowerLimit;
+    replay.fd = true;
+    replay.length = 16;
+    std::copy(recorded.begin(), recorded.end(), replay.data.begin());
+    second.gw.onCanFrame(gw::kPtCan, replay, second.now);
+    REQUIRE(second.gw.securityEvents().size() == 1);
+    CHECK(second.gw.securityEvents()[0].result == secoc::VerifyResult::MacFailure);
+}
+
+TEST_CASE("fv master: configuration checks") {
+    auto cfg = config::makeVehicleEthGatewayMatrix();
+    findPdu(cfg, "GW_SteerTorqueReq")->secoc->freshnessTxBits = 2;     // only the reset flag
+    findPdu(cfg, "GW_FvSync_BODY_CAN")->length = 4;                   // sync message needs 8
+    cfg.freshnessSync->syncPdus.push_back("ESP_WheelSpeeds_PT");       // a routed PDU
+    cfg.freshnessSync->syncPdus.push_back("Nope");
+    cfg.freshnessSync->message.dataId = 0x0130;                       // VCU_PowerLimit's Data ID
+    cfg.freshnessSync->layout.messageBits = 40;                       // 16 + 20 + 40 > 64
+    auto errors = validateRoutingConfig(cfg);
+    CHECK(contains(errors, "PDU 'GW_SteerTorqueReq': freshnessTxBits must be reset flag (2) + 1..40"));
+    CHECK(contains(errors, "freshness sync: PDU 'GW_FvSync_BODY_CAN' (4 bytes) shorter than the sync message (8 bytes)"));
+    CHECK(contains(errors, "freshness sync: PDU 'ESP_WheelSpeeds_PT' is also used by a route"));
+    CHECK(contains(errors, "freshness sync: unknown PDU 'Nope'"));
+    CHECK(contains(errors, "freshness sync: Data ID 0x130 already used by a PDU"));
+    CHECK(contains(errors, "freshness sync: trip + reset + message counter exceed 64 bits"));
+
+    auto noMaster = config::makeVehicleEthGatewayMatrix();
+    noMaster.freshnessSync.reset();
+    errors = validateRoutingConfig(noMaster);
+    CHECK(contains(errors, "PDU 'GW_SteerTorqueReq': synchronised freshness needs the FV master"));
+    CHECK(contains(errors, "PDU 'VCU_PowerLimit': synchronised freshness needs the FV master"));
 }
