@@ -138,15 +138,24 @@ answers on the gateway's own logical address (0x1001).
 | `31 01 F2 10 [group ..]` | `71 01 F2 10 00` | key master: start a campaign (section 7) |
 | `31 03 F2 10` | `71 03 F2 10 <state> <n> {result, generation (4), ECU (2), SHE error}` | key master: results |
 
+**Who may change keys.** `31 01 F201`/`F202` and the key master campaign
+`31 01 F210` are not covered by the SHE authentication. On the gateway they
+need a tester with a verified TLS client certificate (DoIP over TLS, see
+DIAG_GATEWAY_DESIGN.md §3.4); others get NRC 0x33 *securityAccessDenied*.
+`31 01 F200` (M3-authenticated) and the status DIDs stay open. ECUs, which
+only the key master talks to, do not apply this policy.
+
 Negative responses: 0x7F wrong session, 0x13 length, 0x12 sub-function (only
-startRoutine), 0x31 unknown routine, 0x37 lockout (3 authentication failures
-→ 10 s), 0x72 key store could not be written. Functional requests never reach
+startRoutine), 0x31 unknown routine, 0x33 tester not certificate-authenticated,
+0x37 lockout (3 authentication failures → 10 s), 0x72 key store could not be
+written. Functional requests never reach
 the key routines.
 
-The routines are not behind SecurityAccess: their authorisation is the SHE
+The key load is not behind SecurityAccess: its authorisation is the SHE
 protocol itself (M3 needs MASTER_ECU_KEY, which only the backend has), and the
 outcome is reported as the SHE error code so the backend can tell an
-authentication failure from a rollback.
+authentication failure from a rollback. The routines without such
+cryptographic protection rely on the tester's TLS client certificate (above).
 
 **Persistence before confirmation**: the service writes the key store before
 it returns M4/M5 or the activation result. If that fails it answers NRC 0x72 and

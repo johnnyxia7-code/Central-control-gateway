@@ -61,7 +61,9 @@ At start-up the vehicle announcement is broadcast **3 times, 500 ms apart**
 | Situation | Response code |
 |-----------|---------------|
 | SA outside the tester range 0x0E00..0x0FFF | 0x00 unknown SA, socket closed |
-| Activation type other than default (0x00) / WWH-OBD (0x01) | 0x06 unsupported, socket closed |
+| Activation type other than default (0x00), WWH-OBD (0x01) or central security (0xE0) | 0x06 unsupported, socket closed |
+| Plain TCP socket while TLS is required (`requireTls`, `--tls-only`), or 0xE0 on plain TCP | 0x07 needs a TLS socket, socket closed |
+| 0xE0 on TLS without a verified client certificate | 0x04 missing authentication, socket closed |
 | Socket already active with another SA | 0x02 SA mismatch, socket closed |
 | SA active on **another** socket | alive check (0x0007) on that socket: it answers → 0x03 SA in use; silent for 500 ms → old socket closed, **0x10** |
 | All `maxTcpConnections` sockets active | alive check on all of them: all answer → 0x01 no free socket; one silent → it is closed, **0x10** |
@@ -70,7 +72,45 @@ At start-up the vehicle announcement is broadcast **3 times, 500 ms apart**
 The TCP listener accepts `maxTcpConnections + 1` sockets, so a surplus tester
 can still receive its 0x01 rejection. One activation handshake runs at a time.
 
-### 3.4 Diagnostic messages (0x8001)
+### 3.4 DoIP over TLS (ISO 13400-2:2019, TCP 3496)
+
+Testers can connect to a TLS port next to the plain one. The TLS layer
+(`platform::DoipTlsServer`, OpenSSL) is in the Linux platform code. The
+portable gateway only learns what the handshake established
+(`diag::ConnectionSecurity`: TLS, verified client certificate, subject CN).
+
+| Topic | Behaviour |
+|-------|-----------|
+| Protocol | TLS 1.2 (ECDHE key exchange, AES-GCM only, no renegotiation) or TLS 1.3 |
+| Server identity | certificate chain and key from PEM files (`--tls-cert`, `--tls-key`) |
+| Client certificates | with a tester CA (`--tls-ca`), a presented certificate must verify (else the handshake fails); a tester without one is *anonymous TLS*. With `--tls-require-client-cert` there is no anonymous TLS |
+| Handshake | non-blocking in the process's `poll()` loop; the gateway sees the connection only after a completed handshake; 2 s limit (also drops plain DoIP on the TLS port) |
+| Plain port | still open; `--tls-only` (`requireTls`) answers every routing activation there with 0x07 |
+| Connection IDs | TLS connections are numbered from 0x10000, so the transport tells the two servers apart |
+
+**What a verified client certificate unlocks:**
+- routing activation type 0xE0 (central security), see §3.3;
+- the key management routines that change keys without SHE authentication:
+  activate and discard keys (`31 01 F201/F202`) and the key master campaign
+  (`31 01 F210`). Other testers get NRC 0x33 (*securityAccessDenied*). The SHE
+  key update itself (`31 01 F200`) is authenticated by M3 and stays open.
+
+Local services see `LocalRequestContext::tls` and `authenticated` for their
+own policies.
+
+Bench certificates (ECDSA P-256) can be created with OpenSSL:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 \
+    -subj "/CN=CCG Tester CA" -keyout ca.key -out ca.pem
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=ccg-gateway" \
+    -keyout gw.key -out gw.csr
+openssl x509 -req -in gw.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 365 -out gw.pem
+# same for each tester (CN = tester identity), then:
+openssl s_client -connect <gateway>:3496 -CAfile ca.pem -cert tester.pem -key tester.key
+```
+
+### 3.5 Diagnostic messages (0x8001)
 
 Payload: `SA (2) | TA (2) | UDS data`.
 
@@ -78,9 +118,9 @@ Payload: `SA (2) | TA (2) | UDS data`.
 |-------|----------|
 | Socket not activated, or SA ≠ activated SA | NACK 0x02 invalid SA, socket closed |
 | TA = gateway LA 0x1001 | ACK, local UDS server answers (§5) |
-| TA = functional 0xE400 | ACK from 0xE400, single frame on 0x7DF on **every** CAN bus (§4.3), and forwarded to every Ethernet ECU (§3.5) |
+| TA = functional 0xE400 | ACK from 0xE400, single frame on 0x7DF on **every** CAN bus (§4.3), and forwarded to every Ethernet ECU (§3.6) |
 | TA = ECU LA | ISO-TP to the ECU; ACK **after** ISO-TP delivered the request, NACK 0x08 on ISO-TP failure |
-| TA = Ethernet ECU LA (ADAS 0x1010) | DoIP-to-DoIP (§3.5); ACK **after** the ECU's DoIP entity acknowledged, its NACK passed on, NACK 0x06 if it cannot be reached |
+| TA = Ethernet ECU LA (ADAS 0x1010) | DoIP-to-DoIP (§3.6); ACK **after** the ECU's DoIP entity acknowledged, its NACK passed on, NACK 0x06 if it cannot be reached |
 | Request longer than the ECU's `maxRequestLength` | NACK 0x04 too large |
 | ECU's ISO-TP channel still sending the previous request | NACK 0x08 |
 | Unknown TA | NACK 0x03 |
@@ -91,7 +131,7 @@ that last addressed this ECU. This includes several responses per request,
 e.g. NRC 0x78 *response pending* followed by the final answer. If that tester
 has disconnected, the response is dropped (`responsesDropped`).
 
-### 3.5 DoIP-to-DoIP routing (Ethernet ECUs)
+### 3.6 DoIP-to-DoIP routing (Ethernet ECUs)
 
 ECUs on the vehicle Ethernet that are DoIP entities themselves (the ADAS
 domain controller, 0x1010 at 192.168.10.20:13400) are reached through the
@@ -219,8 +259,13 @@ version 0x02 (ISO 13400-2:2012).
 
 ```
 ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
-                 [--port 13400] [--broadcast 255.255.255.255]
+                 [--port 13400] [--broadcast 255.255.255.255] \
+                 [--tls-cert gw.pem --tls-key gw.key [--tls-ca testers.pem] \
+                  [--tls-require-client-cert] [--tls-only] [--tls-port 3496]]
 ```
+
+TLS needs OpenSSL 3 at build time (`CCG_HAVE_TLS`). Without it, the process
+refuses the TLS options.
 
 - **Process loop:** one `poll()` loop over the TCP listener, the TCP data
   sockets, the UDP socket and the CAN sockets; `mainFunction()` runs every 1 ms.
@@ -236,7 +281,7 @@ ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
 - **DoIP client** (`diag::DoipClient`): reaches the ECUs on the vehicle
   Ethernet that are DoIP entities themselves (ADAS 0x1010 at
   192.168.10.20:13400, `--doip ADAS=IP:PORT`). It routes tester requests
-  (§3.5) and serves gateway functions. For the gateway's own requests it
+  (§3.6) and serves gateway functions. For the gateway's own requests it
   activates routing with source address 0x0F00 (in-vehicle test equipment).
   Each request is a diagnostic message followed by the ACK and the response.
   The client handles NACKs, NRC 0x78, alive checks and reconnects, and keeps
@@ -246,8 +291,10 @@ ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
 
 ## 8. Limitations / next steps
 
-- No TLS (ISO 13400-2:2019 port 3496) and no authentication / confirmation in
-  routing activation (codes 0x04, 0x05, 0x11 are never sent).
+- TLS: certificate revocation (CRL/OCSP) is not checked, and the tester's
+  certificate grants one level ("verified"), with no roles from certificate
+  attributes. There is no confirmation step in routing activation (0x05 and
+  0x11 are never sent).
 - One outstanding physical request per ECU; a second one is refused with NACK
   0x08 rather than queued.
 - DoIP-to-DoIP routing uses plain TCP towards the Ethernet ECUs (no TLS) and

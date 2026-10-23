@@ -57,15 +57,31 @@ struct DiagStatistics {
     std::uint64_t responsesDropped = 0;
     std::uint64_t isotpTxErrors = 0;
     std::uint64_t isotpRxErrors = 0;
+    std::uint64_t tlsConnections = 0;
+    std::uint64_t authenticatedConnections = 0;  // TLS with verified client certificate
     std::uint64_t ethernetRequests = 0;   // routed to DoIP entities on the vehicle Ethernet
     std::uint64_t ethernetResponses = 0;
 };
+
+// Security of a tester's TCP_DATA connection (ISO 13400-2:2019).
+struct ConnectionSecurity {
+    bool tls = false;                  // TLS socket (port 3496)
+    bool clientAuthenticated = false;  // client certificate verified against the tester CA
+    std::string peer;                  // subject CN of the client certificate
+};
+
+// Activation types (ISO 13400-2)
+inline constexpr std::uint8_t kActivationDefault = 0x00;
+inline constexpr std::uint8_t kActivationWwhObd = 0x01;
+inline constexpr std::uint8_t kActivationCentralSecurity = 0xE0;
 
 // Request to the gateway's own UDS server, as seen by a local service handler.
 struct LocalRequestContext {
     std::uint8_t session = 0x01;  // active diagnostic session of the gateway
     bool functional = false;      // functional (0xE400) or physical request
     TimePoint now{};
+    bool tls = false;             // request arrived on a TLS socket
+    bool authenticated = false;   // ... from a tester with a verified client certificate
 };
 
 // Additional UDS services of the gateway's own diagnostic server (e.g. key
@@ -149,7 +165,8 @@ public:
     // Starts the vehicle announcements.
     void start(TimePoint now);
 
-    void onTcpConnected(ConnectionId connection, TimePoint now);
+    // `security`: what the TLS layer established (plain TCP by default).
+    void onTcpConnected(ConnectionId connection, TimePoint now, const ConnectionSecurity& security = {});
     void onTcpData(ConnectionId connection, const std::uint8_t* data, std::size_t length,
                    TimePoint now);
     void onTcpClosed(ConnectionId connection, TimePoint now);  // closed by the peer
@@ -192,6 +209,7 @@ private:
         bool registered = false;
         std::uint16_t tester = 0;
         std::uint8_t version = doip::kVersion2012;
+        ConnectionSecurity security;
     };
 
     struct PendingActivation {
@@ -228,7 +246,8 @@ private:
                          std::vector<std::uint8_t> data, bool functional, TimePoint now);
     bool testerConnected(const Requester& req) const;
     std::optional<std::vector<std::uint8_t>> localService(const std::vector<std::uint8_t>& request,
-                                                          bool functional, TimePoint now);
+                                                          bool functional, TimePoint now,
+                                                          const ConnectionSecurity& security);
 
     void evaluatePendingActivation();
     void finishActivation(bool accept, doip::ActivationCode rejectCode);

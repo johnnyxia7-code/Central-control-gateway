@@ -256,15 +256,18 @@ int main() {
         syncResults.clear();
     };
 
-    // --- backend tester over DoIP
-    const diag::ConnectionId tester = 1;
+    // --- testers: a workshop tester on plain DoIP, the backend key server on
+    // DoIP over TLS with its client certificate (the TLS layer itself runs on
+    // the Linux process; here the gateway gets the established security).
+    diag::ConnectionId tester = 1;
+    std::uint16_t testerAddress = dg::kTester;
     auto send = [&](std::uint16_t type, const Bytes& payload) {
         const auto b = doip::encode(doip::kVersion2012, type, payload);
         diagGw.onTcpData(tester, b.data(), b.size(), g_now);
     };
     auto request = [&](const Bytes& uds) {
         std::cout << stamp() << "tester -> gateway [" << hex(uds) << "]\n";
-        send(pt::kDiagnosticMessage, doip::diagnosticMessagePayload(dg::kTester, dg::kGateway, uds));
+        send(pt::kDiagnosticMessage, doip::diagnosticMessagePayload(testerAddress, dg::kGateway, uds));
     };
     auto printResults = [&] {
         const auto& r = diagBus.lastUds;
@@ -287,10 +290,23 @@ int main() {
     for (int t = 0; t <= 4000; ++t) {
         g_now = g_t0 + std::chrono::milliseconds(t);
         switch (t) {
-            case 100:
-                log("backend: tester connects over DoIP, extended session");
+            case 80:
+                log("workshop tester on plain DoIP (0x0E81) tries to start a key campaign");
+                tester = 2;
+                testerAddress = 0x0E81;
                 diagGw.onTcpConnected(tester, g_now);
-                send(pt::kRoutingActivationRequest, {0x0E, 0x80, 0x00, 0, 0, 0, 0});
+                send(pt::kRoutingActivationRequest, {0x0E, 0x81, 0x00, 0, 0, 0, 0});
+                request({0x10, 0x03});
+                request({0x31, 0x01, 0xF2, 0x10});  // -> NRC 0x33 securityAccessDenied
+                diagGw.onTcpClosed(tester, g_now);
+                break;
+            case 100:
+                log("backend key server: DoIP over TLS (port 3496), client certificate 'backend-keyserver', "
+                    "central security activation 0xE0");
+                tester = 1;
+                testerAddress = dg::kTester;
+                diagGw.onTcpConnected(tester, g_now, diag::ConnectionSecurity{true, true, "backend-keyserver"});
+                send(pt::kRoutingActivationRequest, {0x0E, 0x80, diag::kActivationCentralSecurity, 0, 0, 0, 0});
                 request({0x10, 0x03});
                 break;
             case 150:

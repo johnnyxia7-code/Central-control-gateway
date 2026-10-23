@@ -52,6 +52,7 @@ enum class ActivationCode : std::uint8_t {
     SourceAddressInUse = 0x03,
     MissingAuthentication = 0x04,
     RejectedConfirmation = 0x05,
+    UnsupportedActivationTypeTls = 0x07,  // ISO 13400-2:2019: activation type needs a TLS socket
     UnsupportedActivationType = 0x06,
     Success = 0x10,
     ConfirmationRequired = 0x11,

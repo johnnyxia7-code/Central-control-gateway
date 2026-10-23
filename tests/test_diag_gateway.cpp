@@ -288,9 +288,14 @@ TEST_CASE("diag tcp: routing activation success and rejections") {
     CHECK(f.tx.closed.count(unknown));
 
     const auto security = f.connect();
-    f.activate(security, 0x0E81, 0xE0);
-    CHECK_EQ(f.activationCode(security), 0x06);
+    f.activate(security, 0x0E81, 0xE0);  // central security needs TLS (ISO 13400-2:2019)
+    CHECK_EQ(f.activationCode(security), 0x07);
     CHECK(f.tx.closed.count(security));
+
+    const auto oem = f.connect();
+    f.activate(oem, 0x0E81, 0x02);
+    CHECK_EQ(f.activationCode(oem), 0x06);
+    CHECK(f.tx.closed.count(oem));
 
     f.activate(ok, 0x0E99);  // other SA on an active socket
     CHECK_EQ(f.activationCode(ok), 0x02);

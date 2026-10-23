@@ -1,8 +1,15 @@
-// HPC diagnostic gateway process: DoIP (TCP/UDP 13400) <-> UDS on CAN (ISO-TP).
+// HPC diagnostic gateway process: DoIP (TCP/UDP 13400, TLS 3496) <-> UDS on CAN (ISO-TP).
 //
 //   ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2
 //                    [--port 13400] [--broadcast 255.255.255.255]
 //                    [--key-store /var/lib/ccg/keys [--demo-keys]] [--doip ADAS=192.168.10.20:13400]
+//                    [--tls-cert gw.pem --tls-key gw.key [--tls-ca testers.pem]
+//                     [--tls-require-client-cert] [--tls-only] [--tls-port 3496]]
+//
+// DoIP over TLS (ISO 13400-2:2019): testers connect to the TLS port; with
+// --tls-ca their client certificates are verified, and a verified tester may
+// use central security activation (0xE0) and the key management routines that
+// change keys. --tls-only refuses routing activation on the plain port (0x07).
 //
 // With --key-store the gateway's own diagnostic address also serves the SecOC
 // key management routines (SHE key update, activation, key status); the file
@@ -29,6 +36,9 @@
 #include "ccg/keym/key_management_service.hpp"
 #include "ccg/keym/key_master.hpp"
 #include "doip_sockets.hpp"
+#ifdef CCG_HAVE_TLS
+#include "doip_tls_server.hpp"
+#endif
 #include "doip_tcp_connector.hpp"
 #include "key_store.hpp"
 #include "socketcan_transport.hpp"
@@ -50,8 +60,24 @@ public:
         : can(channels), tcp_(tcp), udp_(udp) {}
 
     // A failed send is detected as a closed socket by the next read.
-    void sendTcp(diag::ConnectionId c, const std::vector<std::uint8_t>& d) override { tcp_.send(c, d); }
-    void closeTcp(diag::ConnectionId c) override { tcp_.close(c); }
+    void sendTcp(diag::ConnectionId c, const std::vector<std::uint8_t>& d) override {
+#ifdef CCG_HAVE_TLS
+        if (tls && tls->owns(c)) {
+            tls->send(c, d);
+            return;
+        }
+#endif
+        tcp_.send(c, d);
+    }
+    void closeTcp(diag::ConnectionId c) override {
+#ifdef CCG_HAVE_TLS
+        if (tls && tls->owns(c)) {
+            tls->close(c);
+            return;
+        }
+#endif
+        tcp_.close(c);
+    }
     void sendUdp(const diag::UdpPeer& p, const std::vector<std::uint8_t>& d) override { udp_.sendTo(p, d); }
     void broadcastUdp(const std::vector<std::uint8_t>& d) override { udp_.broadcast(d); }
     bool transmitCan(std::size_t ch, const can::CanFrame& f) override {
@@ -59,6 +85,9 @@ public:
     }
 
     std::vector<std::unique_ptr<platform::SocketCanTransport>> can;
+#ifdef CCG_HAVE_TLS
+    platform::DoipTlsServer* tls = nullptr;
+#endif
 
 private:
     platform::DoipTcpServer& tcp_;
@@ -71,6 +100,7 @@ void printStatistics(const diag::DiagStatistics& s) {
               << s.routingActivationsRejected << " | req=" << s.diagRequests
               << " ack=" << s.diagAcks << " nack=" << s.diagNacks
               << " func=" << s.functionalRequests << " local=" << s.localRequests
+              << " tls=" << s.tlsConnections << " certified=" << s.authenticatedConnections
               << " | ecuResp=" << s.ecuResponses << " dropped=" << s.responsesDropped
               << " tpTxErr=" << s.isotpTxErrors << " tpRxErr=" << s.isotpRxErrors << "\n";
 }
@@ -97,11 +127,23 @@ int main(int argc, char** argv) {
     std::string keyStore;
     bool demoKeys = false;
     std::map<std::string, std::string> doipEndpoints;
+    std::string tlsCert, tlsKey, tlsCa;
+    bool tlsRequireClientCert = false;
+    bool tlsOnly = false;
+    std::uint16_t tlsPort = 3496;
     try {
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--demo-keys") {
                 demoKeys = true;
+                continue;
+            }
+            if (arg == "--tls-require-client-cert") {
+                tlsRequireClientCert = true;
+                continue;
+            }
+            if (arg == "--tls-only") {
+                tlsOnly = true;
                 continue;
             }
             if (i + 1 >= argc) throw std::invalid_argument("missing value for " + arg);
@@ -116,6 +158,14 @@ int main(int argc, char** argv) {
                 broadcast = value;
             } else if (arg == "--key-store") {
                 keyStore = value;
+            } else if (arg == "--tls-cert") {
+                tlsCert = value;
+            } else if (arg == "--tls-key") {
+                tlsKey = value;
+            } else if (arg == "--tls-ca") {
+                tlsCa = value;
+            } else if (arg == "--tls-port") {
+                tlsPort = static_cast<std::uint16_t>(std::stoul(value));
             } else if (arg == "--doip") {
                 const auto eq = value.find('=');
                 if (eq == std::string::npos) throw std::invalid_argument("expected ECU=IP:PORT");
@@ -124,21 +174,49 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("unknown argument " + arg);
             }
         }
+        if (tlsCert.empty() != tlsKey.empty()) throw std::invalid_argument("--tls-cert and --tls-key go together");
+        if ((tlsOnly || tlsRequireClientCert || !tlsCa.empty()) && tlsCert.empty()) {
+            throw std::invalid_argument("TLS options need --tls-cert and --tls-key");
+        }
+#ifndef CCG_HAVE_TLS
+        if (!tlsCert.empty()) throw std::invalid_argument("built without OpenSSL: no DoIP over TLS");
+#endif
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\nusage: " << argv[0]
                   << " --can CHANNEL=IFACE ... [--port 13400] [--broadcast ADDR]"
-                     " [--key-store FILE [--demo-keys]] [--doip ECU=IP:PORT]\n";
+                     " [--key-store FILE [--demo-keys]] [--doip ECU=IP:PORT]"
+                     " [--tls-cert PEM --tls-key PEM [--tls-ca PEM] [--tls-require-client-cert] [--tls-only]"
+                     " [--tls-port 3496]]\n";
         return EXIT_FAILURE;
     }
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
+    std::signal(SIGPIPE, SIG_IGN);  // a tester resetting its TLS socket must not end the process
 
     try {
         auto config = config::makeVehicleDiagRouting();
+        config.entity.requireTls = tlsOnly;
+        config.entity.tlsPort = tlsPort;
         platform::DoipTcpServer tcp(port, config.entity.maxTcpConnections);
         platform::DoipUdpSocket udp(port, broadcast);
         LinuxDiagTransport transport(tcp, udp, config.channels.size());
+#ifdef CCG_HAVE_TLS
+        std::unique_ptr<platform::DoipTlsServer> tls;
+        if (!tlsCert.empty()) {
+            platform::TlsServerConfig tc;
+            tc.certificateFile = tlsCert;
+            tc.privateKeyFile = tlsKey;
+            tc.caFile = tlsCa;
+            tc.requireClientCertificate = tlsRequireClientCert;
+            tls = std::make_unique<platform::DoipTlsServer>(tlsPort, config.entity.maxTcpConnections, tc);
+            transport.tls = tls.get();
+            std::cout << "[diag] DoIP over TLS on TCP " << tlsPort
+                      << (tlsCa.empty() ? "" : tlsRequireClientCert ? ", client certificate required"
+                                                                    : ", client certificates verified")
+                      << (tlsOnly ? ", plain TCP refused for routing activation" : "") << "\n";
+        }
+#endif
 
         std::vector<std::pair<int, std::size_t>> canFds;
         for (std::size_t c = 0; c < config.channels.size(); ++c) {
@@ -194,7 +272,7 @@ int main(int argc, char** argv) {
             }
             keys->takePersistRequest();
             keyEventsSeen = keys->eventCount();
-            keyService = std::make_unique<keym::KeyManagementService>(*keys, saveKeys);
+            keyService = std::make_unique<keym::KeyManagementService>(*keys, saveKeys, true);
             gateway.addLocalService(*keyService);
             keyMaster = std::make_unique<keym::KeyMaster>(config::makeVehicleKeyMaster(), *keys, diagClients, random);
             keyMaster->setTrace([](const std::string& t) { std::cout << "[keym] " << t << "\n"; });
@@ -214,6 +292,13 @@ int main(int argc, char** argv) {
             const std::size_t doipBase = fds.size();
             const auto doipFds = doipConnector.pollFds();
             fds.insert(fds.end(), doipFds.begin(), doipFds.end());
+            const std::size_t tlsBase = fds.size();
+#ifdef CCG_HAVE_TLS
+            if (tls) {
+                const auto tlsFds = tls->pollFds();
+                fds.insert(fds.end(), tlsFds.begin(), tlsFds.end());
+            }
+#endif
 
             now = diag::Clock::now();
             const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(nextTick - now).count();
@@ -246,8 +331,15 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            doipConnector.process(std::vector<pollfd>(fds.begin() + static_cast<std::ptrdiff_t>(doipBase), fds.end()),
+            doipConnector.process(std::vector<pollfd>(fds.begin() + static_cast<std::ptrdiff_t>(doipBase),
+                                                      fds.begin() + static_cast<std::ptrdiff_t>(tlsBase)),
                                   now);
+#ifdef CCG_HAVE_TLS
+            if (tls) {
+                tls->process(std::vector<pollfd>(fds.begin() + static_cast<std::ptrdiff_t>(tlsBase), fds.end()), gateway,
+                             now);
+            }
+#endif
             if (now >= nextTick) {
                 gateway.mainFunction(now);
                 doipClient.mainFunction(now);

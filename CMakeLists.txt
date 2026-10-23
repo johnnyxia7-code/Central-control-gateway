@@ -119,6 +119,10 @@ add_executable(ccg_key_tool app/key_tool_main.cpp)
 target_link_libraries(ccg_key_tool PRIVATE ccg_keym)
 ccg_warnings(ccg_key_tool)
 
+# OpenSSL 3 (optional): DoIP over TLS in the Linux diagnostic gateway, and a
+# test-only cross-check of the software AES-CMAC.
+find_package(OpenSSL 3 QUIET)
+
 # --- Linux gateway process (SocketCAN + SOME/IP over UDP) --------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_library(ccg_platform_linux
@@ -133,6 +137,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   )
   target_include_directories(ccg_platform_linux PUBLIC platform/linux)
   target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s ccg_diag ccg_secoc ccg_keym)
+  if(OpenSSL_FOUND)
+    target_sources(ccg_platform_linux PRIVATE platform/linux/doip_tls_server.cpp)
+    target_link_libraries(ccg_platform_linux PUBLIC OpenSSL::SSL)
+    target_compile_definitions(ccg_platform_linux PUBLIC CCG_HAVE_TLS=1)
+  endif()
   ccg_warnings(ccg_platform_linux)
 
   add_executable(ccg_s2s_gateway app/s2s_gateway_main.cpp)
@@ -171,6 +180,7 @@ if(CCG_BUILD_TESTS)
     tests/test_key_master.cpp
     tests/test_doip_client.cpp
     tests/test_doip_routing.cpp
+    tests/test_doip_tls.cpp
   )
   target_link_libraries(ccg_tests PRIVATE ccg_vehicle_matrix ccg_sim ccg_secoc)
   if(TARGET ccg_platform_linux)
@@ -179,10 +189,12 @@ if(CCG_BUILD_TESTS)
                                      tests/test_key_store.cpp)
     target_link_libraries(ccg_tests PRIVATE ccg_platform_linux)
   endif()
-  find_package(OpenSSL 3 QUIET)
   if(OpenSSL_FOUND)  # test-only cross-check of the software AES-CMAC
     target_sources(ccg_tests PRIVATE tests/test_cmac_openssl.cpp)
     target_link_libraries(ccg_tests PRIVATE OpenSSL::Crypto)
+    if(TARGET ccg_platform_linux)
+      target_sources(ccg_tests PRIVATE tests/test_doip_tls_linux.cpp)
+    endif()
   endif()
   ccg_warnings(ccg_tests)
   add_test(NAME ccg_tests COMMAND ccg_tests)

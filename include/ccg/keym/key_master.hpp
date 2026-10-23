@@ -49,6 +49,9 @@ struct KeyGroup {
 struct KeyMasterConfig {
     std::vector<KeyGroup> groups;
     she::Flags flags;  // protection flags of distributed keys (KEY_USAGE must be set)
+    // Starting a campaign over UDS needs a tester with a verified TLS client
+    // certificate (DoIP over TLS); others get NRC 0x33 (securityAccessDenied).
+    bool requireAuthenticatedTester = true;
 };
 
 // Problems with the configuration against the gateway's key slots (empty = valid).
@@ -111,7 +114,7 @@ public:
     void setTrace(std::function<void(const std::string&)> trace) { trace_ = std::move(trace); }
 
     // UDS on the gateway's address:
-    //   31 01 F2 10 [group ..]  start campaign (extended session) -> 71 01 F2 10 00
+    //   31 01 F2 10 [group ..]  start campaign (extended session, authenticated tester) -> 71 01 F2 10 00
     //   31 03 F2 10             results -> 71 03 F2 10 <state> <n> {result, generation (4), ECU (2), SHE error}
     std::optional<std::vector<std::uint8_t>> handle(const std::vector<std::uint8_t>& request,
                                                     const diag::LocalRequestContext& context) override;

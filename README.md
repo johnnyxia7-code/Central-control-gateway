@@ -32,6 +32,7 @@ Design: [docs/ETH_GATEWAY_DESIGN.md](docs/ETH_GATEWAY_DESIGN.md)
 DoIP edge node for the external tester, routing UDS requests to the ECUs on CAN and to the DoIP ECUs on the vehicle Ethernet.
 
 - **DoIP (ISO 13400-2)**: vehicle identification and announcements, entity status, power mode (UDP); routing activation with alive-check socket handling, inactivity timers, header NACKs, diagnostic message ACK/NACK (TCP)
+- **DoIP over TLS** (ISO 13400-2:2019, port 3496, OpenSSL): TLS 1.2 ECDHE/AES-GCM or TLS 1.3, optional mutual TLS against a tester CA; plain TCP can be refused (activation code 0x07); a verified client certificate unlocks central security activation (0xE0) and the key routines that change keys (otherwise NRC 0x33)
 - **ISO-TP (ISO 15765-2)** on CAN and CAN FD: single/first/consecutive/flow-control frames, escape lengths > 4095 bytes, block size and STmin, N_As/N_Bs/N_Cr timeouts, FC.WAIT, overflow
 - **Routing** by logical address to the ECU's CAN channel and IDs; functional requests (0xE400) on 0x7DF on every bus; responses including NRC 0x78 *response pending* go back to the requesting tester
 - Local UDS server for the gateway's own address (session control, tester present, VIN / serial number), extensible by further services
@@ -77,7 +78,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure    # or ./build/ccg_tests [filter]
 ```
 
-Requirements: C++17 compiler (GCC ≥ 9 / Clang ≥ 10), CMake ≥ 3.16. No third-party dependencies.
+Requirements: C++17 compiler (GCC ≥ 9 / Clang ≥ 10), CMake ≥ 3.16. Optional: OpenSSL 3 for DoIP over TLS (and a test cross-check of the AES-CMAC); everything else has no third-party dependencies.
 
 ## Run
 
@@ -103,7 +104,8 @@ sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
 
 ./build/ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
     --key-store keys.dat --demo-keys \
-    --doip ADAS=192.168.10.20:13400                 # DoIP on TCP/UDP 13400, key routines, key master
+    --doip ADAS=192.168.10.20:13400 \
+    --tls-cert gw.pem --tls-key gw.key --tls-ca testers.pem   # DoIP 13400 + TLS 3496, key routines, key master
 
 ./build/ccg_key_tool --uid 000000000000004343470000000001 --slot 6 --auth-slot 1 \
     --auth-key <MASTER_ECU_KEY> --key <new key> --counter 2      # backend: M1..M3, expected M4/M5

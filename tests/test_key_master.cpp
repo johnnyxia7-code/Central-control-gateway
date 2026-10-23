@@ -380,7 +380,8 @@ TEST_CASE("key master: the generation follows the newest member key") {
 
 TEST_CASE("key master: campaign over UDS on the gateway address") {
     Vehicle v;
-    v.gw.onTcpConnected(1, v.now);
+    // Backend key server over DoIP/TLS with a verified client certificate.
+    v.gw.onTcpConnected(1, v.now, diag::ConnectionSecurity{true, true, "backend-keyserver"});
     auto request = [&](const Bytes& uds) -> Bytes {
         v.bus.tcp.clear();
         auto b = doip::encode(doip::kVersion2012, doip::payload::kDiagnosticMessage,
@@ -467,4 +468,28 @@ TEST_CASE("key master: an ADAS group renewal uses one DoIP connection and routin
     CHECK_EQ(v.doip.statistics().activations, 1u);
     CHECK_EQ(v.doip.statistics().responses, 7u);
     CHECK_EQ(v.doip.statistics().nacks, 0u);
+}
+
+TEST_CASE("key master: starting a campaign needs a certificate-authenticated tester") {
+    for (const auto& security : {diag::ConnectionSecurity{}, diag::ConnectionSecurity{true, false, ""}}) {
+        Vehicle v;
+        v.gw.onTcpConnected(1, v.now, security);
+        auto send = [&](std::uint16_t type, const Bytes& payload) {
+            const auto b = doip::encode(doip::kVersion2012, type, payload);
+            v.gw.onTcpData(1, b.data(), b.size(), v.now);
+        };
+        send(doip::payload::kRoutingActivationRequest, {0x0E, 0x80, 0x00, 0, 0, 0, 0});
+        send(doip::payload::kDiagnosticMessage, doip::diagnosticMessagePayload(dg::kTester, dg::kGateway, {0x10, 0x03}));
+        v.bus.tcp.clear();
+        send(doip::payload::kDiagnosticMessage,
+             doip::diagnosticMessagePayload(dg::kTester, dg::kGateway, {0x31, 0x01, 0xF2, 0x10}));
+        Bytes rsp;
+        for (const auto& m : v.bus.tcp) {
+            if (doip::decodeHeader(m.data()).type == doip::payload::kDiagnosticMessage) {
+                rsp.assign(m.begin() + doip::kHeaderSize + 4, m.end());
+            }
+        }
+        CHECK(rsp == (Bytes{0x7F, 0x31, 0x33}));
+        CHECK(v.master.state() == keym::KeyMaster::State::Idle);
+    }
 }

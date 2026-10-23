@@ -413,6 +413,7 @@ std::optional<std::vector<std::uint8_t>> KeyMaster::handle(const std::vector<std
     const std::uint8_t sub = request[1] & 0x7F;
     if (sub == 0x01) {
         if (context.session != 0x03) return nrc(0x7F);
+        if (config_.requireAuthenticatedTester && !context.authenticated) return nrc(0x33);  // securityAccessDenied
         if (state_ == State::Running || !keys_.deriveEcuMasterKey(she::Uid{})) {
             return nrc(0x22);  // conditionsNotCorrect: campaign running / no key master secret
         }

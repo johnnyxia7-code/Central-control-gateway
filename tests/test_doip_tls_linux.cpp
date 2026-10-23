@@ -1,0 +1,343 @@
+// DoIP over TLS on real sockets: platform::DoipTlsServer + DiagGateway against
+// an OpenSSL client on loopback. Certificates are generated per test run.
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <csignal>
+#include <cstdio>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "ccg/diag/diag_gateway.hpp"
+#include "ccg/doip/doip_message.hpp"
+#include "doip_tls_server.hpp"
+#include "test_framework.hpp"
+#include "vehicle_diag_routing.hpp"
+
+using namespace ccg;
+using Bytes = std::vector<std::uint8_t>;
+namespace pt = doip::payload;
+namespace dg = config::dg;
+
+namespace {
+
+// --- test PKI ------------------------------------------------------------------
+
+struct Credential {
+    EVP_PKEY* key = nullptr;
+    X509* cert = nullptr;
+    std::string certFile;
+    std::string keyFile;
+};
+
+std::string tempFile(const std::string& name) {
+    return "/tmp/ccg_tls_" + std::to_string(::getpid()) + "_" + name + ".pem";
+}
+
+void addExtension(X509* cert, X509* issuer, int nid, const char* value) {
+    X509V3_CTX ctx;
+    X509V3_set_ctx_nodb(&ctx);
+    X509V3_set_ctx(&ctx, issuer, cert, nullptr, nullptr, 0);
+    X509_EXTENSION* ext = X509V3_EXT_conf_nid(nullptr, &ctx, nid, value);
+    X509_add_ext(cert, ext, -1);
+    X509_EXTENSION_free(ext);
+}
+
+// ECDSA P-256 certificate, signed by `issuer` (self-signed CA if null).
+Credential makeCredential(const std::string& name, const char* cn, const Credential* issuer, bool ca, long serial) {
+    Credential c;
+    c.key = EVP_EC_gen("P-256");
+    c.cert = X509_new();
+    X509_set_version(c.cert, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(c.cert), serial);
+    X509_gmtime_adj(X509_getm_notBefore(c.cert), -3600);
+    X509_gmtime_adj(X509_getm_notAfter(c.cert), 86400);
+    X509_set_pubkey(c.cert, c.key);
+    X509_NAME* subject = X509_get_subject_name(c.cert);
+    X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>(cn), -1, -1, 0);
+    X509_set_issuer_name(c.cert, issuer ? X509_get_subject_name(issuer->cert) : subject);
+    X509* signer = issuer ? issuer->cert : c.cert;
+    addExtension(c.cert, signer, NID_basic_constraints, ca ? "critical,CA:TRUE" : "critical,CA:FALSE");
+    addExtension(c.cert, signer, NID_key_usage, ca ? "critical,keyCertSign,cRLSign" : "critical,digitalSignature");
+    if (!ca) addExtension(c.cert, signer, NID_ext_key_usage, "serverAuth,clientAuth");
+    X509_sign(c.cert, issuer ? issuer->key : c.key, EVP_sha256());
+
+    c.certFile = tempFile(name + "_cert");
+    c.keyFile = tempFile(name + "_key");
+    FILE* f = std::fopen(c.certFile.c_str(), "w");
+    PEM_write_X509(f, c.cert);
+    std::fclose(f);
+    f = std::fopen(c.keyFile.c_str(), "w");
+    PEM_write_PrivateKey(f, c.key, nullptr, nullptr, 0, nullptr, nullptr);
+    std::fclose(f);
+    return c;
+}
+
+struct Pki {
+    Credential ca = makeCredential("ca", "CCG Tester CA", nullptr, true, 1);
+    Credential gateway = makeCredential("gw", "ccg-gateway", &ca, false, 2);
+    Credential tester = makeCredential("tester", "backend-keyserver", &ca, false, 3);
+    Credential rogueCa = makeCredential("rogue_ca", "Rogue CA", nullptr, true, 4);
+    Credential rogue = makeCredential("rogue", "rogue-tester", &rogueCa, false, 5);
+
+    ~Pki() {
+        for (auto* c : {&ca, &gateway, &tester, &rogueCa, &rogue}) {
+            std::remove(c->certFile.c_str());
+            std::remove(c->keyFile.c_str());
+            X509_free(c->cert);
+            EVP_PKEY_free(c->key);
+        }
+    }
+};
+
+// --- gateway with TLS server ----------------------------------------------------
+
+struct TlsTransport final : diag::IDiagTransport {
+    platform::DoipTlsServer* tls = nullptr;
+    void sendTcp(diag::ConnectionId c, const Bytes& d) override { tls->send(c, d); }
+    void closeTcp(diag::ConnectionId c) override { tls->close(c); }
+    void sendUdp(const diag::UdpPeer&, const Bytes&) override {}
+    void broadcastUdp(const Bytes&) override {}
+    bool transmitCan(std::size_t, const can::CanFrame&) override { return true; }
+};
+
+struct Bench {
+    TlsTransport transport;
+    platform::DoipTlsServer server;
+    diag::DiagGateway gw;
+
+    Bench(std::uint16_t port, const platform::TlsServerConfig& cfg)
+        : server(port, 2, cfg), gw(config::makeVehicleDiagRouting(), transport) {
+        transport.tls = &server;
+        gw.start(diag::Clock::now());
+    }
+    void step() {
+        auto fds = server.pollFds();
+        ::poll(fds.data(), fds.size(), 2);
+        const auto now = diag::Clock::now();
+        server.process(fds, gw, now);
+        gw.mainFunction(now);
+    }
+};
+
+// --- OpenSSL client (the tester) ------------------------------------------------
+
+struct Client {
+    SSL_CTX* ctx = nullptr;
+    SSL* ssl = nullptr;
+    int fd = -1;
+    doip::StreamReassembler stream{4096};
+    std::vector<doip::StreamReassembler::Item> messages;
+
+    Client(std::uint16_t port, const Pki& pki, const Credential* identity) {
+        ctx = SSL_CTX_new(TLS_client_method());
+        SSL_CTX_load_verify_locations(ctx, pki.ca.certFile.c_str(), nullptr);
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);  // the tester checks the gateway too
+        if (identity) {
+            SSL_CTX_use_certificate_file(ctx, identity->certFile.c_str(), SSL_FILETYPE_PEM);
+            SSL_CTX_use_PrivateKey_file(ctx, identity->keyFile.c_str(), SSL_FILETYPE_PEM);
+        }
+        fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr);
+        ssl = SSL_new(ctx);
+        SSL_set_fd(ssl, fd);
+        SSL_set1_host(ssl, "ccg-gateway");
+        SSL_set_connect_state(ssl);
+    }
+    ~Client() {
+        SSL_free(ssl);
+        ::close(fd);
+        SSL_CTX_free(ctx);
+    }
+
+    // true: done, false: failed, nullopt: in progress
+    std::optional<bool> handshakeStep() {
+        const int r = SSL_do_handshake(ssl);
+        if (r == 1) return true;
+        const int e = SSL_get_error(ssl, r);
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) return std::nullopt;
+        ERR_clear_error();
+        return false;
+    }
+    void send(std::uint16_t type, const Bytes& payload) {
+        const auto b = doip::encode(doip::kVersion2012, type, payload);
+        SSL_write(ssl, b.data(), static_cast<int>(b.size()));
+    }
+    // Reads what arrived; false once the gateway closed the connection.
+    bool poll() {
+        std::uint8_t buf[2048];
+        for (;;) {
+            const int n = SSL_read(ssl, buf, sizeof buf);
+            if (n > 0) {
+                stream.feed(buf, static_cast<std::size_t>(n));
+                while (auto m = stream.next()) messages.push_back(std::move(*m));
+                continue;
+            }
+            const int e = SSL_get_error(ssl, n);
+            ERR_clear_error();
+            return e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE;
+        }
+    }
+    std::optional<Bytes> last(std::uint16_t type) const {
+        for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+            if (it->header.type == type) return it->payload;
+        }
+        return std::nullopt;
+    }
+};
+
+const Bytes kCentralSecurity = {0x0E, 0x80, diag::kActivationCentralSecurity, 0, 0, 0, 0};
+const Bytes kDefaultActivation = {0x0E, 0x80, diag::kActivationDefault, 0, 0, 0, 0};
+
+// Drives server and client until the client's handshake finishes.
+std::optional<bool> handshake(Bench& bench, Client& client) {
+    for (int i = 0; i < 500; ++i) {
+        bench.step();
+        const auto r = client.handshakeStep();
+        if (r) {
+            for (int j = 0; j < 20; ++j) bench.step();  // let the server see the end of the handshake
+            return r;
+        }
+    }
+    return std::nullopt;
+}
+
+// Sends and waits for a message of `type` (or the connection's end).
+std::optional<Bytes> exchange(Bench& bench, Client& client, std::uint16_t type, const Bytes& payload,
+                              std::uint16_t answer) {
+    client.messages.clear();
+    client.send(type, payload);
+    for (int i = 0; i < 500; ++i) {
+        bench.step();
+        const bool open = client.poll();
+        if (auto m = client.last(answer)) return m;
+        if (!open) return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+// The server refuses the client. With TLS 1.3 the client may finish its side of
+// the handshake first and only sees the server's alert when it reads.
+bool refused(Bench& bench, Client& client) {
+    const auto r = handshake(bench, client);
+    if (r == std::optional<bool>(false)) return true;
+    if (!r) return false;
+    return !exchange(bench, client, pt::kRoutingActivationRequest, kDefaultActivation, pt::kRoutingActivationResponse);
+}
+
+platform::TlsServerConfig serverConfig(const Pki& pki, bool requireClientCert) {
+    platform::TlsServerConfig c;
+    c.certificateFile = pki.gateway.certFile;
+    c.privateKeyFile = pki.gateway.keyFile;
+    c.caFile = pki.ca.certFile;
+    c.requireClientCertificate = requireClientCert;
+    return c;
+}
+
+}  // namespace
+
+TEST_CASE("doip tls linux: mutual TLS, central security activation and UDS") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    Bench bench(31496, serverConfig(pki, false));
+    Client client(31496, pki, &pki.tester);
+    REQUIRE(handshake(bench, client) == std::optional<bool>(true));
+    CHECK_EQ(bench.gw.statistics().tlsConnections, 1u);
+    CHECK_EQ(bench.gw.statistics().authenticatedConnections, 1u);
+
+    const auto ra = exchange(bench, client, pt::kRoutingActivationRequest, kCentralSecurity, pt::kRoutingActivationResponse);
+    REQUIRE(ra.has_value());
+    CHECK_EQ(ra->at(4), 0x10);
+    const auto rsp = exchange(bench, client, pt::kDiagnosticMessage,
+                              doip::diagnosticMessagePayload(dg::kTester, dg::kGateway, {0x22, 0xF1, 0x90}),
+                              pt::kDiagnosticMessage);
+    REQUIRE(rsp.has_value());
+    CHECK_EQ(rsp->at(4), 0x62);
+    CHECK_EQ(rsp->size(), 4u + 3u + 17u);  // SA TA | 62 F1 90 | VIN
+}
+
+TEST_CASE("doip tls linux: TLS without client certificate is anonymous") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    Bench bench(31497, serverConfig(pki, false));
+    {
+        Client client(31497, pki, nullptr);
+        REQUIRE(handshake(bench, client) == std::optional<bool>(true));
+        const auto ra = exchange(bench, client, pt::kRoutingActivationRequest, kCentralSecurity,
+                                 pt::kRoutingActivationResponse);
+        REQUIRE(ra.has_value());
+        CHECK_EQ(ra->at(4), 0x04);  // missing authentication
+    }
+    Client client(31497, pki, nullptr);
+    REQUIRE(handshake(bench, client) == std::optional<bool>(true));
+    const auto ra = exchange(bench, client, pt::kRoutingActivationRequest, kDefaultActivation,
+                             pt::kRoutingActivationResponse);
+    REQUIRE(ra.has_value());
+    CHECK_EQ(ra->at(4), 0x10);
+    CHECK_EQ(bench.gw.statistics().authenticatedConnections, 0u);
+}
+
+TEST_CASE("doip tls linux: untrusted or missing client certificates fail the handshake") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    {
+        Bench bench(31498, serverConfig(pki, false));
+        Client client(31498, pki, &pki.rogue);  // certificate from another CA
+        CHECK(refused(bench, client));
+        CHECK_EQ(bench.server.handshakeFailures(), 1u);
+        CHECK_EQ(bench.gw.statistics().tcpConnectionsAccepted, 0u);  // the gateway never saw it
+    }
+    {
+        Bench bench(31499, serverConfig(pki, true));
+        Client client(31499, pki, nullptr);  // certificate required
+        CHECK(refused(bench, client));
+        CHECK_EQ(bench.server.handshakeFailures(), 1u);
+        CHECK_EQ(bench.gw.statistics().tcpConnectionsAccepted, 0u);
+    }
+}
+
+TEST_CASE("doip tls linux: plain DoIP on the TLS port is dropped") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    Bench bench(31500, serverConfig(pki, false));
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(31500);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0);
+    const auto ra = doip::encode(doip::kVersion2012, pt::kRoutingActivationRequest, kDefaultActivation);
+    ::send(fd, ra.data(), ra.size(), MSG_NOSIGNAL);
+    for (int i = 0; i < 50; ++i) bench.step();
+    CHECK_EQ(bench.server.handshakeFailures(), 1u);
+    CHECK_EQ(bench.server.connections(), 0u);
+    CHECK_EQ(bench.gw.statistics().tcpConnectionsAccepted, 0u);
+    ::close(fd);
+}
+
+TEST_CASE("doip tls linux: bad server credentials are reported at start-up") {
+    Pki pki;
+    auto cfg = serverConfig(pki, false);
+    cfg.privateKeyFile = pki.tester.keyFile;  // does not match the certificate
+    bool threw = false;
+    try {
+        platform::DoipTlsServer server(31501, 2, cfg);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}

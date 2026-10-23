@@ -71,6 +71,7 @@ std::optional<std::vector<std::uint8_t>> KeyManagementService::routineControl(
         }
         case uds::kRidActivateKeys:
         case uds::kRidDiscardKeys: {
+            if (requireAuthenticated_ && !context.authenticated) return nrc(kSidRoutine, 0x33);
             const std::vector<std::uint8_t> slots(request.begin() + 4, request.end());
             if (!keys_.hasPending(slots)) return nrc(kSidRoutine, 0x24);  // requestSequenceError
             const std::size_t n = rid == uds::kRidActivateKeys ? keys_.activatePending(context.now, slots)

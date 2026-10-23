@@ -29,6 +29,9 @@ struct DoipEntityConfig {
     Milliseconds aliveCheckTimeout{500};          // T_TCP_Alive_Check
     std::uint8_t announceCount = 3;               // A_DoIP_Announce_Num
     Milliseconds announceInterval{500};           // A_DoIP_Announce_Interval
+    // ISO 13400-2:2019 DoIP over TLS (TCP port 3496)
+    bool requireTls = false;  // routing activation on a plain TCP socket is answered 0x07
+    std::uint16_t tlsPort = 3496;
 };
 
 struct DiagCanChannel {

@@ -24,6 +24,9 @@
 // A changed key store is persisted before the response is sent: if that fails
 // the answer is NRC 0x72 (generalProgrammingFailure) and the backend retries
 // with the next counter value.
+// With `requireAuthenticatedTester` (the gateway), activating and discarding
+// keys - which the SHE protocol does not authenticate - needs a tester with a
+// verified TLS client certificate; others get NRC 0x33 (securityAccessDenied).
 namespace ccg::keym {
 
 namespace uds {
@@ -44,8 +47,9 @@ inline constexpr std::uint8_t kStatusMacKey = 0x10;
 class KeyManagementService final : public diag::ILocalServiceHandler {
 public:
     // `persist` writes the key store to non-volatile memory (true = stored).
-    explicit KeyManagementService(KeyManager& keys, std::function<bool()> persist = {})
-        : keys_(keys), persist_(std::move(persist)) {}
+    explicit KeyManagementService(KeyManager& keys, std::function<bool()> persist = {},
+                                  bool requireAuthenticatedTester = false)
+        : keys_(keys), persist_(std::move(persist)), requireAuthenticated_(requireAuthenticatedTester) {}
 
     std::optional<std::vector<std::uint8_t>> handle(const std::vector<std::uint8_t>& request,
                                                     const diag::LocalRequestContext& context) override;
@@ -59,6 +63,7 @@ private:
 
     KeyManager& keys_;
     std::function<bool()> persist_;
+    bool requireAuthenticated_;
 };
 
 }  // namespace ccg::keym

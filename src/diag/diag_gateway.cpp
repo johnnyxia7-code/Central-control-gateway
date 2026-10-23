@@ -229,11 +229,15 @@ void DiagGateway::onUdpDatagram(const UdpPeer& peer, const std::uint8_t* data, s
 // TCP: connections, routing activation, diagnostic messages
 // ---------------------------------------------------------------------------
 
-void DiagGateway::onTcpConnected(ConnectionId id, TimePoint now) {
+void DiagGateway::onTcpConnected(ConnectionId id, TimePoint now, const ConnectionSecurity& security) {
     Connection c(maxTcpPayload_);
     c.connectedAt = now;
     c.lastActivity = now;
     c.version = config_.entity.protocolVersion;
+    c.security = security;
+    c.security.clientAuthenticated = security.tls && security.clientAuthenticated;
+    if (c.security.tls) ++stats_.tlsConnections;
+    if (c.security.clientAuthenticated) ++stats_.authenticatedConnections;
     connections_.erase(id);
     connections_.emplace(id, std::move(c));
     ++stats_.tcpConnectionsAccepted;
@@ -348,8 +352,17 @@ void DiagGateway::handleRoutingActivation(ConnectionId id, const std::vector<std
     };
 
     if (!isTester(tester)) return reject(ActivationCode::UnknownSourceAddress);
-    if (activationType != 0x00 && activationType != 0x01) {
-        return reject(ActivationCode::UnsupportedActivationType);  // 0xE0 central security etc.
+    // ISO 13400-2:2019 TLS: a plain socket is refused when TLS is required, and
+    // central security needs a TLS socket with an authenticated tester.
+    if (activationType != kActivationDefault && activationType != kActivationWwhObd &&
+        activationType != kActivationCentralSecurity) {
+        return reject(ActivationCode::UnsupportedActivationType);
+    }
+    if (!c.security.tls && (config_.entity.requireTls || activationType == kActivationCentralSecurity)) {
+        return reject(ActivationCode::UnsupportedActivationTypeTls);
+    }
+    if (activationType == kActivationCentralSecurity && !c.security.clientAuthenticated) {
+        return reject(ActivationCode::MissingAuthentication);
     }
     if (c.registered) {
         if (c.tester != tester) return reject(ActivationCode::SourceAddressMismatch);
@@ -445,7 +458,7 @@ void DiagGateway::handleDiagnosticMessage(ConnectionId id, const std::vector<std
     if (target == config_.entity.logicalAddress) {
         ++stats_.localRequests;
         sendDiagAck(req, target);
-        if (auto response = localService(data, false, now)) {
+        if (auto response = localService(data, false, now, c.security)) {
             sendDiagMessage(req, target, *response);
         }
         return;
@@ -507,14 +520,16 @@ void DiagGateway::handleFunctionalRequest(const Requester& req,
             routeToEthernet(req, ecu.logicalAddress, config_.entity.functionalAddress, data, true, now);
         }
     }
-    if (auto response = localService(data, true, now)) {
+    const auto conn = connections_.find(req.connection);
+    const ConnectionSecurity security = conn != connections_.end() ? conn->second.security : ConnectionSecurity{};
+    if (auto response = localService(data, true, now, security)) {
         sendDiagMessage(req, config_.entity.logicalAddress, *response);
     }
 }
 
 // Minimal UDS server of the gateway itself (its own logical address).
 std::optional<std::vector<std::uint8_t>> DiagGateway::localService(
-    const std::vector<std::uint8_t>& request, bool functional, TimePoint now) {
+    const std::vector<std::uint8_t>& request, bool functional, TimePoint now, const ConnectionSecurity& security) {
     const std::uint8_t sid = request[0];
     localSessionActivity_ = now;
     auto negative = [&](std::uint8_t nrc) -> std::optional<std::vector<std::uint8_t>> {
@@ -526,7 +541,8 @@ std::optional<std::vector<std::uint8_t>> DiagGateway::localService(
     };
 
     for (auto* handler : localHandlers_) {
-        auto response = handler->handle(request, LocalRequestContext{localSession_, functional, now});
+        auto response = handler->handle(
+            request, LocalRequestContext{localSession_, functional, now, security.tls, security.clientAuthenticated});
         if (!response) continue;
         if (response->empty()) return std::nullopt;
         if (response->size() == 3 && (*response)[0] == 0x7F) return negative((*response)[2]);
