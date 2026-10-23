@@ -7,7 +7,7 @@
 // address (--net-address, for an interface no network manager owns) and the
 // SOME/IP-SD multicast route that Android lacks (platform/linux/network_setup.hpp).
 //
-//   ccg_someipd [--app routingmanagerd] [--net-if IFACE [--net-address 10.0.0.20/24]
+//   ccg_someipd [--app routingmanagerd] [--net-if IFACE [--net-address 192.168.10.30/24]
 //               [--sd-prefix 224.0.0.0/4] [--sd-table 254] [--no-sd-route]]
 #include <pthread.h>
 #include <signal.h>

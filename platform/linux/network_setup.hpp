@@ -25,7 +25,7 @@ public:
 
     explicit NetworkSetup(std::string interfaceName);
 
-    // "10.0.0.20/24": bring the link up and add (or keep) this address.
+    // "192.168.10.30/24": bring the link up and add (or keep) this address.
     void setAddress(const std::string& cidr);
     // Multicast prefix routed to the interface, e.g. 224.0.0.0/4 or 224.244.224.245.
     void setMulticastRoute(const std::string& prefix = "224.0.0.0/4",

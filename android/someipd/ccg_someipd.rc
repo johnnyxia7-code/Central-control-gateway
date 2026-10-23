@@ -9,7 +9,7 @@ on early-init
     # vsomeip base path (VSOMEIP_BASE_PATH): local sockets and lock files.
     mkdir /dev/socket/someip 0770 system system
 
-service vendor.ccg.someipd /vendor/bin/ccg_someipd --app routingmanagerd --net-if eth1 --net-address 10.0.0.20/24
+service vendor.ccg.someipd /vendor/bin/ccg_someipd --app routingmanagerd --net-if eth1 --net-address 192.168.10.30/24
     class early_hal
     user system
     group system inet

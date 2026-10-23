@@ -17,4 +17,4 @@ PRODUCT_PACKAGES += \
 
 PRODUCT_PACKAGES_DEBUG += \
     ccg_ivi_vehicle_client \
-    ccg_s2s_tests
+    ccg_s2s_ivi_tests

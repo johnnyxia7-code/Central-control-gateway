@@ -1,5 +1,5 @@
 {
-    "unicast": "10.0.0.20",
+    "unicast": "192.168.10.30",
     "netmask": "255.255.255.0",
     "diagnosis": "0x20",
     "logging": {

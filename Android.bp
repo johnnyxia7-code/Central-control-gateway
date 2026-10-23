@@ -96,25 +96,36 @@ cc_binary {
     ],
 }
 
-// Unit tests of the gateway core and the IVI client (host and target):
-//   atest ccg_s2s_tests   or   m ccg_s2s_tests && out/host/linux-x86/nativetest64/...
+// Unit tests of the S2S core and the IVI client (host and target):
+//   atest ccg_s2s_ivi_tests
+// (The Ethernet / diagnostic / SecOC parts of the HPC are not built for Android.)
 cc_test {
-    name: "ccg_s2s_tests",
+    name: "ccg_s2s_ivi_tests",
     defaults: ["ccg_defaults"],
     host_supported: true,
     gtest: false,
     srcs: [
-        "src/**/*.cpp",
+        "src/can/*.cpp",
+        "src/e2e/*.cpp",
+        "src/s2s/*.cpp",
         "config/vehicle_s2s_matrix.cpp",
         "platform/linux/someip_udp_binding.cpp",
         "platform/linux/network_setup.cpp",
-        "tests/*.cpp",
+        "tests/test_main.cpp",
+        "tests/test_signal_codec.cpp",
+        "tests/test_e2e.cpp",
+        "tests/test_someip.cpp",
+        "tests/test_config_validator.cpp",
+        "tests/test_s2s_gateway.cpp",
+        "tests/test_someip_udp_binding.cpp",
+        "tests/test_network_setup.cpp",
+        "tests/test_ivi_client.cpp",
+        "tests/test_ivi_vhal_bridge.cpp",
     ],
     local_include_dirs: [
         "config",
         "platform/linux",
         "tests",
     ],
-    static_libs: ["libccg_ivi"],
-    exclude_srcs: ["src/someip/someip_message.cpp"], // part of libccg_ivi
+    static_libs: ["libccg_ivi"], // includes src/someip
 }

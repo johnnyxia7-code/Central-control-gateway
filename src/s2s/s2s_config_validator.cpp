@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "ccg/can/can_frame.hpp"
+#include "ccg/can/signal_layout.hpp"
 #include "ccg/s2s/s2s_config.hpp"
 
 namespace ccg::s2s {
@@ -39,58 +40,7 @@ void checkMessage(const Message& msg, const char* direction, Errors& errors) {
         return;
     }
 
-    std::vector<std::string> owner(static_cast<std::size_t>(msg.length) * 8);
-    auto claim = [&](const can::SignalSpec& spec) {
-        if (!can::fitsInFrame(spec, msg.length)) {
-            errors.add(where, ": signal '", spec.name, "' does not fit into ",
-                       int{msg.length}, " bytes");
-            return;
-        }
-        can::forEachBitMsbFirst(spec, [&](std::size_t pos) {
-            if (!owner[pos].empty()) {
-                errors.add(where, ": signal '", spec.name, "' overlaps '", owner[pos],
-                           "' at bit ", pos);
-            }
-            owner[pos] = spec.name;
-        });
-    };
-
-    std::set<std::string> names;
-    for (const auto& s : msg.signals) {
-        if (!names.insert(s.name).second) {
-            errors.add(where, ": duplicate signal '", s.name, "'");
-        }
-        if (s.factor == 0.0) {
-            errors.add(where, ": signal '", s.name, "' has factor 0");
-        }
-        if (s.min > s.max) {
-            errors.add(where, ": signal '", s.name, "' has min > max");
-        }
-        claim(s);
-    }
-
-    if (msg.e2e) {
-        if (msg.e2e->crcByte >= msg.length) {
-            errors.add(where, ": E2E CRC byte outside payload");
-        } else {
-            can::SignalSpec crc;
-            crc.name = "E2E_CRC";
-            crc.startBit = static_cast<std::uint16_t>(msg.e2e->crcByte * 8);
-            crc.length = 8;
-            claim(crc);
-        }
-        can::SignalSpec counter;
-        counter.name = "E2E_Counter";
-        counter.startBit = msg.e2e->counterStartBit;
-        counter.length = 4;
-        claim(counter);
-        if (msg.e2e->maxDeltaCounter == 0 || msg.e2e->maxDeltaCounter >= e2e::kCounterModulo) {
-            errors.add(where, ": E2E maxDeltaCounter must be 1..14");
-        }
-        if (msg.e2e->maxConsecutiveErrors == 0) {
-            errors.add(where, ": E2E maxConsecutiveErrors must be >= 1");
-        }
-    }
+    can::checkSignalLayout(where, msg.length, msg.signals, msg.e2e, errors.list);
 }
 
 template <typename Message>

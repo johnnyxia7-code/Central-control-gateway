@@ -28,9 +28,9 @@ integrated into the AOSP tree of the IVI, and how it was verified.
 │        │ UNIX sockets in /dev/socket/someip         │              │
 │ ┌──────▼──────────────────────────────────────────┐ │   SOME/IP + SOME/IP-SD
 │ │ vendor.ccg.someipd: vsomeip routing manager     │◄├──────────────┘
-│ │  + vehicle network setup (link, address, route) │ │   vehicle Ethernet, eth1 10.0.0.20
+│ │  + vehicle network setup (link, address, route) │ │   vehicle Ethernet, eth1 192.168.10.30
 │ └─────────────────────────────────────────────────┘ │   SD 224.244.224.245:30490
-└─────────────────────────────────────────────────────┘   services 10.0.0.10:30501
+└─────────────────────────────────────────────────────┘   services 192.168.10.1:30510
 ```
 
 ## 2. What the port consists of
@@ -107,7 +107,7 @@ the real `S2SGateway` (`tests/ivi_harness.hpp`).
 | `setup_aosp.sh` | applies the vsomeip patches, installs Boost into `external/boost` (idempotent) |
 | `external/vsomeip/patches/` | Android patch for vsomeip 3.7.6 (paths, Boost version) |
 | `external/boost/` | `fetch_boost.sh` (pinned SHA-256) and the `Android.bp` template |
-| `../Android.bp` (repository root) | `libccg_ivi`, `libccg_vsomeip_client`, `ccg_someipd`, `ccg_ivi_vehicle_client`, `ccg_vsomeip_ivi.json`, `ccg_s2s_tests` |
+| `../Android.bp` (repository root) | `libccg_ivi`, `libccg_vsomeip_client`, `ccg_someipd`, `ccg_ivi_vehicle_client`, `ccg_vsomeip_ivi.json`, `ccg_s2s_ivi_tests` |
 | `someipd/ccg_someipd.rc` | `/dev/socket/someip`, service `vendor.ccg.someipd` (`early_hal`, `system`, `NET_ADMIN`) |
 | `vhal/` | `android.hardware.automotive.vehicle-ccg-service`: `DefaultVehicleHal` + `SomeIpVehicleHardware`, init rc, VINTF fragment |
 | `sepolicy/` | `ccg_someipd`, `someip_socket`, `someip_domain`, VHAL additions |
@@ -137,7 +137,7 @@ Target: Android 14 or later (per-area access in `VehicleAreaConfig`).
    - `config/vsomeip/ivi_vehicle.json`: `unicast` = the IVI address.
    - `android/overlay/.../config.xml`: regex of the interfaces EthernetService may manage.
    - `android/vhal/vhal-ccg-service.xml`: VHAL AIDL version of the release (2 = Android 14, 3 = Android 15).
-5. `m` and flash. Optional: `atest ccg_s2s_tests` (unit tests on target and host).
+5. `m` and flash. Optional: `atest ccg_s2s_ivi_tests` (unit tests on target and host).
 
 ## 5. Vehicle HAL properties
 
@@ -189,7 +189,7 @@ adb root && adb shell ccg_ivi_vehicle_client --duration-s 10 --lock   # debug bu
 Done in this repository's CI-less environment (Linux host, vsomeip 3.7.6 built
 from source):
 
-- **Unit tests** (`ccg_s2s_tests`, 61 tests): codec, client (availability, field
+- **Unit tests** (`ccg_s2s_ivi_tests`, 61 tests): codec, client (availability, field
   refresh, timeouts, service loss, late responses, header checks), VHAL mapping
   (IDs, configs, unit conversions, status mapping, on-change filtering, writes),
   all against the real `S2SGateway`; also with GCC ASan/UBSan and Clang `-Werror`.

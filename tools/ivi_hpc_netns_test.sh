@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Two-ECU integration test of the IVI vsomeip port against the HPC S2S gateway.
 #
-#   ccg-hpc netns  10.0.0.10 eth0  <--veth-->  eth1 10.0.0.20  ccg-ivi netns
+#   ccg-hpc netns  192.168.10.1 eth0  <--veth-->  eth1 192.168.10.30  ccg-ivi netns
 #   ccg_hpc_vsomeip_bench                      ccg_someipd (routing manager, SD route)
 #   (S2S gateway + virtual CAN bus)            ccg_ivi_vehicle_client (VHAL stack)
 #
@@ -46,7 +46,7 @@ fail() {
 ip netns add "$HPC"
 ip netns add "$IVI"
 ip link add eth0 netns "$HPC" type veth peer name eth1 netns "$IVI"
-ip -n "$HPC" addr add 10.0.0.10/24 dev eth0
+ip -n "$HPC" addr add 192.168.10.1/24 dev eth0
 for ns in "$HPC" "$IVI"; do ip -n "$ns" link set lo up; done
 ip -n "$HPC" link set eth0 up
 # A Linux HPC has its multicast route; the IVI (Android) has none.
@@ -67,7 +67,7 @@ run_hpc "$BUILD/ccg_hpc_vsomeip_bench" > "$WORK/hpc.log" 2>&1 &
 pids+=($!)
 
 # --- IVI without SD route (stock Android): vsomeip never starts SOME/IP-SD --------
-run_ivi "$BUILD/ccg_someipd" --net-if eth1 --net-address 10.0.0.20/24 --no-sd-route \
+run_ivi "$BUILD/ccg_someipd" --net-if eth1 --net-address 192.168.10.30/24 --no-sd-route \
     > "$WORK/someipd-noroute.log" 2>&1 &
 noroute=$!
 sleep 1
@@ -82,13 +82,13 @@ echo "ok: without the SD route the IVI finds no service (the Android failure mod
 # --- IVI: routing daemon first (as started by init), then the VHAL-side client ----
 ip -n "$IVI" addr flush dev eth1
 ip -n "$IVI" link set eth1 down
-run_ivi "$BUILD/ccg_someipd" --net-if eth1 --net-address 10.0.0.20/24 > "$WORK/someipd.log" 2>&1 &
+run_ivi "$BUILD/ccg_someipd" --net-if eth1 --net-address 192.168.10.30/24 > "$WORK/someipd.log" 2>&1 &
 someipd=$!
 pids+=($someipd)
 sleep 1
-ip -n "$IVI" -4 addr show dev eth1 | grep -q 'inet 10.0.0.20/24' || fail "ccg_someipd did not configure eth1"
+ip -n "$IVI" -4 addr show dev eth1 | grep -q 'inet 192.168.10.30/24' || fail "ccg_someipd did not configure eth1"
 ip -n "$IVI" route show 224.0.0.0/4 | grep -q 'dev eth1' || fail "ccg_someipd did not install the SD route"
-echo "ok: ccg_someipd brought eth1 up with 10.0.0.20/24 and the SD multicast route"
+echo "ok: ccg_someipd brought eth1 up with 192.168.10.30/24 and the SD multicast route"
 
 set +e
 (run_ivi "$BUILD/ccg_ivi_vehicle_client" --expect-all-services --lock --climate 23.5:4 --trunk \
@@ -134,7 +134,7 @@ ip -n "$IVI" link set eth1 down
 ip -n "$IVI" addr flush dev eth1
 sleep 2
 ip -n "$IVI" route show 224.0.0.0/4 | grep -q 'dev eth1' || fail "SD route not restored after link down"
-ip -n "$IVI" -4 addr show dev eth1 | grep -q 'inet 10.0.0.20/24' || fail "address not restored"
+ip -n "$IVI" -4 addr show dev eth1 | grep -q 'inet 192.168.10.30/24' || fail "address not restored"
 (run_ivi "$BUILD/ccg_ivi_vehicle_client" --expect-all-services --unlock --duration-s 4 \
     > "$WORK/client3.log" 2>&1) || fail "services not available again after the link flap"
 expect client3.log 'command unlock: OK' "IVI back in service after a link flap"

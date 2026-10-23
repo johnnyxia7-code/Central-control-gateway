@@ -1,5 +1,5 @@
 {
-    "unicast": "10.0.0.10",
+    "unicast": "192.168.10.1",
     "netmask": "255.255.255.0",
     "diagnosis": "0x10",
     "logging": {
@@ -12,10 +12,10 @@
         { "name": "ccg_s2s_gateway", "id": "0x1001" }
     ],
     "services": [
-        { "service": "0x6001", "instance": "0x0001", "unreliable": "30501" },
-        { "service": "0x6002", "instance": "0x0001", "unreliable": "30501" },
-        { "service": "0x6003", "instance": "0x0001", "unreliable": "30501" },
-        { "service": "0x6004", "instance": "0x0001", "unreliable": "30501" }
+        { "service": "0x6001", "instance": "0x0001", "unreliable": "30510" },
+        { "service": "0x6002", "instance": "0x0001", "unreliable": "30510" },
+        { "service": "0x6003", "instance": "0x0001", "unreliable": "30510" },
+        { "service": "0x6004", "instance": "0x0001", "unreliable": "30510" }
     ],
     "routing": "ccg_s2s_gateway",
     "service-discovery": {
