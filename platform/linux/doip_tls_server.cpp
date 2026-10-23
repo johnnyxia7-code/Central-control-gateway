@@ -41,7 +41,7 @@ std::string commonName(X509* cert) {
 DoipTlsServer::DoipTlsServer(std::uint16_t port, std::size_t maxConnections, const TlsServerConfig& config,
                              diag::ConnectionId firstId)
     : revocation_(config.crl),
-      stapler_(config.ocspResponseFile),
+      stapler_(config.ocspResponseFile, config.ocspCheckResponse),
       caFile_(config.caFile),
       maxConnections_(maxConnections),
       firstId_(firstId),
@@ -76,9 +76,14 @@ DoipTlsServer::DoipTlsServer(std::uint16_t port, std::size_t maxConnections, con
             throw std::runtime_error("TLS: a CRL needs the tester CA");
         }
 
-        if (stapler_.enabled()) {
-            if (!stapler_.load()) throw std::runtime_error("TLS: unusable OCSP response " + config.ocspResponseFile);
-            stapler_.attach(ctx_);
+        stapler_.attach(ctx_);
+        if (stapler_.enabled() && !stapler_.load()) {
+            throw std::runtime_error("TLS: OCSP response " + config.ocspResponseFile +
+                                     " is unusable or not about the server certificate");
+        }
+        if (config.ocspCheckResponse && stapler_.mustStaple() && !stapler_.enabled()) {
+            throw std::runtime_error("TLS: the server certificate is must-staple (RFC 7633) but no OCSP response "
+                                     "is configured");
         }
 
         listenFd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);

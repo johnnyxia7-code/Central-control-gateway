@@ -42,6 +42,8 @@ struct TlsServerConfig {
     CrlPolicy crl;  // revocation of client certificates (needs caFile)
     std::string ocspResponseFile;  // OCSP response for our certificate (DER); empty = no stapling
     int maxProtocolVersion = 0;    // e.g. TLS1_2_VERSION for interoperability tests; 0 = newest
+    bool ocspCheckResponse = true; // false: no OCSP sanity checks (response certificate, must-staple
+                                   // without response) - only to emulate a misconfigured peer in tests
 };
 
 class DoipTlsServer {
@@ -79,6 +81,7 @@ public:
     // Loads a new OCSP response for stapling. False: unusable, the old one stays.
     bool reloadOcsp() { return stapler_.load(); }
     const OcspStatistics& ocsp() const { return stapler_.statistics(); }
+    bool mustStaple() const { return stapler_.mustStaple(); }  // own certificate carries RFC 7633 must-staple
 
 private:
     struct Socket {

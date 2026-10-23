@@ -4,6 +4,7 @@
 #include <openssl/ocsp.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <cstdio>
 #include <cstring>
@@ -43,7 +44,43 @@ X509* findIssuer(SSL* ssl, X509* leaf) {
     return issuer;
 }
 
+// SingleResponse about `cert`: same serial and issuer name hash.
+OCSP_SINGLERESP* singleFor(OCSP_BASICRESP* basic, X509* cert) {
+    for (int i = 0; i < OCSP_resp_count(basic); ++i) {
+        OCSP_SINGLERESP* single = OCSP_resp_get0(basic, i);
+        ASN1_OCTET_STRING* nameHash = nullptr;
+        ASN1_OBJECT* md = nullptr;
+        ASN1_OCTET_STRING* keyHash = nullptr;
+        ASN1_INTEGER* serial = nullptr;
+        auto* id = const_cast<OCSP_CERTID*>(OCSP_SINGLERESP_get0_id(single));
+        if (OCSP_id_get0_info(&nameHash, &md, &keyHash, &serial, id) != 1) continue;
+        if (!serial || ASN1_INTEGER_cmp(serial, X509_get0_serialNumber(cert)) != 0) continue;
+        const EVP_MD* digest = EVP_get_digestbyobj(md);
+        unsigned char hash[EVP_MAX_MD_SIZE];
+        unsigned int len = 0;
+        if (!digest || X509_NAME_digest(X509_get_issuer_name(cert), digest, hash, &len) != 1) continue;
+        if (nameHash && static_cast<unsigned int>(ASN1_STRING_length(nameHash)) == len &&
+            std::memcmp(ASN1_STRING_get0_data(nameHash), hash, len) == 0) {
+            return single;
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace
+
+bool hasMustStaple(X509* cert) {
+    if (!cert) return false;
+    auto* features = static_cast<TLS_FEATURE*>(X509_get_ext_d2i(cert, NID_tlsfeature, nullptr, nullptr));
+    if (!features) return false;
+    bool statusRequest = false;
+    for (int i = 0; i < sk_ASN1_INTEGER_num(features); ++i) {
+        const long feature = ASN1_INTEGER_get(sk_ASN1_INTEGER_value(features, i));
+        statusRequest = statusRequest || feature == 5 /* status_request */ || feature == 17 /* status_request_v2 */;
+    }
+    TLS_FEATURE_free(features);
+    return statusRequest;
+}
 
 // --- server: staple our own status ---------------------------------------------
 
@@ -67,9 +104,12 @@ bool OcspStapler::load() {
         ERR_clear_error();
         return false;
     }
+    OCSP_SINGLERESP* single = certificate_ ? singleFor(basic.get(), certificate_) : nullptr;
+    if (checkResponse_ && !single) return false;  // a response about another certificate
+    if (!single) single = OCSP_resp_get0(basic.get(), 0);
     ASN1_GENERALIZEDTIME* thisUpdate = nullptr;
     ASN1_GENERALIZEDTIME* nextUpdate = nullptr;
-    OCSP_single_get0_status(OCSP_resp_get0(basic.get(), 0), nullptr, nullptr, &thisUpdate, &nextUpdate);
+    OCSP_single_get0_status(single, nullptr, nullptr, &thisUpdate, &nextUpdate);
     response_ = std::move(der);
     nextUpdate_ = toTime(nextUpdate);
     ++stats_.reloads;
@@ -77,15 +117,19 @@ bool OcspStapler::load() {
 }
 
 void OcspStapler::attach(SSL_CTX* ctx) {
+    certificate_ = SSL_CTX_get0_certificate(ctx);
+    mustStaple_ = hasMustStaple(certificate_);
     SSL_CTX_set_tlsext_status_cb(ctx, &OcspStapler::callback);
     SSL_CTX_set_tlsext_status_arg(ctx, this);
 }
 
 int OcspStapler::callback(SSL* ssl, void* arg) {
     auto* self = static_cast<OcspStapler*>(arg);
-    if (!self || self->response_.empty()) return SSL_TLSEXT_ERR_NOACK;
-    if (self->nextUpdate_ != 0 && std::time(nullptr) > self->nextUpdate_) {
-        ++self->stats_.notStapledExpired;  // an outdated staple would only fail the client
+    if (!self) return SSL_TLSEXT_ERR_NOACK;
+    const bool outdated = self->nextUpdate_ != 0 && std::time(nullptr) > self->nextUpdate_;
+    if (self->response_.empty() || outdated) {
+        if (outdated) ++self->stats_.notStapledExpired;  // an outdated staple would only fail the client
+        if (self->mustStaple_) ++self->stats_.mustStapleUnserved;  // the client will refuse us
         return SSL_TLSEXT_ERR_NOACK;
     }
     auto* copy = static_cast<unsigned char*>(OPENSSL_malloc(self->response_.size()));
@@ -118,7 +162,10 @@ int OcspVerifier::callback(SSL* ssl, void* arg) {
 
 // 1: accept, 0: fail the handshake.
 int OcspVerifier::check(SSL* ssl) {
-    const bool require = policy_.require;
+    // Must-staple in the peer's certificate overrides an optional policy.
+    const bool mustStaple = hasMustStaple(SSL_get0_peer_certificate(ssl));
+    if (mustStaple) ++stats_.mustStapleEnforced;
+    const bool require = policy_.require || mustStaple;
     const unsigned char* p = nullptr;
     const long len = SSL_get_tlsext_status_ocsp_resp(ssl, &p);
     if (!p || len <= 0) {

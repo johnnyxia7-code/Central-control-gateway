@@ -242,8 +242,27 @@ This works with TLS 1.3 (Certificate extension) and TLS 1.2
 | Gateway → ECUs (ADAS) | asks every ECU for its staple and checks it: signed by the CA or a delegated OCSP signer that chains to the vehicle CA, about exactly the ECU's certificate, within thisUpdate/nextUpdate (5 min clock tolerance), status good |
 | Policy | **revoked** always fails the handshake. A missing, unverifiable, outdated or "unknown" staple fails it only with `--vehicle-ocsp-require`; otherwise it is counted and the CRLs remain the revocation check |
 
+**Response sanity on the server side.** A response file is only taken if it
+is "successful" and holds a SingleResponse for the server's own certificate
+(serial number and issuer name hash). A response about another certificate is
+refused at start-up and on reload. Before this check it would have been stapled
+blindly.
+
+**Must-staple (RFC 7633).** A certificate with the TLS Feature extension
+`status_request` (or `status_request_v2`) promises that its owner always
+staples:
+
+| Side | Enforcement |
+|------|-------------|
+| Gateway → ECUs | an ECU certificate with must-staple needs a **good, verified staple** whatever `--vehicle-ocsp-require` says. A missing, unverifiable, outdated or unknown staple fails the handshake (`mustStapleEnforced` counts these connections) |
+| Gateway → testers | if the gateway's own certificate is must-staple, the process does not start without `--tls-ocsp`. If the response becomes outdated, the gateway withholds it and counts `mustStapleUnserved`, because testers will refuse the connection until the backend delivers a fresh one |
+
+Must-staple certificates with the OpenSSL CLI: add `tlsfeature = status_request`
+to the extension file used for signing, e.g.
+`openssl x509 -req -in adas.csr -CA ca.pem -CAkey ca.key -extfile ms.ext -out adas.pem`.
+
 Counters (`OcspStatistics`): stapled, withheld as outdated, verified, revoked,
-missing, invalid, and handshakes refused.
+missing, invalid, handshakes refused, must-staple enforced and unserved.
 
 A staple with the OpenSSL CLI (the CA database from §3.8; in production the
 backend's OCSP responder):
@@ -379,8 +398,8 @@ refuses the TLS options.
 ## 8. Limitations / next steps
 
 - TLS: revocation uses full CRLs and OCSP stapling. The gateway does not query
-  OCSP responders itself (it is offline), does not enforce the "must staple"
-  certificate extension, and does not use delta CRLs. The tester's certificate grants one level ("verified"), with no roles
+  OCSP responders itself (it is offline), and does not use delta CRLs.
+  Must-staple is enforced (§3.9). The tester's certificate grants one level ("verified"), with no roles
   from certificate attributes. There is no confirmation step in routing
   activation (0x05 and 0x11 are never sent).
 - One outstanding physical request per ECU; a second one is refused with NACK

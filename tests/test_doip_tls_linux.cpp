@@ -59,7 +59,8 @@ void addExtension(X509* cert, X509* issuer, int nid, const char* value) {
 }
 
 // ECDSA P-256 certificate, signed by `issuer` (self-signed CA if null).
-Credential makeCredential(const std::string& name, const char* cn, const Credential* issuer, bool ca, long serial) {
+Credential makeCredential(const std::string& name, const char* cn, const Credential* issuer, bool ca, long serial,
+                          bool mustStaple = false) {
     Credential c;
     c.key = EVP_EC_gen("P-256");
     c.cert = X509_new();
@@ -75,6 +76,7 @@ Credential makeCredential(const std::string& name, const char* cn, const Credent
     addExtension(c.cert, signer, NID_basic_constraints, ca ? "critical,CA:TRUE" : "critical,CA:FALSE");
     addExtension(c.cert, signer, NID_key_usage, ca ? "critical,keyCertSign,cRLSign" : "critical,digitalSignature");
     if (!ca) addExtension(c.cert, signer, NID_ext_key_usage, "serverAuth,clientAuth");
+    if (mustStaple) addExtension(c.cert, signer, NID_tlsfeature, "status_request");  // RFC 7633
     X509_sign(c.cert, issuer ? issuer->key : c.key, EVP_sha256());
 
     c.certFile = tempFile(name + "_cert");
@@ -158,9 +160,11 @@ struct Pki {
     Credential rogue = makeCredential("rogue", "rogue-tester", &rogueCa, false, 5);
     Credential adas = makeCredential("adas", "adas-dc", &ca, false, 6);
     Credential rogueAdas = makeCredential("rogue_adas", "adas-dc", &rogueCa, false, 7);
+    Credential adasMustStaple = makeCredential("adas_ms", "adas-dc", &ca, false, 8, true);
+    Credential gatewayMustStaple = makeCredential("gw_ms", "ccg-gateway", &ca, false, 9, true);
 
     ~Pki() {
-        for (auto* c : {&ca, &gateway, &tester, &rogueCa, &rogue, &adas, &rogueAdas}) {
+        for (auto* c : {&ca, &gateway, &tester, &rogueCa, &rogue, &adas, &rogueAdas, &adasMustStaple, &gatewayMustStaple}) {
             std::remove(c->certFile.c_str());
             std::remove(c->keyFile.c_str());
             X509_free(c->cert);
@@ -715,7 +719,8 @@ namespace {
 
 // Tester that asks for the staple; returns the OCSP status of the gateway's
 // certificate it received (nullopt: no staple).
-std::optional<int> testerSeesStaple(Bench& bench, std::uint16_t port, const Pki& pki, bool ask = true) {
+std::optional<int> testerSeesStaple(Bench& bench, std::uint16_t port, const Pki& pki, bool ask = true,
+                                    const Credential* about = nullptr) {
     Client client(port, pki, &pki.tester);
     if (ask) SSL_set_tlsext_status_type(client.ssl, TLSEXT_STATUSTYPE_ocsp);
     if (handshake(bench, client) != std::optional<bool>(true)) return std::nullopt;
@@ -724,7 +729,7 @@ std::optional<int> testerSeesStaple(Bench& bench, std::uint16_t port, const Pki&
     if (!p || len <= 0) return std::nullopt;
     OCSP_RESPONSE* resp = d2i_OCSP_RESPONSE(nullptr, &p, len);
     OCSP_BASICRESP* basic = resp ? OCSP_response_get1_basic(resp) : nullptr;
-    OCSP_CERTID* id = OCSP_cert_to_id(nullptr, pki.gateway.cert, pki.ca.cert);
+    OCSP_CERTID* id = OCSP_cert_to_id(nullptr, (about ? *about : pki.gateway).cert, pki.ca.cert);
     int status = -1;
     int reason = 0;
     ASN1_GENERALIZEDTIME *rev = nullptr, *thisUpd = nullptr, *nextUpd = nullptr;
@@ -824,6 +829,7 @@ TEST_CASE("doip tls linux: the gateway checks the ADAS OCSP staple") {
         auto server = adasServer(pki.adas, pki);
         server.ocspResponseFile = c.staple;
         server.maxProtocolVersion = version;
+        server.ocspCheckResponse = c.staple != otherCert;  // emulate an ECU stapling a wrong response
         AdasOverTls v(port++, server);
         auto cfg = gatewayClient(pki);
         cfg.ocsp = platform::OcspPolicy{true, c.require};
@@ -839,4 +845,85 @@ TEST_CASE("doip tls linux: the gateway checks the ADAS OCSP staple") {
         }
       }
     }
+}
+
+// --------------------------------------------------------------- must-staple (RFC 7633)
+
+TEST_CASE("doip tls linux: must-staple ADAS certificate needs a good staple whatever the policy") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    CHECK(platform::hasMustStaple(pki.adasMustStaple.cert));
+    CHECK(!platform::hasMustStaple(pki.adas.cert));
+    const auto good = files.add(makeOcsp("ocsp_ms_good", pki.adasMustStaple, pki.ca, pki.ca, V_OCSP_CERTSTATUS_GOOD));
+    const auto forged =
+        files.add(makeOcsp("ocsp_ms_forged", pki.adasMustStaple, pki.ca, pki.rogueCa, V_OCSP_CERTSTATUS_GOOD));
+    struct Case {
+        std::string staple;
+        diag::ClientResult expected;
+    };
+    const std::vector<Case> cases = {
+        {"", diag::ClientResult::TransportError},      // no staple although the certificate demands one
+        {forged, diag::ClientResult::TransportError},  // unverifiable staple
+        {good, diag::ClientResult::Ok},
+    };
+    std::uint16_t port = 31560;
+    for (const int version : {0, TLS1_2_VERSION}) {
+        for (const auto& c : cases) {
+            auto server = adasServer(pki.adasMustStaple, pki);
+            server.ocspResponseFile = c.staple;
+            server.maxProtocolVersion = version;
+            server.ocspCheckResponse = !c.staple.empty();  // emulate an ECU that ignores its must-staple
+            AdasOverTls v(port++, server);
+            auto cfg = gatewayClient(pki);
+            cfg.ocsp = platform::OcspPolicy{true, false};  // optional by policy ...
+            v.connector.enableTls(cfg);
+            const auto r = v.request({0x3E, 0x00});
+            REQUIRE(r.has_value());
+            CHECK(r->first == c.expected);  // ... but required by the certificate
+            CHECK_EQ(v.connector.ocsp()->mustStapleEnforced, 1u);
+        }
+    }
+}
+
+TEST_CASE("doip tls linux: a must-staple gateway certificate needs its OCSP response") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    auto config = [&](const std::string& ocsp) {
+        platform::TlsServerConfig c;
+        c.certificateFile = pki.gatewayMustStaple.certFile;
+        c.privateKeyFile = pki.gatewayMustStaple.keyFile;
+        c.caFile = pki.ca.certFile;
+        c.ocspResponseFile = ocsp;
+        return c;
+    };
+    auto starts = [&](std::uint16_t port, const std::string& ocsp) {
+        try {
+            Bench bench(port, config(ocsp));
+            return true;
+        } catch (const std::runtime_error&) {
+            return false;
+        }
+    };
+    const auto other = files.add(makeOcsp("ocsp_gw_other", pki.gateway, pki.ca, pki.ca, V_OCSP_CERTSTATUS_GOOD));
+    CHECK(!starts(31570, ""));     // must-staple without a response to staple
+    CHECK(!starts(31571, other));  // response about another certificate
+
+    const auto file = files.add(makeOcsp("ocsp_gw_ms", pki.gatewayMustStaple, pki.ca, pki.ca,
+                                         V_OCSP_CERTSTATUS_GOOD, OcspTime::Expired));
+    Bench bench(31572, config(file));
+    CHECK(!testerSeesStaple(bench, 31572, pki, true, &pki.gatewayMustStaple).has_value());
+    CHECK_EQ(bench.server.ocsp().mustStapleUnserved, 1u);  // the tester will refuse such a gateway
+
+    makeOcsp("ocsp_gw_ms", pki.gatewayMustStaple, pki.ca, pki.ca, V_OCSP_CERTSTATUS_GOOD);
+    CHECK(bench.server.reloadOcsp());
+    CHECK(testerSeesStaple(bench, 31572, pki, true, &pki.gatewayMustStaple) ==
+          std::optional<int>(V_OCSP_CERTSTATUS_GOOD));
+
+    // A reload with a response about another certificate is not taken.
+    makeOcsp("ocsp_gw_ms", pki.gateway, pki.ca, pki.ca, V_OCSP_CERTSTATUS_GOOD);
+    CHECK(!bench.server.reloadOcsp());
+    CHECK(testerSeesStaple(bench, 31572, pki, true, &pki.gatewayMustStaple) ==
+          std::optional<int>(V_OCSP_CERTSTATUS_GOOD));
 }

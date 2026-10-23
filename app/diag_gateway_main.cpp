@@ -27,7 +27,9 @@
 // tester-facing certificate, fetched by the backend; it is stapled for testers
 // that ask and reloaded when it changes. ECUs are asked for their staple; a
 // revoked status always fails, --vehicle-ocsp-require also refuses ECUs
-// without a good staple.
+// without a good staple. Must-staple certificates (RFC 7633) are enforced on
+// both sides: an ECU certificate carrying it needs a good staple whatever the
+// policy, and a must-staple gateway certificate needs --tls-ocsp to start.
 //
 // With --key-store the gateway's own diagnostic address also serves the SecOC
 // key management routines (SHE key update, activation, key status); the file
@@ -280,7 +282,8 @@ int main(int argc, char** argv) {
                                                                     : ", client certificates verified")
                       << (tlsOnly ? ", plain TCP refused for routing activation" : "")
                       << (testerCrl.empty() ? "" : ", revocation: " + testerCrl)
-                      << (tlsOcsp.empty() ? "" : ", OCSP staple: " + tlsOcsp) << "\n";
+                      << (tlsOcsp.empty() ? "" : ", OCSP staple: " + tlsOcsp)
+                      << (tls->mustStaple() ? " (certificate is must-staple)" : "") << "\n";
         }
 #endif
 
@@ -458,7 +461,8 @@ int main(int argc, char** argv) {
                     const bool ok = tls->reloadOcsp();
                     std::cout << "[diag] OCSP staple " << (ok ? "reloaded" : "unusable - previous response kept")
                               << " (stapled " << tls->ocsp().stapled << ", withheld as outdated "
-                              << tls->ocsp().notStapledExpired << ")\n";
+                              << tls->ocsp().notStapledExpired << ", must-staple unserved "
+                              << tls->ocsp().mustStapleUnserved << ")\n";
                 }
 #endif
                 if (!vehicleCrl.empty() && vehicleCrlWatch.changed()) {
