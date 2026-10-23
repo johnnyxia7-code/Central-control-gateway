@@ -54,7 +54,7 @@ TEST_CASE("key store: round trip keeps every key state; file is private") {
         CHECK(a.slot == b.slot && a.state == b.state && a.key == b.key && a.counter == b.counter &&
               a.flags == b.flags && a.remaining == b.remaining);
     }
-    CHECK(snap.keys.size() == 8u);  // 6 active + 1 previous + 1 pending
+    CHECK(snap.keys.size() == 9u);  // 7 active + 1 previous + 1 pending
     std::remove(path.c_str());
 }
 

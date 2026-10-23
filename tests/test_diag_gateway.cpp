@@ -564,8 +564,10 @@ TEST_CASE("diag local: UDS services of the gateway and S3 timeout") {
     CHECK(f.responses(c, dg::kGateway).back() == (Bytes{0x7E, 0x00}));
     f.request(c, dg::kGateway, {0x22, 0x12, 0x34});
     CHECK(f.responses(c, dg::kGateway).back() == (Bytes{0x7F, 0x22, 0x31}));
-    f.request(c, dg::kGateway, {0x31, 0x01, 0x02, 0x03});
-    CHECK(f.responses(c, dg::kGateway).back() == (Bytes{0x7F, 0x31, 0x11}));
+    f.request(c, dg::kGateway, {0x31, 0x01, 0x02, 0x03});  // no such routine
+    CHECK(f.responses(c, dg::kGateway).back() == (Bytes{0x7F, 0x31, 0x31}));
+    f.request(c, dg::kGateway, {0x2E, 0xF1, 0x90, 0x00});
+    CHECK(f.responses(c, dg::kGateway).back() == (Bytes{0x7F, 0x2E, 0x11}));
     CHECK(f.tx.canLog.empty());  // nothing reached the CAN buses
 
     f.advance(5000ms);  // S3 server timeout

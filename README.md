@@ -59,6 +59,7 @@ Key slots of the gateway HSM and their renewal from the backend.
 - **Protection**: anti-rollback update counter per key, UID binding (wildcard only if allowed), write protection, MAC-only key usage, lockout after repeated authentication failures
 - **Rollover without communication loss**: new keys are staged until the backend activates them; the previous key is still accepted for verification during a grace period, the pending key already verifies MACs of ECUs that switched early
 - **UDS on DoIP** (gateway address 0x1001): RoutineControl F200 load key, F201 activate, F202 discard; DID F2A0 key status; the key store is persisted before M4/M5 are returned
+- **In-vehicle key master**: the gateway generates the SecOC keys it shares with VCU, EPS and BCM and distributes them over ISO-TP with the same SHE protocol (ECU authorisation keys derived from the vehicle key master secret and the ECU's UID). Each key group is atomic: it is activated only when every member proved it holds the key, and otherwise discarded everywhere. Started with RoutineControl F210
 - Security events for the IdsM; backend tool `ccg_key_tool` builds M1–M3 and checks M4/M5
 
 Design: [docs/KEY_MANAGEMENT_DESIGN.md](docs/KEY_MANAGEMENT_DESIGN.md)
@@ -85,6 +86,7 @@ Bench simulations (no hardware, print the traffic the gateway produces):
 ./build/ccg_eth_gw_sim
 ./build/ccg_diag_sim
 ./build/ccg_keym_sim
+./build/ccg_key_master_sim
 ```
 
 On a Linux HPC / bench PC with (virtual) CAN interfaces:

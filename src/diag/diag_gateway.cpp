@@ -13,6 +13,9 @@ using doip::HeaderNack;
 namespace pt = doip::payload;
 
 constexpr std::chrono::milliseconds kS3Server{5000};  // UDS session timeout of the gateway
+// Internal client timing: P2 includes the ISO-TP transfer of request and response.
+constexpr std::chrono::milliseconds kP2Client{1000};
+constexpr std::chrono::milliseconds kP2StarClient{5500};
 
 std::uint64_t rxKey(std::size_t channel, std::uint32_t id, bool extended) {
     return (static_cast<std::uint64_t>(channel) << 33) | (static_cast<std::uint64_t>(extended) << 32) |
@@ -27,6 +30,17 @@ std::string joinErrors(const std::vector<std::string>& errors) {
 }
 
 }  // namespace
+
+const char* toString(ClientResult result) {
+    switch (result) {
+        case ClientResult::Ok: return "OK";
+        case ClientResult::Busy: return "BUSY";
+        case ClientResult::UnknownTarget: return "UNKNOWN_TARGET";
+        case ClientResult::TransportError: return "TRANSPORT_ERROR";
+        case ClientResult::Timeout: return "TIMEOUT";
+    }
+    return "UNKNOWN";
+}
 
 DiagConfigError::DiagConfigError(std::vector<std::string> errors)
     : std::runtime_error(joinErrors(errors)), errors_(std::move(errors)) {}
@@ -443,8 +457,9 @@ void DiagGateway::handleDiagnosticMessage(ConnectionId id, const std::vector<std
         sendDiagNack(req, target, DiagNack::MessageTooLarge);
         return;
     }
-    if (ecu.awaitingAck || ecu.tp->txBusy()) {
-        sendDiagNack(req, target, DiagNack::TransportProtocolError);  // previous request still on the bus
+    if (ecu.awaitingAck || ecu.tp->txBusy() || ecu.internal) {
+        // previous request still on the bus, or the gateway itself talks to the ECU
+        sendDiagNack(req, target, DiagNack::TransportProtocolError);
         return;
     }
     ecu.awaitingAck = req;
@@ -533,6 +548,8 @@ std::optional<std::vector<std::uint8_t>> DiagGateway::localService(
             }
             return out;
         }
+        case 0x31:  // RoutineControl: routines are provided by local service handlers
+            return negative(request.size() < 4 ? 0x13 : 0x31);
         default:
             return negative(0x11);
     }
@@ -543,6 +560,7 @@ std::optional<std::vector<std::uint8_t>> DiagGateway::localService(
 // ---------------------------------------------------------------------------
 
 void DiagGateway::onCanFrame(std::size_t channel, const can::CanFrame& frame, TimePoint now) {
+    now_ = now;
     const auto it = ecuByRxId_.find(rxKey(channel, frame.id, frame.extended));
     if (it != ecuByRxId_.end()) {
         ecus_[it->second].tp->onFrame(frame, now);
@@ -551,6 +569,13 @@ void DiagGateway::onCanFrame(std::size_t channel, const can::CanFrame& frame, Ti
 
 void DiagGateway::onEcuTxDone(std::size_t index, isotp::Result result) {
     auto& ecu = ecus_[index];
+    if (ecu.internal && !ecu.awaitingAck) {
+        if (result != isotp::Result::Ok) {
+            ++stats_.isotpTxErrors;
+            finishInternal(index, ClientResult::TransportError, {});
+        }
+        return;
+    }
     const auto req = ecu.awaitingAck;
     ecu.awaitingAck.reset();
     if (!req) return;
@@ -565,6 +590,14 @@ void DiagGateway::onEcuTxDone(std::size_t index, isotp::Result result) {
 
 void DiagGateway::onEcuResponse(std::size_t index, std::vector<std::uint8_t>&& data) {
     ++stats_.ecuResponses;
+    if (auto& internal = ecus_[index].internal) {
+        if (data.size() == 3 && data[0] == 0x7F && data[2] == 0x78) {
+            internal->deadline = now_ + kP2StarClient;  // response pending
+            return;
+        }
+        finishInternal(index, ClientResult::Ok, std::move(data));
+        return;
+    }
     const auto& owner = ecus_[index].responseOwner;
     const auto it = owner ? connections_.find(owner->connection) : connections_.end();
     if (it == connections_.end() || !it->second.registered || it->second.tester != owner->tester) {
@@ -575,10 +608,41 @@ void DiagGateway::onEcuResponse(std::size_t index, std::vector<std::uint8_t>&& d
 }
 
 // ---------------------------------------------------------------------------
+// Gateway-internal diagnostic client
+// ---------------------------------------------------------------------------
+
+void DiagGateway::request(std::uint16_t target, std::vector<std::uint8_t> uds, TimePoint now,
+                          Callback callback) {
+    now_ = now;
+    const auto it = ecuByAddress_.find(target);
+    if (it == ecuByAddress_.end()) {
+        callback(ClientResult::UnknownTarget, {});
+        return;
+    }
+    auto& ecu = ecus_[it->second];
+    if (ecu.awaitingAck || ecu.tp->txBusy() || ecu.internal) {
+        callback(ClientResult::Busy, {});
+        return;
+    }
+    ecu.internal = InternalRequest{std::move(callback), now + kP2Client};
+    ecu.responseOwner.reset();  // a tester's late responses must not reach the client
+    if (!ecu.tp->transmit(std::move(uds), now)) {
+        finishInternal(it->second, ClientResult::TransportError, {});
+    }
+}
+
+void DiagGateway::finishInternal(std::size_t index, ClientResult result, std::vector<std::uint8_t> response) {
+    auto callback = std::move(ecus_[index].internal->callback);
+    ecus_[index].internal.reset();
+    callback(result, std::move(response));
+}
+
+// ---------------------------------------------------------------------------
 // Periodic processing
 // ---------------------------------------------------------------------------
 
 void DiagGateway::mainFunction(TimePoint now) {
+    now_ = now;
     // Vehicle announcements after start-up.
     if (announcementsLeft_ > 0 && now >= nextAnnouncement_) {
         --announcementsLeft_;
@@ -613,8 +677,11 @@ void DiagGateway::mainFunction(TimePoint now) {
         localSession_ = 0x01;
     }
 
-    for (auto& ecu : ecus_) {
-        ecu.tp->mainFunction(now);
+    for (std::size_t i = 0; i < ecus_.size(); ++i) {
+        ecus_[i].tp->mainFunction(now);
+        if (ecus_[i].internal && now >= ecus_[i].internal->deadline) {
+            finishInternal(i, ClientResult::Timeout, {});
+        }
     }
 }
 

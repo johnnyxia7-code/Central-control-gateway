@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -76,6 +77,29 @@ public:
                                                             const LocalRequestContext& context) = 0;
 };
 
+// Gateway-internal diagnostic client (e.g. the key master): UDS requests from
+// the gateway itself to an ECU, over the same ISO-TP channel as the testers.
+enum class ClientResult : std::uint8_t {
+    Ok,              // final response received (positive or negative)
+    Busy,            // a tester or another internal request is using the ECU
+    UnknownTarget,
+    TransportError,  // ISO-TP transmission failed (e.g. no flow control)
+    Timeout,         // no final response within P2 / P2* (after NRC 0x78)
+};
+
+const char* toString(ClientResult result);
+
+class IDiagClient {
+public:
+    using Callback = std::function<void(ClientResult result, std::vector<std::uint8_t> response)>;
+    virtual ~IDiagClient() = default;
+    // Physical request to the ECU with `target` logical address. The callback
+    // runs exactly once, possibly before request() returns; it must not send
+    // the next request itself (do that from the client's own main function).
+    virtual void request(std::uint16_t target, std::vector<std::uint8_t> uds, TimePoint now,
+                         Callback callback) = 0;
+};
+
 class DiagConfigError : public std::runtime_error {
 public:
     explicit DiagConfigError(std::vector<std::string> errors);
@@ -90,7 +114,7 @@ private:
 //
 // Single threaded: all entry points are called from one executor, every 1 ms
 // for mainFunction().
-class DiagGateway {
+class DiagGateway final : public IDiagClient {
 public:
     DiagGateway(DiagRoutingConfig config, IDiagTransport& transport);
 
@@ -108,6 +132,11 @@ public:
 
     // The handler must outlive the gateway.
     void addLocalService(ILocalServiceHandler& handler) { localHandlers_.push_back(&handler); }
+
+    // IDiagClient. While an internal request is open, tester requests to that
+    // ECU are refused (diagnostic NACK) and its responses go to the callback.
+    void request(std::uint16_t target, std::vector<std::uint8_t> uds, TimePoint now,
+                 Callback callback) override;
 
     std::optional<std::size_t> channelIndex(const std::string& name) const;
     bool isRoutingActive(ConnectionId connection) const;
@@ -140,9 +169,15 @@ private:
         TimePoint deadline{};
     };
 
+    struct InternalRequest {
+        Callback callback;
+        TimePoint deadline{};
+    };
+
     struct Ecu {
         std::size_t channel = 0;
         std::unique_ptr<isotp::Channel> tp;
+        std::optional<InternalRequest> internal;  // gateway-internal client request
         std::optional<Requester> awaitingAck;    // physical request in ISO-TP transmission
         std::optional<Requester> responseOwner;  // tester that gets the ECU responses
     };
@@ -164,6 +199,7 @@ private:
     void closeConnection(ConnectionId id, bool notifyTransport);
 
     void onEcuTxDone(std::size_t ecu, isotp::Result result);
+    void finishInternal(std::size_t ecu, ClientResult result, std::vector<std::uint8_t> response);
     void onEcuResponse(std::size_t ecu, std::vector<std::uint8_t>&& data);
 
     void sendTcp(ConnectionId id, std::uint16_t type, const std::vector<std::uint8_t>& payload);
@@ -192,6 +228,7 @@ private:
     std::uint8_t announcementsLeft_ = 0;
     TimePoint nextAnnouncement_{};
     std::vector<ILocalServiceHandler*> localHandlers_;
+    TimePoint now_{};  // latest time seen, for callbacks without a time argument
     std::uint8_t localSession_ = 0x01;
     TimePoint localSessionActivity_{};
 };

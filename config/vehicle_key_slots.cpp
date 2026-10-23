@@ -14,7 +14,9 @@ keym::KeyManagerConfig makeVehicleKeySlots() {
         {keyslot::kVcuGw, "K_VCU_GW", true},
         {keyslot::kGwChs, "K_GW_CHS", true},
         {keyslot::kFvMaster, "K_FV_MASTER", true},
+        {keyslot::kKeyMaster, "K_KEY_MASTER", false},
     };
+    c.keyMasterSlot = keyslot::kKeyMaster;
     c.gracePeriod = std::chrono::minutes(10);
     c.maxFailedAttempts = 3;
     c.lockoutTime = std::chrono::seconds(10);
@@ -22,6 +24,8 @@ keym::KeyManagerConfig makeVehicleKeySlots() {
 }
 
 crypto::Block demoMasterEcuKey() { return demoKey(0x4D); }
+
+crypto::Block demoKeyMasterSecret() { return demoKey(0x6B); }
 
 void provisionDemoKeyStore(keym::KeyManager& keys, keym::TimePoint now) {
     keym::she::Flags mac;
@@ -35,6 +39,7 @@ void provisionDemoKeyStore(keym::KeyManager& keys, keym::TimePoint now) {
     keys.provision(keyslot::kVcuGw, demoKey(3), 1, mac, now);
     keys.provision(keyslot::kGwChs, demoKey(4), 1, mac, now);
     keys.provision(keyslot::kFvMaster, demoKey(5), 1, mac, now);
+    keys.provision(keyslot::kKeyMaster, demoKeyMasterSecret(), 1, master, now);  // cipher key, no KEY_USAGE
 }
 
 }  // namespace ccg::config

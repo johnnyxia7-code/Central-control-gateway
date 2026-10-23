@@ -15,7 +15,10 @@ The key manager of the gateway (`ccg_keym`):
   **brute force** (lockout),
 - renews keys in a vehicle **without breaking communication**: staged
   activation, then a grace period in which the previous key is still accepted,
-- offers all this as UDS routines on the gateway's own DoIP address.
+- offers all this as UDS routines on the gateway's own DoIP address,
+- acts as **in-vehicle key master**: generates the SecOC keys it shares with
+  the CAN ECUs and distributes them with the same SHE protocol over ISO-TP
+  (section 7).
 
 ```
  Backend key server                 HPC central gateway                         ECUs
@@ -41,6 +44,7 @@ The key manager of the gateway (`ccg_keym`):
 | KEY_3 (0x6) | K_VCU_GW | VCU → gateway (PT_CAN) | MASTER_ECU_KEY or KEY_3 |
 | KEY_4 (0x7) | K_GW_CHS | gateway → chassis (CHS_CAN) | MASTER_ECU_KEY or KEY_4 |
 | KEY_5 (0x8) | K_FV_MASTER | FV synchronisation messages | MASTER_ECU_KEY or KEY_5 |
+| KEY_10 (0xD) | K_KEY_MASTER | vehicle key master secret (section 7); a cipher key, never usable as MAC key | MASTER_ECU_KEY or KEY_10 |
 
 Every stored key has a **28-bit update counter** (its generation) and the SHE
 protection flags:
@@ -127,8 +131,11 @@ answers on the gateway's own logical address (0x1001).
 |---------|----------|-------|
 | `22 F2 A0` | `62 F2 A0 n {slot, state, counter (4), pending counter (4)}` | any session; state bits: 01 active, 02 pending, 04 previous, 08 write-protected, 10 MAC key |
 | `31 01 F2 00 M1 M2 M3` (68 bytes) | `71 01 F2 00 <SHE error code> [M4 M5]` | extended session, physical only |
-| `31 01 F2 01` | `71 01 F2 01 <number of keys activated>` | NRC 0x24 if nothing is pending |
-| `31 01 F2 02` | `71 01 F2 02 <number of keys discarded>` | NRC 0x24 if nothing is pending |
+| `22 F2 A1` | `62 F2 A1 <SHE UID, 15 bytes>` | any session; needed to address an update container |
+| `31 01 F2 01 [slot ..]` | `71 01 F2 01 <number of keys activated>` | all pending keys or only the listed slots; NRC 0x24 if none is pending |
+| `31 01 F2 02 [slot ..]` | `71 01 F2 02 <number of keys discarded>` | as above |
+| `31 01 F2 10 [group ..]` | `71 01 F2 10 00` | key master: start a campaign (section 7) |
+| `31 03 F2 10` | `71 03 F2 10 <state> <n> {result, generation (4), ECU (2), SHE error}` | key master: results |
 
 Negative responses: 0x7F wrong session, 0x13 length, 0x12 sub-function (only
 startRoutine), 0x31 unknown routine, 0x37 lockout (3 authentication failures
@@ -152,10 +159,78 @@ code), `UPDATE_LOCKED`, `KEY_ACTIVATED`, `PENDING_DISCARDED`,
 `PREVIOUS_KEY_EXPIRED`. MAC failures of SecOC PDUs remain SecOC security events
 of the Ethernet gateway.
 
-## 7. Bench processes
+## 7. In-vehicle key master (`keym::KeyMaster`)
+
+The gateway renews the SecOC keys it shares with CAN ECUs itself; the backend
+only triggers the campaign and reads its results.
+
+**ECU authorisation keys.** Each ECU's MASTER_ECU_KEY is derived from the
+vehicle key master secret (gateway KEY_10) and the ECU's SHE UID:
+
+```
+MASTER_ECU_KEY(ECU) = KDF(K_KEY_MASTER, UID | 'M')        KDF = AES-MP as in section 3
+```
+
+The plant provisions every ECU with its derived key (the backend knows the
+secret); the gateway derives it inside its HSM when it needs it. One ECU's
+key reveals nothing about the others.
+
+**Key groups** (`config/vehicle_key_master.cpp`): one SecOC key and every slot
+holding it.
+
+| # | Key | Gateway slot | ECU slots |
+|---|-----|--------------|-----------|
+| 0 | K_VCU_GW | KEY_3 | VCU 0x0010 KEY_1 |
+| 1 | K_GW_CHS | KEY_4 | EPS 0x0021 KEY_1 |
+| 2 | K_FV_MASTER | KEY_5 | VCU KEY_2, EPS KEY_2, BCM 0x0030 KEY_1 |
+
+The ADAS keys stay with the backend (DoIP-native ECU on Ethernet).
+
+**Campaign** (started with `31 01 F210 [group ..]` or `KeyMaster::start`):
+
+```
+1 prepare    per ECU   10 03, 22 F2A1 (UID), 22 F2A0 (stored generations)
+2 load       per group new key from the HSM RNG, generation = newest generation of any member + 1,
+                       staged in the gateway HSM (stageInternal);
+             per member 10 03, 31 01 F200 M1 M2 M3 (authorised by the derived MASTER_ECU_KEY),
+                       M4/M5 checked against the expected proof
+3 activate   per ECU   10 03, 31 01 F201 <slots of complete groups>, 31 01 F202 <slots of failed groups>
+             gateway   activate complete groups, discard failed ones (last, see below)
+```
+
+- **Atomic per group**: a key is activated only when every member proved
+  (M4/M5) that it stores it. A failed member (no response, negative response,
+  SHE error, wrong proof) fails the group, and the members that already hold
+  the key discard it. Other groups go ahead.
+- **Activation order**: ECUs first, the gateway last. During the switch,
+  receivers accept the pending and the previous key (section 4), so no PDU is
+  lost whichever side switches first. If an ECU does not confirm the
+  activation, the group is reported `ACTIVATION_FAILED` but the gateway still
+  activates. The ECU keeps verifying with its pending key, and the next
+  campaign replaces it.
+- **Results** per group: `ACTIVATED`, `ECU_UNREACHABLE`, `ECU_REFUSED`,
+  `KEY_REJECTED` (with the ECU's SHE error code), `PROOF_MISMATCH`,
+  `GATEWAY_KEY_ERROR`, `ACTIVATION_FAILED`, `NOT_RUN`; plus the generation and
+  the ECU that failed. A failed group simply runs again in a later campaign
+  (e.g. at the next ignition when the ECU is powered).
+- **Diagnostic client**: the requests use the gateway's own ISO-TP channels
+  (`diag::IDiagClient`, implemented by `DiagGateway`). While the key master
+  talks to an ECU, tester requests to that ECU are refused with a diagnostic
+  NACK. P2 is 1 s, and 5.5 s after NRC 0x78.
+- **Key generation**: `keym::IRandom`. The Linux process uses `getrandom()`
+  (`platform::SystemRandom`) and the target uses the HSM TRNG.
+  `DeterministicRandom` is for tests and simulation only.
+
+```
+ccg_key_master_sim   # EPS unpowered: K_VCU_GW renewed, EPS groups discarded everywhere;
+                     # EPS powered: remaining groups renewed; SecOC and FV sync never break
+```
+
+## 8. Bench processes
 
 ```
 # diagnostic gateway owns the key store (first start: --demo-keys provisions TEST keys)
+# and runs the key master (31 01 F210); new gateway keys reach ccg_eth_gateway via the store
 ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
                  --key-store /var/lib/ccg/keys --demo-keys
 
@@ -167,6 +242,7 @@ ccg_key_tool --uid 000000000000004343470000000001 --slot 6 --auth-slot 1 \
              --auth-key <MASTER_ECU_KEY> --key <new key> --counter 2 [--check <response>]
 
 ccg_keym_sim      # forged and replayed containers, update, activation, rollover, retired key
+ccg_key_master_sim  # gateway as key master distributing keys to VCU, EPS, BCM
 ```
 
 Key store file (mode 0600, written to a temporary file, `fsync`ed, renamed):
@@ -177,16 +253,17 @@ pending  <slot> <counter> <flags hex> <key hex>
 previous <slot> <counter> <flags hex> <key hex> <remaining grace period ms>
 ```
 
-## 8. Limitations / next steps
+## 9. Limitations / next steps
 
 - On the target the key slots, SHE protocol and counters live in the HSM
   (keys never in application memory); the software key manager and the
   key store file are the bench stand-in. Production (EOL) provisioning of
   MASTER_ECU_KEY is a plant process; `provision()` models it.
-- The gateway is a key *receiver*. Distributing keys to the CAN ECUs (gateway
-  as in-vehicle key master, deriving and pushing SecOC keys with SHE updates
-  over ISO-TP) is not implemented; the backend updates each ECU through the
-  diagnostic routing.
+- Key master: the campaign runs the ECUs one after the other (one request in
+  flight), and its results are not persisted across a restart. Generation
+  numbers of discarded (never activated) keys can be used again by the next
+  campaign. The key master does not unlock ECUs with SecurityAccess, because
+  the SHE container is the authorisation.
 - No key validity period / automatic renewal schedule; the backend decides when
   to renew.
 - The two Linux processes share the key store through a file (single writer:

@@ -13,9 +13,10 @@
 //
 //   31 01 F2 00 <M1 M2 M3>  load key (SHE memory update protocol)
 //                           -> 71 01 F2 00 <SHE error code> [<M4 M5>]
-//   31 01 F2 01             activate pending keys -> 71 01 F2 01 <count>
-//   31 01 F2 02             discard pending keys  -> 71 01 F2 02 <count>
+//   31 01 F2 01 [slot ..]   activate pending keys (all, or the listed slots) -> 71 01 F2 01 <count>
+//   31 01 F2 02 [slot ..]   discard pending keys  (all, or the listed slots) -> 71 01 F2 02 <count>
 //   22 F2 A0                key status: <n> { slot, state, counter (4), pending counter (4) }
+//   22 F2 A1                SHE UID (15 bytes), needed to address an update container
 //
 // The routines need the extended session and a physical request. Their
 // authorisation is the SHE protocol itself (M3, made with MASTER_ECU_KEY by the
@@ -30,6 +31,7 @@ inline constexpr std::uint16_t kRidLoadKey = 0xF200;
 inline constexpr std::uint16_t kRidActivateKeys = 0xF201;
 inline constexpr std::uint16_t kRidDiscardKeys = 0xF202;
 inline constexpr std::uint16_t kDidKeyStatus = 0xF2A0;
+inline constexpr std::uint16_t kDidUid = 0xF2A1;
 
 // key status byte
 inline constexpr std::uint8_t kStatusActive = 0x01;

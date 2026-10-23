@@ -45,10 +45,18 @@ struct KeyManagerConfig {
     std::chrono::milliseconds gracePeriod{std::chrono::minutes(10)};  // previous key still verified
     std::uint8_t maxFailedAttempts = 3;                       // then key updates are locked
     std::chrono::milliseconds lockoutTime{std::chrono::seconds(10)};
+    // Key master: slot holding the vehicle key master secret from which the
+    // ECUs' MASTER_ECU_KEYs are derived (0 = this device is no key master).
+    std::uint8_t keyMasterSlot = 0;
 };
 
 // Problems with the configuration (empty = valid).
 std::vector<std::string> validateKeyManagerConfig(const KeyManagerConfig& config);
+
+// MASTER_ECU_KEY of the ECU with `uid` under a vehicle key master secret:
+// KDF(secret, UID | 'M'). The plant provisions the ECUs with it; the key
+// master derives it inside the HSM.
+crypto::Block deriveEcuMasterKey(const crypto::Block& keyMasterSecret, const she::Uid& uid);
 
 struct KeyEvent {
     enum class Kind : std::uint8_t {
@@ -88,10 +96,20 @@ public:
     LoadResult loadKey(const she::UpdateRequest& request, TimePoint now);
     bool lockedOut(TimePoint now) const { return lockedUntil_ && now < *lockedUntil_; }
 
-    // Switches every pending key to active. Returns the number of keys switched.
-    std::size_t activatePending(TimePoint now);
-    std::size_t discardPending(TimePoint now);
-    bool hasPending() const;
+    // Switches pending keys to active (all slots, or only `slots`). Returns
+    // the number of keys switched.
+    std::size_t activatePending(TimePoint now, const std::vector<std::uint8_t>& slots = {});
+    std::size_t discardPending(TimePoint now, const std::vector<std::uint8_t>& slots = {});
+    bool hasPending(const std::vector<std::uint8_t>& slots = {}) const;
+
+    // --- key master (HSM-internal operations, the keys never leave the HSM)
+    // MASTER_ECU_KEY of the ECU with `uid`: KDF(key master secret, UID | 'M').
+    // nullopt if this device has no key master secret.
+    std::optional<crypto::Block> deriveEcuMasterKey(const she::Uid& uid) const;
+    // Stores a key generated inside the HSM like a SHE update (write
+    // protection, anti-rollback, staging), without the M1..M3 container.
+    she::ErrorCode stageInternal(std::uint8_t slot, const crypto::Block& key, std::uint32_t counter,
+                                 const she::Flags& flags, TimePoint now);
 
     // Expires previous keys after the grace period.
     void mainFunction(TimePoint now);
@@ -160,6 +178,9 @@ private:
     const Slot* findSlot(std::uint8_t slot) const;
     const Slot* findKey(const std::string& keyId) const;
     LoadResult reject(std::uint8_t slot, she::ErrorCode error, TimePoint now);
+    // Installs a new generation: staged as pending or active at once. Returns true if staged.
+    bool install(Slot& slot, const she::UpdatePayload& payload, TimePoint now);
+    static bool selected(const Slot& slot, const std::vector<std::uint8_t>& slots);
     void log(KeyEvent::Kind kind, std::uint8_t slot, std::uint32_t counter, she::ErrorCode error, TimePoint now);
 
     KeyManagerConfig config_;

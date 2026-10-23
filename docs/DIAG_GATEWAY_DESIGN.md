@@ -184,6 +184,12 @@ ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
 - **CAN filters:** the kernel filters only pass the ECUs' response IDs.
 - **Simulation:** `ccg_diag_sim` replays a scripted tester session against
   simulated UDS ECUs (`sim/uds_ecu.*`) in virtual time.
+- **Internal diagnostic client:** `DiagGateway` also implements
+  `diag::IDiagClient`. Gateway functions such as the SecOC key master send
+  their own UDS requests to an ECU over its ISO-TP channel. The client waits
+  for the final response (NRC 0x78 extends P2 to P2*) and reports busy,
+  unknown target, transport error or timeout. While such a request is open,
+  tester requests to the same ECU get NACK 0x08.
 
 ## 8. Limitations / next steps
 

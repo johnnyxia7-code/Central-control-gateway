@@ -23,27 +23,32 @@ std::optional<std::vector<std::uint8_t>> KeyManagementService::handle(
     const std::vector<std::uint8_t>& request, const diag::LocalRequestContext& context) {
     if (request.empty()) return std::nullopt;
     if (request[0] == kSidRead) {
-        if (request.size() != 3 || ((request[1] << 8) | request[2]) != uds::kDidKeyStatus) return std::nullopt;
-        return keyStatus();
+        if (request.size() != 3) return std::nullopt;
+        const auto did = static_cast<std::uint16_t>((request[1] << 8) | request[2]);
+        if (did == uds::kDidKeyStatus) return keyStatus();
+        if (did == uds::kDidUid) {
+            std::vector<std::uint8_t> out = {0x62, request[1], request[2]};
+            out.insert(out.end(), keys_.config().uid.begin(), keys_.config().uid.end());
+            return out;
+        }
+        return std::nullopt;
     }
-    if (request[0] == kSidRoutine && !context.functional) {
-        return routineControl(request, context);
+    if (request[0] == kSidRoutine && !context.functional && request.size() >= 4) {
+        const auto rid = static_cast<std::uint16_t>((request[2] << 8) | request[3]);
+        if (rid == uds::kRidLoadKey || rid == uds::kRidActivateKeys || rid == uds::kRidDiscardKeys) {
+            return routineControl(request, context);
+        }
     }
-    return std::nullopt;
+    return std::nullopt;  // other routines: further handlers or the built-in server
 }
 
 std::optional<std::vector<std::uint8_t>> KeyManagementService::routineControl(
     const std::vector<std::uint8_t>& request, const diag::LocalRequestContext& context) {
-    // NRC order of ISO 14229-1: session, length, sub-function, routine ID.
     if (context.session != kExtendedSession) return nrc(kSidRoutine, 0x7F);
-    if (request.size() < 4) return nrc(kSidRoutine, 0x13);
     const std::uint8_t sub = request[1] & 0x7F;
     const bool suppress = request[1] & 0x80;
     const auto rid = static_cast<std::uint16_t>((request[2] << 8) | request[3]);
     if (sub != 0x01) return nrc(kSidRoutine, 0x12);  // only startRoutine
-    if (rid != uds::kRidLoadKey && rid != uds::kRidActivateKeys && rid != uds::kRidDiscardKeys) {
-        return nrc(kSidRoutine, 0x31);  // requestOutOfRange
-    }
 
     std::vector<std::uint8_t> out = {0x71, 0x01, request[2], request[3]};
     switch (rid) {
@@ -66,10 +71,10 @@ std::optional<std::vector<std::uint8_t>> KeyManagementService::routineControl(
         }
         case uds::kRidActivateKeys:
         case uds::kRidDiscardKeys: {
-            if (request.size() != 4) return nrc(kSidRoutine, 0x13);
-            if (!keys_.hasPending()) return nrc(kSidRoutine, 0x24);  // requestSequenceError
-            const std::size_t n = rid == uds::kRidActivateKeys ? keys_.activatePending(context.now)
-                                                               : keys_.discardPending(context.now);
+            const std::vector<std::uint8_t> slots(request.begin() + 4, request.end());
+            if (!keys_.hasPending(slots)) return nrc(kSidRoutine, 0x24);  // requestSequenceError
+            const std::size_t n = rid == uds::kRidActivateKeys ? keys_.activatePending(context.now, slots)
+                                                               : keys_.discardPending(context.now, slots);
             if (!persisted()) return nrc(kSidRoutine, 0x72);
             if (suppress) return std::vector<std::uint8_t>{};
             out.push_back(static_cast<std::uint8_t>(n));

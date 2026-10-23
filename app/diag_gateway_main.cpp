@@ -6,7 +6,9 @@
 //
 // With --key-store the gateway's own diagnostic address also serves the SecOC
 // key management routines (SHE key update, activation, key status); the file
-// is the gateway's key store and is followed by ccg_eth_gateway.
+// is the gateway's key store and is followed by ccg_eth_gateway. The gateway
+// is also the in-vehicle key master: RoutineControl 31 01 F210 distributes new
+// SecOC keys to the ECUs (31 03 F210: results).
 #include <poll.h>
 
 #include <algorithm>
@@ -21,10 +23,13 @@
 
 #include "ccg/diag/diag_gateway.hpp"
 #include "ccg/keym/key_management_service.hpp"
+#include "ccg/keym/key_master.hpp"
 #include "doip_sockets.hpp"
 #include "key_store.hpp"
 #include "socketcan_transport.hpp"
+#include "system_random.hpp"
 #include "vehicle_diag_routing.hpp"
+#include "vehicle_key_master.hpp"
 #include "vehicle_key_slots.hpp"
 
 namespace {
@@ -146,6 +151,8 @@ int main(int argc, char** argv) {
         // SecOC key management; the key store file stands in for the HSM key NvM.
         std::unique_ptr<keym::KeyManager> keys;
         std::unique_ptr<keym::KeyManagementService> keyService;
+        platform::SystemRandom random;
+        std::unique_ptr<keym::KeyMaster> keyMaster;
         std::uint64_t keyEventsSeen = 0;
         auto saveKeys = [&] { return platform::saveKeyStore(keyStore, keys->snapshot(diag::Clock::now())); };
         if (!keyStore.empty()) {
@@ -164,6 +171,9 @@ int main(int argc, char** argv) {
             keyEventsSeen = keys->eventCount();
             keyService = std::make_unique<keym::KeyManagementService>(*keys, saveKeys);
             gateway.addLocalService(*keyService);
+            keyMaster = std::make_unique<keym::KeyMaster>(config::makeVehicleKeyMaster(), *keys, gateway, random);
+            keyMaster->setTrace([](const std::string& t) { std::cout << "[keym] " << t << "\n"; });
+            gateway.addLocalService(*keyMaster);
         }
         gateway.start(now);
         std::cout << "[diag] DoIP entity listening on TCP/UDP " << port << "\n";
@@ -211,6 +221,7 @@ int main(int argc, char** argv) {
             if (now >= nextTick) {
                 gateway.mainFunction(now);
                 if (keys) {
+                    keyMaster->mainFunction(now);
                     keys->mainFunction(now);  // previous keys expire after the grace period
                     if (keys->takePersistRequest() && !saveKeys()) {
                         std::cerr << "[diag] ERROR: cannot persist key store " << keyStore << "\n";

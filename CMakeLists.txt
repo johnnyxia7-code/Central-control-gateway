@@ -68,6 +68,7 @@ add_library(ccg_keym
   src/keym/she.cpp
   src/keym/key_manager.cpp
   src/keym/key_management_service.cpp
+  src/keym/key_master.cpp
 )
 target_include_directories(ccg_keym PUBLIC include)
 target_link_libraries(ccg_keym PUBLIC ccg_secoc ccg_diag)
@@ -79,15 +80,16 @@ add_library(ccg_vehicle_matrix
   config/vehicle_eth_gateway_matrix.cpp
   config/vehicle_diag_routing.cpp
   config/vehicle_key_slots.cpp
+  config/vehicle_key_master.cpp
 )
 target_include_directories(ccg_vehicle_matrix PUBLIC config)
 target_link_libraries(ccg_vehicle_matrix PUBLIC ccg_s2s ccg_ethgw ccg_diag ccg_keym)
 ccg_warnings(ccg_vehicle_matrix)
 
 # --- simulated ECUs for tests and bench simulations --------------------------
-add_library(ccg_sim sim/uds_ecu.cpp)
+add_library(ccg_sim sim/uds_ecu.cpp sim/ecu_key_store.cpp)
 target_include_directories(ccg_sim PUBLIC sim)
-target_link_libraries(ccg_sim PUBLIC ccg_diag)
+target_link_libraries(ccg_sim PUBLIC ccg_diag ccg_keym)
 ccg_warnings(ccg_sim)
 
 # --- bench simulation (virtual time, no hardware) ----------------------------
@@ -107,6 +109,10 @@ add_executable(ccg_keym_sim app/keym_sim_main.cpp)
 target_link_libraries(ccg_keym_sim PRIVATE ccg_vehicle_matrix)
 ccg_warnings(ccg_keym_sim)
 
+add_executable(ccg_key_master_sim app/key_master_sim_main.cpp)
+target_link_libraries(ccg_key_master_sim PRIVATE ccg_vehicle_matrix ccg_sim)
+ccg_warnings(ccg_key_master_sim)
+
 # --- backend key server tool (builds SHE M1..M3, checks M4/M5) ---------------
 add_executable(ccg_key_tool app/key_tool_main.cpp)
 target_link_libraries(ccg_key_tool PRIVATE ccg_keym)
@@ -121,6 +127,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     platform/linux/doip_sockets.cpp
     platform/linux/secoc_storage.cpp
     platform/linux/key_store.cpp
+    platform/linux/system_random.cpp
   )
   target_include_directories(ccg_platform_linux PUBLIC platform/linux)
   target_link_libraries(ccg_platform_linux PUBLIC ccg_s2s ccg_diag ccg_secoc ccg_keym)
@@ -159,6 +166,7 @@ if(CCG_BUILD_TESTS)
     tests/test_fv_sync.cpp
     tests/test_she.cpp
     tests/test_key_manager.cpp
+    tests/test_key_master.cpp
   )
   target_link_libraries(ccg_tests PRIVATE ccg_vehicle_matrix ccg_sim ccg_secoc)
   if(TARGET ccg_platform_linux)

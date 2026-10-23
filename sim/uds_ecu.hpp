@@ -48,6 +48,7 @@ public:
     void mainFunction(TimePoint now);
 
     const Config& config() const { return cfg_; }
+    TimePoint now() const { return now_; }  // time of the request being handled
     const std::vector<std::vector<std::uint8_t>>& requests() const { return requests_; }
 
     // Default behaviour: 0x10, 0x3E, 0x22 F187/F190, 0x31 with response pending,

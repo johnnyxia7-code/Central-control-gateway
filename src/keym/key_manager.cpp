@@ -61,6 +61,9 @@ std::vector<std::string> validateKeyManagerConfig(const KeyManagerConfig& c) {
         else if (!ids.insert(s.keyId).second) errors.push_back(name + ": key ID '" + s.keyId + "' used twice");
     }
     if (!master) errors.push_back("MASTER_ECU_KEY slot missing (authorises key updates)");
+    if (c.keyMasterSlot != 0 && !slots.count(c.keyMasterSlot)) {
+        errors.push_back("key master slot " + slotName(c.keyMasterSlot) + " not configured");
+    }
     return errors;
 }
 
@@ -168,34 +171,71 @@ KeyManager::LoadResult KeyManager::loadKey(const she::UpdateRequest& request, Ti
 
     LoadResult r;
     r.error = she::ErrorCode::NoError;
-    const bool secocKey = !target->config.keyId.empty();
-    if (target->active && target->config.staged) {
-        target->pending.emplace(payload.key, payload.counter, payload.flags);
-        r.staged = true;
-        log(KeyEvent::Kind::KeyStaged, slotId, payload.counter, she::ErrorCode::NoError, now);
-    } else {
-        if (target->active && secocKey && config_.gracePeriod.count() > 0) {
-            target->previous = target->active;
-            target->previousExpiry = now + config_.gracePeriod;
-        }
-        target->active.emplace(payload.key, payload.counter, payload.flags);
-        target->pending.reset();
-        log(KeyEvent::Kind::KeyLoaded, slotId, payload.counter, she::ErrorCode::NoError, now);
-    }
+    r.staged = install(*target, payload, now);
     // M4 carries the real UID, also for a wildcard update.
     r.proof = she::buildProof(config_.uid, slotId, authId, payload.key, payload.counter);
     persistRequest_ = true;
     return r;
 }
 
-bool KeyManager::hasPending() const {
-    return std::any_of(slots_.begin(), slots_.end(), [](const Slot& s) { return s.pending.has_value(); });
+bool KeyManager::install(Slot& target, const she::UpdatePayload& payload, TimePoint now) {
+    const bool secocKey = !target.config.keyId.empty();
+    if (target.active && target.config.staged) {
+        target.pending.emplace(payload.key, payload.counter, payload.flags);
+        log(KeyEvent::Kind::KeyStaged, target.config.slot, payload.counter, she::ErrorCode::NoError, now);
+        persistRequest_ = true;
+        return true;
+    }
+    if (target.active && secocKey && config_.gracePeriod.count() > 0) {
+        target.previous = target.active;
+        target.previousExpiry = now + config_.gracePeriod;
+    }
+    target.active.emplace(payload.key, payload.counter, payload.flags);
+    target.pending.reset();
+    log(KeyEvent::Kind::KeyLoaded, target.config.slot, payload.counter, she::ErrorCode::NoError, now);
+    persistRequest_ = true;
+    return false;
 }
 
-std::size_t KeyManager::activatePending(TimePoint now) {
+bool KeyManager::selected(const Slot& slot, const std::vector<std::uint8_t>& slots) {
+    return slots.empty() || std::find(slots.begin(), slots.end(), slot.config.slot) != slots.end();
+}
+
+bool KeyManager::hasPending(const std::vector<std::uint8_t>& slots) const {
+    return std::any_of(slots_.begin(), slots_.end(),
+                       [&](const Slot& s) { return s.pending.has_value() && selected(s, slots); });
+}
+
+crypto::Block deriveEcuMasterKey(const crypto::Block& keyMasterSecret, const she::Uid& uid) {
+    crypto::Block context{};
+    std::copy(uid.begin(), uid.end(), context.begin());
+    context[15] = 'M';
+    return crypto::deriveKey(keyMasterSecret, context);
+}
+
+std::optional<crypto::Block> KeyManager::deriveEcuMasterKey(const she::Uid& uid) const {
+    const Slot* s = config_.keyMasterSlot ? findSlot(config_.keyMasterSlot) : nullptr;
+    if (!s || !s->active) return std::nullopt;
+    return keym::deriveEcuMasterKey(s->active->value, uid);
+}
+
+she::ErrorCode KeyManager::stageInternal(std::uint8_t slot, const crypto::Block& key, std::uint32_t counter,
+                                         const she::Flags& flags, TimePoint now) {
+    Slot* target = findSlot(slot);
+    if (!target || slot == she::kMasterEcuKey || slot == config_.keyMasterSlot) return she::ErrorCode::KeyInvalid;
+    if (target->active && target->active->flags.writeProtection) return she::ErrorCode::KeyWriteProtected;
+    for (const auto* k : {&target->active, &target->pending}) {
+        if (*k && counter <= (*k)->counter) return she::ErrorCode::KeyUpdateError;
+    }
+    if (counter > she::kMaxCounter) return she::ErrorCode::KeyUpdateError;
+    install(*target, she::UpdatePayload{counter, flags, key}, now);
+    return she::ErrorCode::NoError;
+}
+
+std::size_t KeyManager::activatePending(TimePoint now, const std::vector<std::uint8_t>& slots) {
     std::size_t count = 0;
     for (auto& s : slots_) {
-        if (!s.pending) continue;
+        if (!s.pending || !selected(s, slots)) continue;
         if (s.active && !s.config.keyId.empty() && config_.gracePeriod.count() > 0) {
             s.previous = s.active;
             s.previousExpiry = now + config_.gracePeriod;
@@ -209,10 +249,10 @@ std::size_t KeyManager::activatePending(TimePoint now) {
     return count;
 }
 
-std::size_t KeyManager::discardPending(TimePoint now) {
+std::size_t KeyManager::discardPending(TimePoint now, const std::vector<std::uint8_t>& slots) {
     std::size_t count = 0;
     for (auto& s : slots_) {
-        if (!s.pending) continue;
+        if (!s.pending || !selected(s, slots)) continue;
         log(KeyEvent::Kind::PendingDiscarded, s.config.slot, s.pending->counter, she::ErrorCode::NoError, now);
         s.pending.reset();
         ++count;
@@ -255,7 +295,7 @@ std::vector<KeyManager::SlotStatus> KeyManager::status() const {
 
 bool KeyManager::hasKey(const std::string& keyId) const {
     const Slot* s = findKey(keyId);
-    return s && s->active && s->active->flags.keyUsage;
+    return s && s->config.slot != config_.keyMasterSlot && s->active && s->active->flags.keyUsage;
 }
 
 bool KeyManager::generateMac(const std::string& keyId, const std::uint8_t* data, std::size_t length,

@@ -151,7 +151,7 @@ TEST_CASE("keym: authentication failures, wrong UID and rollback are refused") {
     r = k.km.loadKey(k.update(ks::kVcuGw, keyOf(1), 2, macFlags(), ks::kGwChs, config::demoKey(4)), k.now);
     CHECK(r.error == she::ErrorCode::KeyInvalid);
     // slot not configured
-    r = k.km.loadKey(k.update(0xD, keyOf(1), 2), k.now);
+    r = k.km.loadKey(k.update(0xC, keyOf(1), 2), k.now);
     CHECK(r.error == she::ErrorCode::KeyInvalid);
 
     CHECK(!k.status(ks::kVcuGw).pending);
@@ -475,8 +475,8 @@ TEST_CASE("keym uds: SHE error codes, activation and key status") {
 
     auto status = f.request({0x22, 0xF2, 0xA0});
     REQUIRE(status.has_value());
-    REQUIRE(status->size() == 4 + 6 * 10);
-    CHECK_EQ((*status)[3], 6);
+    REQUIRE(status->size() == 4 + 7 * 10);
+    CHECK_EQ((*status)[3], 7);
     const std::size_t vcu = 4 + 3 * 10;  // MASTER, KEY_1, KEY_2, KEY_3
     CHECK_EQ((*status)[vcu], ks::kVcuGw);
     CHECK_EQ((*status)[vcu + 1], uds::kStatusActive | uds::kStatusPending | uds::kStatusMacKey);
