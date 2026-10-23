@@ -1,0 +1,4 @@
+# Vehicle HAL with the SOME/IP backend (android.hardware.automotive.vehicle-ccg-service):
+# a vsomeip client of ccg_someipd. All remote SOME/IP traffic goes through the
+# routing manager, so the HAL needs no network sockets of its own.
+typeattribute hal_vehicle_default someip_domain;

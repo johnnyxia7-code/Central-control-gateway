@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Interfaces EthernetService manages: only the user-facing one (eth0).
+         The vehicle network (eth1, ccg_someipd.rc) must not match. -->
+    <string translatable="false" name="config_ethernet_iface_regex">eth0</string>
+</resources>

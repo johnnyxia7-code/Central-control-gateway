@@ -1,0 +1,8 @@
+service vendor.vehicle-hal-ccg /vendor/bin/hw/android.hardware.automotive.vehicle-ccg-service
+    class early_hal
+    user vehicle_network
+    # system: access to /dev/socket/someip (vsomeip local communication with ccg_someipd)
+    group system inet
+    setenv VSOMEIP_CONFIGURATION /vendor/etc/vsomeip/ivi_vehicle.json
+    setenv VSOMEIP_APPLICATION_NAME ccg_vhal
+    setenv VSOMEIP_BASE_PATH /dev/socket/someip/

@@ -1,0 +1,7 @@
+// Keeps the vehicle network interface out of ConnectivityService / EthernetService,
+// so that ccg_someipd owns its address (no DHCP client, no netd network on it).
+runtime_resource_overlay {
+    name: "CcgIviConnectivityOverlay",
+    vendor: true,
+    sdk_version: "current",
+}

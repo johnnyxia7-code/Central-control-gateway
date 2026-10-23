@@ -12,6 +12,7 @@ Translates CAN signals into SOME/IP events/fields and SOME/IP method calls into 
 - On-change (with debounce), cyclic and mixed event transmission; fields with getter and initial event
 - Method → CAN with range check, all-or-nothing writes, burst repetitions, minimum delay time, pulse signals
 - SOME/IP return codes per specification
+- vsomeip binding with SOME/IP-SD (`ccg_s2s_gateway_vsomeip`)
 
 Design: [docs/S2S_DESIGN.md](docs/S2S_DESIGN.md)
 
@@ -70,6 +71,19 @@ Key slots of the gateway HSM and their renewal from the backend.
 
 Design: [docs/KEY_MANAGEMENT_DESIGN.md](docs/KEY_MANAGEMENT_DESIGN.md)
 
+## IVI controller (Android)
+
+COVESA vsomeip 3.7 ported to the Android IVI: the HPC services above become Vehicle HAL properties.
+
+- **vsomeip on Android**: patch (socket base path usable by `early_hal` services, vendor config path, Boost version), Boost 1.83 for `external/boost`, repo local manifest and setup script
+- **SOME/IP routing daemon** `ccg_someipd`: vsomeip routing manager that also brings the vehicle interface up, assigns its address and keeps the SOME/IP-SD multicast route Android lacks (without it vsomeip never starts SD)
+- **Vehicle HAL**: `IVehicleHardware` backend for the AOSP `DefaultVehicleHal`: speed, steering angle, doors, central lock, trunk, battery, HVAC with status mapping (`VALID` → AVAILABLE, `TIMEOUT` → UNAVAILABLE, `INVALID` / `E2E_ERROR` → ERROR)
+- **Portable IVI client** (`ivi/`): typed codec, service availability, request supervision, field refresh by getter; unit tested against the real S2S gateway
+- SELinux policy, init scripts, Ethernet overlay, product makefiles
+- Two-ECU test in network namespaces (`tools/ivi_hpc_netns_test.sh`)
+
+Design: [docs/IVI_ANDROID_VSOMEIP.md](docs/IVI_ANDROID_VSOMEIP.md)
+
 All functions check their configuration at start-up and come with a Linux
 process and a deterministic virtual-time simulator.
 
@@ -82,6 +96,15 @@ ctest --test-dir build --output-on-failure    # or ./build/ccg_tests [filter]
 ```
 
 Requirements: C++17 compiler (GCC ≥ 9 / Clang ≥ 10), CMake ≥ 3.16. Optional: OpenSSL 3 for DoIP over TLS (and a test cross-check of the AES-CMAC); everything else has no third-party dependencies.
+
+Optional vsomeip targets (`ccg_s2s_gateway_vsomeip`, `ccg_hpc_vsomeip_bench`, `ccg_someipd`,
+`ccg_ivi_vehicle_client`) are built when vsomeip 3 is found
+(`-DCMAKE_PREFIX_PATH=<vsomeip install>`, `-DCCG_WITH_VSOMEIP=ON|OFF|AUTO`).
+Two-ECU test of the IVI against the HPC in network namespaces (root):
+
+```sh
+sudo tools/ivi_hpc_netns_test.sh build <vsomeip install>/lib
+```
 
 ## Run
 
@@ -117,15 +140,30 @@ sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
     --auth-key <MASTER_ECU_KEY> --key <new key> --counter 2      # backend: M1..M3, expected M4/M5
 ```
 
+With vsomeip and SOME/IP-SD instead of static subscribers:
+
+```sh
+VSOMEIP_CONFIGURATION=config/vsomeip/hpc_s2s_gateway.json ./build/ccg_s2s_gateway_vsomeip --can vcan0
+```
+
+Android IVI: see [docs/IVI_ANDROID_VSOMEIP.md](docs/IVI_ANDROID_VSOMEIP.md) §4 (AOSP integration).
+
 ## Layout
 
 ```
-include/ccg/   public headers (can, e2e, someip, s2s, ethgw, isotp, doip, diag, crypto, secoc, keym)
-src/           portable core libraries (ccg_s2s, ccg_ethgw, ccg_diag, ccg_secoc, ccg_keym)
-config/        reference S2S matrix, Ethernet routing table, diagnostic routing table, key slots
-platform/linux SocketCAN, UDP, SOME/IP-over-UDP and DoIP sockets, SecOC key file / key store / freshness store
-sim/           simulated UDS ECU for tests and the diagnostic simulator
-app/           gateway processes and simulators
-tests/         unit and integration tests
-docs/          design descriptions
+include/ccg/      public headers (can, e2e, someip, s2s, ethgw, isotp, doip, diag, crypto, secoc, keym)
+src/              portable core libraries (ccg_s2s, ccg_ethgw, ccg_diag, ccg_secoc, ccg_keym)
+config/           reference S2S matrix, Ethernet routing table, diagnostic routing table, key slots,
+                  vsomeip configurations (HPC, IVI)
+ivi/              IVI client of the HPC services and VHAL property mapping (ccg_ivi)
+platform/linux    SocketCAN, UDP, SOME/IP-over-UDP and DoIP sockets, SecOC key file / key store /
+                  freshness store, vehicle network setup (netlink)
+platform/vsomeip  vsomeip bindings: HPC server binding, IVI client transport
+sim/              simulated UDS ECU for tests and the diagnostic simulator
+app/              gateway processes, simulators, HPC vsomeip bench, IVI routing daemon and client
+android/          AOSP integration: vsomeip patch, Boost, VHAL, init, SELinux, product
+Android.bp        Soong modules of the IVI side
+tests/            unit and integration tests
+tools/            two-ECU integration test (network namespaces)
+docs/             design descriptions
 ```

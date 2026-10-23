@@ -189,14 +189,23 @@ ccg_s2s_gateway --can can0 [--fd] --port 30490 --subscriber 10.0.0.20:30501 [--p
 - Multiple SOME/IP messages per UDP datagram are handled.
 - Static service discovery: every `--subscriber` is subscribed to all eventgroups and receives initial field values at start.
 
-For production the `platform/linux` adapters are replaced by the series stack
-behind the same interfaces: `ISomeIpBinding` → vsomeip / ara::com binding
-(SOME/IP-SD offer & subscription handling calls `offerService` / `onSubscribe`),
-`ICanTransmitter` → CanIf / SocketCAN with a TX queue.
+`ccg_s2s_gateway_vsomeip` uses vsomeip instead (`platform/vsomeip/VsomeipServerBinding`,
+configuration `config/vsomeip/hpc_s2s_gateway.json`): services are offered with
+SOME/IP-SD, subscriptions call `onSubscribe` (initial field values via `notify_one`),
+and requests / subscriptions are handed from the vsomeip threads to the gateway
+executor through an eventfd. Events are offered with `update_on_change = true` and
+notified with `force`, because the gateway does its own timing (vsomeip would
+otherwise send only on its own cycle). `ccg_hpc_vsomeip_bench` runs the same with
+simulated ECUs instead of SocketCAN. The consumer on the Android IVI is described in
+[IVI_ANDROID_VSOMEIP.md](IVI_ANDROID_VSOMEIP.md).
+
+For other stacks the adapters are replaced behind the same interfaces:
+`ISomeIpBinding` → ara::com binding, `ICanTransmitter` → CanIf / SocketCAN with a TX queue.
 
 ## 8. Limitations / next steps
 
-- SOME/IP-SD, SOME/IP-TP (segmentation > 1400 bytes) and TCP are delegated to the binding.
+- SOME/IP-SD, SOME/IP-TP (segmentation > 1400 bytes) and TCP are delegated to the binding
+  (static SD in the UDP binding, full SD with vsomeip).
 - E2E is Profile-1 style for CAN; SOME/IP-side E2E (Profile 4/7) is not applied.
 - Arrays, structs and strings are not used as service element types (flat basic types only).
 - The matrix is hand written; in a series project it is generated from DBC/ARXML and FIDL/ARXML.

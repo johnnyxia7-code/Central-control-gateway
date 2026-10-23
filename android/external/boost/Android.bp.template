@@ -1,0 +1,79 @@
+// Boost 1.83 for vsomeip on Android (installed into external/boost by fetch_boost.sh).
+//
+// Provides the module names the vsomeip Android.bp links against. Everything
+// else vsomeip uses (Asio, ICL, Property Tree, Stacktrace, ...) is header only.
+
+package {
+    default_applicable_licenses: ["external_boost_license"],
+}
+
+license {
+    name: "external_boost_license",
+    visibility: [":__subpackages__"],
+    license_kinds: ["SPDX-license-identifier-BSL-1.0"],
+    license_text: ["LICENSE_1_0.txt"],
+}
+
+cc_defaults {
+    name: "boost_defaults",
+    vendor_available: true,
+    host_supported: true,
+    export_include_dirs: ["."],
+    rtti: true,
+    cppflags: [
+        "-fexceptions",
+        "-Wno-unused-parameter",
+        "-Wno-deprecated-declarations",
+    ],
+    cflags: [
+        // Only the shared libraries below are built; do not auto-link (MSVC only, harmless elsewhere).
+        "-DBOOST_ALL_NO_LIB",
+        "-DBOOST_ALL_DYN_LINK",
+    ],
+}
+
+cc_library_headers {
+    name: "boost_headers",
+    vendor_available: true,
+    host_supported: true,
+    export_include_dirs: ["."],
+}
+
+// Header only since Boost 1.69; the library remains for link compatibility.
+cc_library_shared {
+    name: "libboost_system",
+    defaults: ["boost_defaults"],
+    srcs: ["libs/system/src/error_code.cpp"],
+}
+
+cc_library_shared {
+    name: "libboost_filesystem",
+    defaults: ["boost_defaults"],
+    srcs: [
+        "libs/filesystem/src/codecvt_error_category.cpp",
+        "libs/filesystem/src/directory.cpp",
+        "libs/filesystem/src/exception.cpp",
+        "libs/filesystem/src/operations.cpp",
+        "libs/filesystem/src/path.cpp",
+        "libs/filesystem/src/path_traits.cpp",
+        "libs/filesystem/src/portability.cpp",
+        "libs/filesystem/src/unique_path.cpp",
+        "libs/filesystem/src/utf8_codecvt_facet.cpp",
+    ],
+    local_include_dirs: ["libs/filesystem/src"],
+    cflags: [
+        "-DBOOST_FILESYSTEM_SOURCE",
+        // Results of the configuration probes b2 / CMake run (libs/filesystem/config),
+        // valid for bionic and glibc. statx() is left out on purpose: bionic only
+        // has it from API 30 and plain fstatat() is sufficient for vsomeip.
+        "-DBOOST_FILESYSTEM_HAS_INIT_PRIORITY",
+        "-DBOOST_FILESYSTEM_NO_CXX20_ATOMIC_REF",
+        "-DBOOST_FILESYSTEM_HAS_STAT_ST_BLKSIZE",
+        "-DBOOST_FILESYSTEM_HAS_STAT_ST_MTIM",
+        "-DBOOST_FILESYSTEM_HAS_FDOPENDIR_NOFOLLOW",
+        "-DBOOST_FILESYSTEM_HAS_DIRENT_D_TYPE",
+        "-DBOOST_FILESYSTEM_HAS_POSIX_AT_APIS",
+    ],
+    shared_libs: ["libboost_system"],
+    export_shared_lib_headers: ["libboost_system"],
+}

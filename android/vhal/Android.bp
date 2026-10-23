@@ -1,0 +1,42 @@
+// Vehicle HAL service of the IVI: AOSP DefaultVehicleHal + SOME/IP backend.
+// Replaces android.hardware.automotive.vehicle@V*-default-service (FakeVehicleHardware)
+// in PRODUCT_PACKAGES, see android/products/ccg_ivi.mk.
+
+cc_binary {
+    name: "android.hardware.automotive.vehicle-ccg-service",
+    vendor: true,
+    relative_install_path: "hw",
+    defaults: [
+        // Pull in the VHAL AIDL NDK version of the platform release.
+        "VehicleHalDefaults",
+        "android-automotive-large-parcelable-defaults",
+    ],
+    srcs: [
+        "SomeIpVehicleHardware.cpp",
+        "VehicleService.cpp",
+    ],
+    header_libs: ["IVehicleHardware"],
+    static_libs: [
+        "DefaultVehicleHal",
+        "VehicleHalUtils",
+        "libccg_vsomeip_client",
+        "libccg_ivi",
+    ],
+    shared_libs: [
+        "libbase",
+        "libbinder_ndk",
+        "liblog",
+        "libutils",
+        "libvsomeip3",
+    ],
+    cppflags: ["-fexceptions"],
+    rtti: true,
+    required: [
+        "ccg_someipd",
+        "ccg_vsomeip_ivi.json",
+        "libvsomeip_cfg",
+        "libvsomeip_sd",
+    ],
+    init_rc: ["vhal-ccg-service.rc"],
+    vintf_fragments: ["vhal-ccg-service.xml"],
+}

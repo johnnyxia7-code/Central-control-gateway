@@ -1,0 +1,19 @@
+# SOME/IP routing daemon of the IVI (vsomeip routing manager host).
+type ccg_someipd, domain;
+type ccg_someipd_exec, exec_type, vendor_file_type, file_type;
+
+init_daemon_domain(ccg_someipd)
+net_domain(ccg_someipd)
+typeattribute ccg_someipd someip_domain;
+
+# Vehicle network: link up, IPv4 address and the SOME/IP-SD multicast route
+# (init: capabilities NET_ADMIN), and vsomeip's netlink connector that watches
+# links, addresses and routes (RTM_GETLINK needs nlmsg_readpriv).
+allow ccg_someipd self:capability net_admin;
+allow ccg_someipd self:netlink_route_socket {
+    create_socket_perms_no_ioctl nlmsg_read nlmsg_readpriv nlmsg_write
+};
+
+# SOME/IP and SOME/IP-SD over UDP (unicast and multicast).
+allow ccg_someipd self:udp_socket { create_socket_perms_no_ioctl };
+allow ccg_someipd self:tcp_socket { create_stream_socket_perms };

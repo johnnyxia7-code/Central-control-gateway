@@ -1,0 +1,20 @@
+# SOME/IP routing daemon of the IVI controller (vsomeip routing manager host).
+#
+# Owns the vehicle network endpoints and SOME/IP-SD; the Vehicle HAL and any
+# other vsomeip application connect to it through /dev/socket/someip.
+# Adapt --net-if / --net-address to the board (vehicle Ethernet / VLAN that is
+# kept out of ConnectivityService, see docs/IVI_ANDROID_VSOMEIP.md).
+
+on early-init
+    # vsomeip base path (VSOMEIP_BASE_PATH): local sockets and lock files.
+    mkdir /dev/socket/someip 0770 system system
+
+service vendor.ccg.someipd /vendor/bin/ccg_someipd --app routingmanagerd --net-if eth1 --net-address 192.168.10.30/24
+    class early_hal
+    user system
+    group system inet
+    # Interface address, link state and the SD multicast route.
+    capabilities NET_ADMIN
+    setenv VSOMEIP_CONFIGURATION /vendor/etc/vsomeip/ivi_vehicle.json
+    setenv VSOMEIP_BASE_PATH /dev/socket/someip/
+    task_profiles ProcessCapacityHigh HighPerformance
