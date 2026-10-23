@@ -203,8 +203,8 @@ gateway uses towards its testers.
 Both TLS sides check revocation: tester certificates (`--tls-crl`) and ECU
 certificates (`--vehicle-crl`). A vehicle is often offline, so the gateway uses
 certificate revocation lists that the backend distributes with the PKI. It does
-not use OCSP (`platform::RevocationChecker`, used by `DoipTlsServer` and
-`DoipTcpConnector`).
+not query OCSP responders; stapled responses are covered in §3.9
+(`platform::RevocationChecker`, used by `DoipTlsServer` and `DoipTcpConnector`).
 
 | Topic | Behaviour |
 |-------|-----------|
@@ -228,6 +228,44 @@ printf '[ca]\ndefault_ca = CA\n[CA]\ndatabase = index.txt\ncrlnumber = crlnumber
 openssl ca -config ca.cnf -keyfile ca.key -cert ca.pem -revoke workshop-17.pem
 openssl ca -config ca.cnf -keyfile ca.key -cert ca.pem -gencrl -out testers.crl
 ```
+
+#### Delta CRLs (RFC 5280 §5.2.4)
+
+The backend can push small, frequent updates as delta CRLs
+(`--tls-delta-crl`, `--vehicle-delta-crl`) next to the complete CRLs, which then
+change rarely. The gateway applies the deltas itself and does not use OpenSSL's
+`X509_V_FLAG_USE_DELTAS`. OpenSSL only takes a delta that a Freshest CRL
+extension announces, and it silently drops an expired one, which would undo
+the revocations of an offline vehicle.
+
+| Topic | Behaviour |
+|-------|-----------|
+| Load checks | critical Delta CRL Indicator and CRL number; signed by its issuer, a CA of the trust file; a numbered complete CRL of the same issuer is loaded |
+| Delta not newer than the complete CRL | obsolete (the complete CRL already contains it): ignored and counted |
+| BaseCRLNumber newer than the loaded complete CRL | its changes cannot be applied: the load fails. At start-up the process does not start; at run time the previous CRLs and deltas stay in force |
+| Several deltas of one issuer | the newest one applies (deltas are cumulative) |
+| Serial listed in the delta | revoked, on top of the complete CRL |
+| Reason removeFromCRL | lifts a certificateHold of the complete CRL |
+| Delta past its nextUpdate | follows `--crl-reject-expired`. By default its revocations stay in force and the use is counted; with the option, certificates of that issuer are refused |
+| Wrong file | a complete CRL in the delta file, or a delta in the complete CRL file, is refused |
+| Updates | a change of either file reloads both. Sessions revoked by the new delta are closed, as for complete CRLs |
+
+Counters: `deltaCrls` (in force), `deltasObsolete`, `revokedByDelta`,
+`unrevokedByDelta`.
+
+The OpenSSL CLI cannot set the Delta CRL Indicator from a number, so the
+base CRL number goes in as DER. `crlnumber` is hex: the complete CRL above is
+number 0x1000, and the delta that follows gets 0x1001.
+
+```sh
+printf '[delta]\ndeltaCRL = critical,DER:02:02:10:00\n' >> ca.cnf   # INTEGER 0x1000 = base CRL
+openssl ca -config ca.cnf -keyfile ca.key -cert ca.pem -revoke workshop-23.pem
+openssl ca -config ca.cnf -keyfile ca.key -cert ca.pem -gencrl -crlexts delta -crlhours 6 -out testers-delta.crl
+```
+
+`openssl ca` lists every revocation of its database. A delta that repeats the
+complete CRL is still correct, just not small; the production PKI publishes
+only the changes since the base.
 
 ### 3.9 OCSP stapling
 
@@ -397,8 +435,11 @@ refuses the TLS options.
 
 ## 8. Limitations / next steps
 
-- TLS: revocation uses full CRLs and OCSP stapling. The gateway does not query
-  OCSP responders itself (it is offline), and does not use delta CRLs.
+- TLS: revocation uses complete and delta CRLs and OCSP stapling. The gateway
+  does not query OCSP responders itself (it is offline). It does not fetch
+  CRLs from distribution points or follow Freshest CRL pointers; the backend
+  delivers the files. Indirect CRLs (issued by another entity than the CA) are
+  not supported for deltas.
   Must-staple is enforced (§3.9). The tester's certificate grants one level ("verified"), with no roles
   from certificate attributes. There is no confirmation step in routing
   activation (0x05 and 0x11 are never sent).

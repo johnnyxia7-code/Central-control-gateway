@@ -72,7 +72,7 @@ DoipTlsServer::DoipTlsServer(std::uint16_t port, std::size_t maxConnections, con
                                nullptr);
         } else if (config.requireClientCertificate) {
             throw std::runtime_error("TLS: client certificates required but no tester CA given");
-        } else if (revocation_.enabled()) {
+        } else if (revocation_.enabled() || !config.crl.deltaCrlFile.empty()) {
             throw std::runtime_error("TLS: a CRL needs the tester CA");
         }
 

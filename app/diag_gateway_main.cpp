@@ -7,6 +7,7 @@
 //                     [--tls-require-client-cert] [--tls-only] [--tls-port 3496]]
 //                    [--vehicle-ca vehicle-ca.pem --vehicle-cert gw-vehicle.pem --vehicle-key gw-vehicle.key]
 //                    [--doip-plain] [--tls-crl testers.crl] [--vehicle-crl vehicle.crl]
+//                    [--tls-delta-crl testers-delta.crl] [--vehicle-delta-crl vehicle-delta.crl]
 //                    [--crl-optional] [--crl-reject-expired]
 //                    [--tls-ocsp gw.ocsp] [--vehicle-ocsp-require]
 //
@@ -23,6 +24,10 @@
 // sessions whose certificate has been revoked meanwhile are closed. Without a
 // CRL for an issuer the handshake fails (--crl-optional accepts it); an
 // outdated CRL is still used (--crl-reject-expired refuses it).
+// Delta CRLs (RFC 5280): --tls-delta-crl and --vehicle-delta-crl carry the
+// revocations since the complete CRL above; they are signature-checked,
+// applied on top of their base CRL and reloaded when they change. A delta for
+// a newer base CRL than the loaded one is refused (previous state kept).
 // OCSP stapling: --tls-ocsp is the OCSP response (DER) for the gateway's
 // tester-facing certificate, fetched by the backend; it is stapled for testers
 // that ask and reloaded when it changes. ECUs are asked for their staple; a
@@ -155,6 +160,7 @@ int main(int argc, char** argv) {
     std::string vehicleCa, vehicleCert, vehicleKey;
     bool doipPlain = false;
     std::string testerCrl, vehicleCrl;
+    std::string testerDeltaCrl, vehicleDeltaCrl;
     bool crlOptional = false;
     bool crlRejectExpired = false;
     std::string tlsOcsp;
@@ -214,6 +220,10 @@ int main(int argc, char** argv) {
                 testerCrl = value;
             } else if (arg == "--vehicle-crl") {
                 vehicleCrl = value;
+            } else if (arg == "--tls-delta-crl") {
+                testerDeltaCrl = value;
+            } else if (arg == "--vehicle-delta-crl") {
+                vehicleDeltaCrl = value;
             } else if (arg == "--vehicle-ca") {
                 vehicleCa = value;
             } else if (arg == "--vehicle-cert") {
@@ -237,6 +247,10 @@ int main(int argc, char** argv) {
         if (!testerCrl.empty() && tlsCa.empty()) throw std::invalid_argument("--tls-crl needs --tls-ca");
         if (!tlsOcsp.empty() && tlsCert.empty()) throw std::invalid_argument("--tls-ocsp needs --tls-cert");
         if (!vehicleCrl.empty() && vehicleCa.empty()) throw std::invalid_argument("--vehicle-crl needs --vehicle-ca");
+        if (!testerDeltaCrl.empty() && testerCrl.empty()) throw std::invalid_argument("--tls-delta-crl needs --tls-crl");
+        if (!vehicleDeltaCrl.empty() && vehicleCrl.empty()) {
+            throw std::invalid_argument("--vehicle-delta-crl needs --vehicle-crl");
+        }
         if ((tlsOnly || tlsRequireClientCert || !tlsCa.empty()) && tlsCert.empty()) {
             throw std::invalid_argument("TLS options need --tls-cert and --tls-key");
         }
@@ -249,7 +263,8 @@ int main(int argc, char** argv) {
                      " [--key-store FILE [--demo-keys]] [--doip ECU=IP:PORT]"
                      " [--tls-cert PEM --tls-key PEM [--tls-ca PEM] [--tls-require-client-cert] [--tls-only]"
                      " [--tls-port 3496]] [--vehicle-ca PEM [--vehicle-cert PEM --vehicle-key PEM]]"
-                     " [--doip-plain] [--tls-crl PEM] [--vehicle-crl PEM] [--crl-optional] [--crl-reject-expired]"
+                     " [--doip-plain] [--tls-crl PEM] [--vehicle-crl PEM] [--tls-delta-crl PEM]"
+                     " [--vehicle-delta-crl PEM] [--crl-optional] [--crl-reject-expired]"
                      " [--tls-ocsp DER] [--vehicle-ocsp-require]\n";
         return EXIT_FAILURE;
     }
@@ -273,7 +288,7 @@ int main(int argc, char** argv) {
             tc.privateKeyFile = tlsKey;
             tc.caFile = tlsCa;
             tc.requireClientCertificate = tlsRequireClientCert;
-            tc.crl = platform::CrlPolicy{testerCrl, !crlOptional, !crlRejectExpired};
+            tc.crl = platform::CrlPolicy{testerCrl, !crlOptional, !crlRejectExpired, testerDeltaCrl};
             tc.ocspResponseFile = tlsOcsp;
             tls = std::make_unique<platform::DoipTlsServer>(tlsPort, config.entity.maxTcpConnections, tc);
             transport.tls = tls.get();
@@ -282,6 +297,7 @@ int main(int argc, char** argv) {
                                                                     : ", client certificates verified")
                       << (tlsOnly ? ", plain TCP refused for routing activation" : "")
                       << (testerCrl.empty() ? "" : ", revocation: " + testerCrl)
+                      << (testerDeltaCrl.empty() ? "" : " + delta " + testerDeltaCrl)
                       << (tlsOcsp.empty() ? "" : ", OCSP staple: " + tlsOcsp)
                       << (tls->mustStaple() ? " (certificate is must-staple)" : "") << "\n";
         }
@@ -323,9 +339,12 @@ int main(int argc, char** argv) {
                                             "--vehicle-key), or --doip-plain on the bench");
             }
             doipConnector.enableTls(platform::TlsClientConfig{
-                vehicleCert, vehicleKey, vehicleCa, platform::CrlPolicy{vehicleCrl, !crlOptional, !crlRejectExpired},
+                vehicleCert, vehicleKey, vehicleCa, platform::CrlPolicy{vehicleCrl, !crlOptional, !crlRejectExpired, vehicleDeltaCrl},
                 platform::OcspPolicy{true, vehicleOcspRequire}});
-            if (!vehicleCrl.empty()) std::cout << "[diag] ECU certificate revocation: " << vehicleCrl << "\n";
+            if (!vehicleCrl.empty()) {
+                std::cout << "[diag] ECU certificate revocation: " << vehicleCrl
+                          << (vehicleDeltaCrl.empty() ? "" : " + delta " + vehicleDeltaCrl) << "\n";
+            }
         }
         diag::DoipClient doipClient(doipCfg, doipConnector);
         doipConnector.attach(doipClient);
@@ -369,6 +388,8 @@ int main(int argc, char** argv) {
         auto nextCrlCheck = now + std::chrono::seconds(5);
         platform::FileWatcher testerCrlWatch(testerCrl);
         platform::FileWatcher vehicleCrlWatch(vehicleCrl);
+        platform::FileWatcher testerDeltaWatch(testerDeltaCrl);
+        platform::FileWatcher vehicleDeltaWatch(vehicleDeltaCrl);
         platform::FileWatcher ocspWatch(tlsOcsp);
         std::vector<std::uint8_t> buffer;
         while (g_running) {
@@ -449,13 +470,17 @@ int main(int argc, char** argv) {
             if (now >= nextCrlCheck) {
                 nextCrlCheck = now + std::chrono::seconds(5);
 #ifdef CCG_HAVE_TLS
-                if (tls && !testerCrl.empty() && testerCrlWatch.changed()) {
+                // Both watchers are polled every time so that each change is seen once.
+                const bool testerBase = testerCrlWatch.changed();
+                const bool testerDelta = testerDeltaWatch.changed();
+                if (tls && !testerCrl.empty() && (testerBase || testerDelta)) {
                     const bool ok = tls->reloadCrl(gateway, now);
                     const auto& r = tls->revocation();
                     std::cout << "[diag] tester CRL " << (ok ? "reloaded" : "unusable - previous CRL kept")
-                              << " (revoked sessions closed " << r.sessionsClosed << ", handshakes refused revoked/"
-                              << "no CRL " << r.revokedRejected << "/" << r.missingCrlRejected
-                              << ", accepted with outdated CRL " << r.expiredCrlAccepted << ")\n";
+                              << " (deltas " << r.deltaCrls << ", obsolete " << r.deltasObsolete
+                              << ", revoked sessions closed " << r.sessionsClosed << ", handshakes refused revoked/"
+                              << "no CRL " << r.revokedRejected << "/" << r.missingCrlRejected << ", by delta "
+                              << r.revokedByDelta << ", accepted with outdated CRL " << r.expiredCrlAccepted << ")\n";
                 }
                 if (tls && !tlsOcsp.empty() && ocspWatch.changed()) {
                     const bool ok = tls->reloadOcsp();
@@ -465,12 +490,15 @@ int main(int argc, char** argv) {
                               << tls->ocsp().mustStapleUnserved << ")\n";
                 }
 #endif
-                if (!vehicleCrl.empty() && vehicleCrlWatch.changed()) {
+                const bool vehicleBase = vehicleCrlWatch.changed();
+                const bool vehicleDelta = vehicleDeltaWatch.changed();
+                if (!vehicleCrl.empty() && (vehicleBase || vehicleDelta)) {
                     const bool ok = doipConnector.reloadCrl(now);
                     std::cout << "[diag] vehicle CRL " << (ok ? "reloaded" : "unusable - previous CRL kept");
                     if (const auto* r = doipConnector.revocation()) {
-                        std::cout << " (ECU connections closed " << r->sessionsClosed << ", refused revoked "
-                                  << r->revokedRejected << ")";
+                        std::cout << " (deltas " << r->deltaCrls << ", ECU connections closed " << r->sessionsClosed
+                                  << ", refused revoked " << r->revokedRejected << ", by delta " << r->revokedByDelta
+                                  << ")";
                     }
                     std::cout << "\n";
                 }

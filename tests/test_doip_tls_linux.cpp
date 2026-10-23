@@ -90,27 +90,54 @@ Credential makeCredential(const std::string& name, const char* cn, const Credent
     return c;
 }
 
-// CRL of `ca` revoking the given serial numbers; `expired`: nextUpdate in the past.
-std::string makeCrl(const std::string& name, const Credential& ca, const std::vector<long>& revoked,
-                    bool expired = false) {
+// CRL entry: serial number and CRLReason (-1: none).
+struct CrlEntry {
+    long serial = 0;
+    int reason = -1;
+};
+
+struct CrlSpec {
+    std::vector<CrlEntry> entries;
+    bool expired = false;                 // nextUpdate in the past
+    long number = -1;                     // CRL number; -1: none
+    long deltaBase = -1;                  // delta CRL: BaseCRLNumber (critical Delta CRL Indicator)
+    const Credential* signer = nullptr;   // another key than the issuer's: forged CRL
+};
+
+// CRL issued in the name of `ca` (complete or delta).
+std::string writeCrl(const std::string& name, const Credential& ca, const CrlSpec& spec) {
     X509_CRL* crl = X509_CRL_new();
     X509_CRL_set_version(crl, 1);  // v2
     X509_CRL_set_issuer_name(crl, X509_get_subject_name(ca.cert));
-    ASN1_TIME* last = X509_gmtime_adj(nullptr, expired ? -2 * 86400 : -3600);
-    ASN1_TIME* next = X509_gmtime_adj(nullptr, expired ? -86400 : 7 * 86400);
+    ASN1_TIME* last = X509_gmtime_adj(nullptr, spec.expired ? -2 * 86400 : -3600);
+    ASN1_TIME* next = X509_gmtime_adj(nullptr, spec.expired ? -86400 : 7 * 86400);
     X509_CRL_set1_lastUpdate(crl, last);
     X509_CRL_set1_nextUpdate(crl, next);
-    for (const long serial : revoked) {
+    for (const auto& entry : spec.entries) {
         X509_REVOKED* r = X509_REVOKED_new();
         ASN1_INTEGER* sn = ASN1_INTEGER_new();
-        ASN1_INTEGER_set(sn, serial);
+        ASN1_INTEGER_set(sn, entry.serial);
         X509_REVOKED_set_serialNumber(r, sn);
         X509_REVOKED_set_revocationDate(r, last);
+        if (entry.reason >= 0) {
+            ASN1_ENUMERATED* reason = ASN1_ENUMERATED_new();
+            ASN1_ENUMERATED_set(reason, entry.reason);
+            X509_REVOKED_add1_ext_i2d(r, NID_crl_reason, reason, 0, 0);
+            ASN1_ENUMERATED_free(reason);
+        }
         X509_CRL_add0_revoked(crl, r);
         ASN1_INTEGER_free(sn);
     }
+    auto addNumber = [&](int nid, long value, int critical) {
+        ASN1_INTEGER* n = ASN1_INTEGER_new();
+        ASN1_INTEGER_set(n, value);
+        X509_CRL_add1_ext_i2d(crl, nid, n, critical, 0);
+        ASN1_INTEGER_free(n);
+    };
+    if (spec.number >= 0) addNumber(NID_crl_number, spec.number, 0);
+    if (spec.deltaBase >= 0) addNumber(NID_delta_crl, spec.deltaBase, 1);
     X509_CRL_sort(crl);
-    X509_CRL_sign(crl, ca.key, EVP_sha256());
+    X509_CRL_sign(crl, (spec.signer ? spec.signer : &ca)->key, EVP_sha256());
     const std::string path = tempFile(name);
     FILE* f = std::fopen(path.c_str(), "w");
     PEM_write_X509_CRL(f, crl);
@@ -119,6 +146,15 @@ std::string makeCrl(const std::string& name, const Credential& ca, const std::ve
     ASN1_TIME_free(next);
     X509_CRL_free(crl);
     return path;
+}
+
+// CRL of `ca` revoking the given serial numbers; `expired`: nextUpdate in the past.
+std::string makeCrl(const std::string& name, const Credential& ca, const std::vector<long>& revoked,
+                    bool expired = false) {
+    CrlSpec spec;
+    for (const long serial : revoked) spec.entries.push_back({serial, -1});
+    spec.expired = expired;
+    return writeCrl(name, ca, spec);
 }
 
 // OCSP response signed by `signer` about `cert` (issued by `issuer`).
@@ -576,7 +612,7 @@ struct TempFiles {
 
 platform::TlsServerConfig withCrl(platform::TlsServerConfig c, const std::string& crl, bool require = true,
                                   bool acceptExpired = true) {
-    c.crl = platform::CrlPolicy{crl, require, acceptExpired};
+    c.crl = platform::CrlPolicy{crl, require, acceptExpired, ""};
     return c;
 }
 
@@ -687,7 +723,7 @@ TEST_CASE("doip tls linux: a revoked ADAS certificate is refused; a CRL update e
         const auto crl = files.add(makeCrl("crl_vehicle_revoked", pki.ca, {6}));  // serial 6: adas-dc
         AdasOverTls v(31527, adasServer(pki.adas, pki));
         auto cfg = gatewayClient(pki);
-        cfg.crl = platform::CrlPolicy{crl, true, true};
+        cfg.crl = platform::CrlPolicy{crl, true, true, ""};
         v.connector.enableTls(cfg);
         const auto r = v.request({0x3E, 0x00});
         REQUIRE(r.has_value());
@@ -700,7 +736,7 @@ TEST_CASE("doip tls linux: a revoked ADAS certificate is refused; a CRL update e
         const auto crl = files.add(makeCrl("crl_vehicle", pki.ca, {}));
         AdasOverTls v(31528, adasServer(pki.adas, pki));
         auto cfg = gatewayClient(pki);
-        cfg.crl = platform::CrlPolicy{crl, true, true};
+        cfg.crl = platform::CrlPolicy{crl, true, true, ""};
         v.connector.enableTls(cfg);
         CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::Ok);
         CHECK(v.client.routingActive(dg::kAdas));
@@ -711,6 +747,195 @@ TEST_CASE("doip tls linux: a revoked ADAS certificate is refused; a CRL update e
         CHECK(!v.client.routingActive(dg::kAdas));
         CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::TransportError);  // no reconnect possible
     }
+}
+
+// --------------------------------------------------------------- delta CRLs
+
+namespace {
+
+constexpr int kKeyCompromise = 1;
+constexpr int kCertificateHold = 6;
+constexpr int kRemoveFromCrl = 8;
+
+platform::TlsServerConfig withDelta(platform::TlsServerConfig c, const std::string& crl, const std::string& delta,
+                                    bool acceptExpired = true) {
+    c.crl = platform::CrlPolicy{crl, true, acceptExpired, delta};
+    return c;
+}
+
+CrlSpec delta(long number, long base, std::vector<CrlEntry> entries = {}) {
+    CrlSpec spec;
+    spec.number = number;
+    spec.deltaBase = base;
+    spec.entries = std::move(entries);
+    return spec;
+}
+
+CrlSpec complete(long number, std::vector<CrlEntry> entries = {}) {
+    CrlSpec spec;
+    spec.number = number;
+    spec.entries = std::move(entries);
+    return spec;
+}
+
+bool serverStarts(std::uint16_t port, const platform::TlsServerConfig& cfg) {
+    try {
+        Bench bench(port, cfg);
+    } catch (const std::runtime_error&) {
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST_CASE("doip tls linux: a delta CRL revokes a tester on top of its base CRL") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    const auto base = files.add(writeCrl("dcrl_base", pki.ca, complete(10)));
+    const auto d = files.add(writeCrl("dcrl_delta", pki.ca, delta(11, 10, {{3, kKeyCompromise}})));
+    Bench bench(31540, withDelta(serverConfig(pki, false), base, d));
+    CHECK_EQ(bench.server.revocation().deltaCrls, 1u);
+    CHECK(!testerGetsIn(bench, 31540, pki, pki.tester));  // revoked by the delta only
+    CHECK_EQ(bench.server.revocation().revokedByDelta, 1u);
+    CHECK_EQ(bench.server.revocation().revokedRejected, 1u);
+    CHECK(testerGetsIn(bench, 31540, pki, pki.gateway));  // not in the delta
+    CHECK_EQ(bench.gw.statistics().tcpConnectionsAccepted, 1u);
+}
+
+TEST_CASE("doip tls linux: delta CRL updates lift a hold and end a revoked session") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    // The base CRL puts the tester on hold (certificateHold).
+    const auto base = files.add(writeCrl("dcrl_hold_base", pki.ca, complete(10, {{3, kCertificateHold}})));
+    const auto d = files.add(writeCrl("dcrl_hold_delta", pki.ca, delta(11, 10)));
+    Bench bench(31541, withDelta(serverConfig(pki, false), base, d));
+    CHECK(!testerGetsIn(bench, 31541, pki, pki.tester));
+
+    // Delta 12: hold lifted (removeFromCRL).
+    writeCrl("dcrl_hold_delta", pki.ca, delta(12, 10, {{3, kRemoveFromCrl}}));
+    CHECK(bench.server.reloadCrl(bench.gw, diag::Clock::now()));
+    CHECK(testerGetsIn(bench, 31541, pki, pki.tester));
+    CHECK(bench.server.revocation().unrevokedByDelta >= 1u);
+
+    Client client(31541, pki, &pki.tester);
+    REQUIRE(handshake(bench, client) == std::optional<bool>(true));
+    const auto ra = exchange(bench, client, pt::kRoutingActivationRequest, kCentralSecurity,
+                             pt::kRoutingActivationResponse);
+    REQUIRE(ra.has_value());
+    REQUIRE(ra->at(4) == 0x10);
+
+    // Delta 13: the key was compromised after all - the running session ends.
+    writeCrl("dcrl_hold_delta", pki.ca, delta(13, 10, {{3, kKeyCompromise}}));
+    CHECK(bench.server.reloadCrl(bench.gw, diag::Clock::now()));
+    CHECK_EQ(bench.server.revocation().sessionsClosed, 1u);
+    CHECK_EQ(bench.gw.openConnections(), 0u);
+    bool open = true;
+    for (int i = 0; i < 50 && open; ++i) {
+        bench.step();
+        open = client.poll();
+    }
+    CHECK(!open);
+    CHECK(!testerGetsIn(bench, 31541, pki, pki.tester));
+    CHECK(testerGetsIn(bench, 31541, pki, pki.gateway));
+}
+
+TEST_CASE("doip tls linux: obsolete, mismatched, forged and misplaced delta CRLs") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    // The complete CRL 12 already contains delta 11: the delta is ignored.
+    {
+        const auto base = files.add(writeCrl("dcrl_new_base", pki.ca, complete(12)));
+        const auto d = files.add(writeCrl("dcrl_old_delta", pki.ca, delta(11, 10, {{3, kKeyCompromise}})));
+        Bench bench(31542, withDelta(serverConfig(pki, false), base, d));
+        CHECK_EQ(bench.server.revocation().deltasObsolete, 1u);
+        CHECK_EQ(bench.server.revocation().deltaCrls, 0u);
+        CHECK(testerGetsIn(bench, 31542, pki, pki.tester));
+    }
+    const auto base10 = files.add(writeCrl("dcrl_base10", pki.ca, complete(10)));
+    // Delta for a complete CRL the gateway does not have yet: its changes could not be applied.
+    const auto ahead = files.add(writeCrl("dcrl_ahead", pki.ca, delta(14, 13)));
+    CHECK(!serverStarts(31543, withDelta(serverConfig(pki, false), base10, ahead)));
+    // Delta in the CA's name, signed by another key.
+    auto forgedSpec = delta(11, 10, {{2, kKeyCompromise}});
+    forgedSpec.signer = &pki.rogueCa;
+    const auto forged = files.add(writeCrl("dcrl_forged", pki.ca, forgedSpec));
+    CHECK(!serverStarts(31543, withDelta(serverConfig(pki, false), base10, forged)));
+    // A complete CRL in the delta file, a delta in the complete CRL file.
+    CHECK(!serverStarts(31543, withDelta(serverConfig(pki, false), base10, base10)));
+    const auto good = files.add(writeCrl("dcrl_good", pki.ca, delta(11, 10, {{3, kKeyCompromise}})));
+    CHECK(!serverStarts(31543, withDelta(serverConfig(pki, false), good, good)));
+    // A delta without a numbered complete CRL, or without any complete CRL.
+    const auto unnumbered = files.add(makeCrl("dcrl_unnumbered", pki.ca, {}));
+    const auto fromZero = files.add(writeCrl("dcrl_from_zero", pki.ca, delta(1, 0, {{3, kKeyCompromise}})));
+    CHECK(!serverStarts(31543, withDelta(serverConfig(pki, false), unnumbered, good)));
+    CHECK(!serverStarts(31543, withDelta(serverConfig(pki, false), unnumbered, fromZero)));
+    CHECK(!serverStarts(31543, withDelta(serverConfig(pki, false), "", good)));
+
+    // At run time an inapplicable delta is refused and the deltas in force stay.
+    Bench bench(31544, withDelta(serverConfig(pki, false), base10, good));
+    CHECK(!testerGetsIn(bench, 31544, pki, pki.tester));
+    writeCrl("dcrl_good", pki.ca, delta(12, 11));  // needs complete CRL 11
+    CHECK(!bench.server.reloadCrl(bench.gw, diag::Clock::now()));
+    CHECK_EQ(bench.server.revocation().deltaCrls, 1u);
+    CHECK(!testerGetsIn(bench, 31544, pki, pki.tester));
+    // The backend installs complete CRL 11 (with the tester) next to it.
+    writeCrl("dcrl_base10", pki.ca, complete(11, {{3, kKeyCompromise}}));
+    CHECK(bench.server.reloadCrl(bench.gw, diag::Clock::now()));
+    CHECK(!testerGetsIn(bench, 31544, pki, pki.tester));
+    CHECK(testerGetsIn(bench, 31544, pki, pki.gateway));
+}
+
+TEST_CASE("doip tls linux: an outdated delta CRL follows the expired-CRL policy") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    const auto base = files.add(writeCrl("dcrl_exp_base", pki.ca, complete(10)));
+    auto spec = delta(11, 10, {{3, kKeyCompromise}});
+    spec.expired = true;
+    const auto d = files.add(writeCrl("dcrl_exp_delta", pki.ca, spec));
+    {
+        Bench bench(31545, withDelta(serverConfig(pki, false), base, d));  // offline vehicle
+        CHECK(!testerGetsIn(bench, 31545, pki, pki.tester));  // its revocations stay in force
+        CHECK(testerGetsIn(bench, 31545, pki, pki.gateway));
+        CHECK(bench.server.revocation().expiredCrlAccepted >= 1u);
+    }
+    {
+        Bench bench(31546, withDelta(serverConfig(pki, false), base, d, false));  // --crl-reject-expired
+        CHECK(!testerGetsIn(bench, 31546, pki, pki.gateway));
+        CHECK(bench.server.revocation().expiredCrlRejected >= 1u);
+    }
+}
+
+TEST_CASE("doip tls linux: a delta CRL ends the connection to a revoked ADAS") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    const auto base = files.add(writeCrl("dcrl_vehicle_base", pki.ca, complete(20)));
+    const auto d = files.add(writeCrl("dcrl_vehicle_delta", pki.ca, delta(21, 20)));
+    AdasOverTls v(31547, adasServer(pki.adas, pki));
+    auto cfg = gatewayClient(pki);
+    cfg.crl = platform::CrlPolicy{base, true, true, d};
+    v.connector.enableTls(cfg);
+    CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::Ok);
+
+    writeCrl("dcrl_vehicle_delta", pki.ca, delta(22, 20, {{6, kKeyCompromise}}));  // ADAS revoked
+    CHECK(v.connector.reloadCrl(diag::Clock::now()));
+    REQUIRE(v.connector.revocation() != nullptr);
+    CHECK_EQ(v.connector.revocation()->sessionsClosed, 1u);
+    CHECK(v.connector.revocation()->revokedByDelta >= 1u);
+    CHECK(!v.client.routingActive(dg::kAdas));
+    CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::TransportError);
+
+    // A forged delta "un-revoking" ADAS is refused.
+    auto forged = delta(23, 20, {{6, kRemoveFromCrl}});
+    forged.signer = &pki.rogueCa;
+    writeCrl("dcrl_vehicle_delta", pki.ca, forged);
+    CHECK(!v.connector.reloadCrl(diag::Clock::now()));
+    CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::TransportError);
 }
 
 // --------------------------------------------------------------- OCSP stapling
