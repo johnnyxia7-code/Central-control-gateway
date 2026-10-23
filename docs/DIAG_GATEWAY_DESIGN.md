@@ -134,9 +134,9 @@ has disconnected, the response is dropped (`responsesDropped`).
 ### 3.6 DoIP-to-DoIP routing (Ethernet ECUs)
 
 ECUs on the vehicle Ethernet that are DoIP entities themselves (the ADAS
-domain controller, 0x1010 at 192.168.10.20:13400) are reached through the
+domain controller, 0x1010 at 192.168.10.20:3496) are reached through the
 gateway's DoIP client (`diag::DoipClient`, enabled with
-`DiagGateway::setEthernetRouting`).
+`DiagGateway::setEthernetRouting`), over **DoIP over TLS** (§3.7).
 
 ```
 tester 0x0E80          gateway 0x1001                          ADAS 0x1010
@@ -171,6 +171,32 @@ tester 0x0E80          gateway 0x1001                          ADAS 0x1010
   ECU's alive checks. When the tester disconnects, its connections to the
   Ethernet ECUs are closed. When the ECU closes an idle connection, the next
   request reconnects.
+
+### 3.7 DoIP over TLS towards the Ethernet ECUs
+
+The connections from the gateway to the Ethernet ECUs (routed testers and
+the key master alike) use TLS. Here the gateway is the TLS client
+(`platform::DoipTcpConnector::enableTls`):
+
+| Topic | Behaviour |
+|-------|-----------|
+| Route | `DoipEcuRoute::tls` and `serverName`; ADAS: `192.168.10.20:3496`, certificate name `adas-dc` |
+| ECU identity | its certificate must chain to the **vehicle CA** (`--vehicle-ca`) and carry the route's name (SNI + host name check, no partial wildcards) |
+| Gateway identity | the gateway presents its vehicle certificate (`--vehicle-cert`, `--vehicle-key`); the ECU can require it |
+| Protocol | TLS 1.2 ECDHE/AES-GCM or TLS 1.3, as on the tester side |
+| Order | TCP connect, then TLS handshake, then routing activation. The DoIP client sees the connection only when TLS is up, and the connect timeout (2 s) covers both |
+| Failure | wrong name, foreign CA, no TLS on the ECU, or the ECU refusing the gateway's certificate: the connection fails. Routed testers get NACK 0x06; the key master reports `ECU_UNREACHABLE` |
+| No fallback | a TLS route never falls back to plain TCP; without TLS credentials the process does not start (`--doip-plain` switches the routes to plain DoIP on the bench) |
+| ECU side | ADAS accepts DoIP over TLS only (`requireTls`): a plain routing activation gets 0x07 |
+
+What the ECU authenticates is the **gateway**. Tester identity reaches the ECU
+only as the passed-through source address. The gateway's own tester
+authentication (§3.4) decides what a tester may do.
+
+The simulated vehicle Ethernet (`sim::DoipLink`) models the outcome of the
+handshake (trusted or not, name, client certificate). The real handshake is
+tested with OpenSSL on loopback against the same `DoipTlsServer` that the
+gateway uses towards its testers.
 
 ## 4. ISO-TP (ISO 15765-2)
 
@@ -261,7 +287,9 @@ version 0x02 (ISO 13400-2:2012).
 ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
                  [--port 13400] [--broadcast 255.255.255.255] \
                  [--tls-cert gw.pem --tls-key gw.key [--tls-ca testers.pem] \
-                  [--tls-require-client-cert] [--tls-only] [--tls-port 3496]]
+                  [--tls-require-client-cert] [--tls-only] [--tls-port 3496]] \
+                 [--vehicle-ca vehicle-ca.pem --vehicle-cert gw-vehicle.pem --vehicle-key gw-vehicle.key] \
+                 [--doip-plain]
 ```
 
 TLS needs OpenSSL 3 at build time (`CCG_HAVE_TLS`). Without it, the process
@@ -280,7 +308,7 @@ refuses the TLS options.
   tester requests to the same ECU get NACK 0x08.
 - **DoIP client** (`diag::DoipClient`): reaches the ECUs on the vehicle
   Ethernet that are DoIP entities themselves (ADAS 0x1010 at
-  192.168.10.20:13400, `--doip ADAS=IP:PORT`). It routes tester requests
+  192.168.10.20:3496 over TLS, `--doip ADAS=IP:PORT`). It routes tester requests
   (§3.6) and serves gateway functions. For the gateway's own requests it
   activates routing with source address 0x0F00 (in-vehicle test equipment).
   Each request is a diagnostic message followed by the ACK and the response.
@@ -297,7 +325,7 @@ refuses the TLS options.
   0x11 are never sent).
 - One outstanding physical request per ECU; a second one is refused with NACK
   0x08 rather than queued.
-- DoIP-to-DoIP routing uses plain TCP towards the Ethernet ECUs (no TLS) and
-  does not forward the tester's routing-activation OEM data or authentication.
+- DoIP-to-DoIP routing does not forward the tester's routing-activation OEM
+  data or its certificate; the ECU authenticates the gateway, not the tester.
 - No extended or mixed ISO-TP addressing, and no LIN diagnostics.
 - The UDS server of the gateway itself is minimal (session, tester present, three DIDs).

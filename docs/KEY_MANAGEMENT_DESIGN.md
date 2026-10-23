@@ -202,7 +202,7 @@ DoIP client (`diag::DoipClient`). The key master is the same for both.
 
 ```
 gateway (DoIP client, SA 0x0F00)                     ADAS domain controller (DoIP entity 0x1010)
-   TCP connect 192.168.10.20:13400  ------------------>
+   TCP connect 192.168.10.20:3496, TLS (vehicle PKI) ->
    0x0005 routing activation (SA 0x0F00, type 00) ---->
    <------------------------------------------------- 0x0006 response, code 0x10
    0x8001 diag message 0F00 -> 1010: 31 01 F200 M1..M3 ->
@@ -224,9 +224,11 @@ gateway (DoIP client, SA 0x0F00)                     ADAS domain controller (DoI
   or refused connection, or a missing ACK fail the request. The key master
   reports the group as `ECU_UNREACHABLE`, discards it on the other members,
   and renews it in a later campaign.
-- **No TLS needed for the keys**: the SHE container is encrypted and
-  authenticated end to end, so the plain DoIP transport (port 13400) only
-  carries ciphertext.
+- **TLS**: the connection is DoIP over TLS (ADAS certificate `adas-dc` from
+  the vehicle CA, gateway vehicle certificate; DIAG_GATEWAY_DESIGN.md §3.7).
+  The keys themselves would not need it, because the SHE container is
+  encrypted and authenticated end to end. TLS protects the rest of the
+  session: the session control, the status reads and the activation.
 
 **Campaign** (started with `31 01 F210 [group ..]` or `KeyMaster::start`):
 
@@ -277,7 +279,8 @@ ccg_key_master_sim   # EPS unpowered: K_VCU_GW and the ADAS keys (over DoIP) ren
 # and runs the key master (31 01 F210); new gateway keys reach ccg_eth_gateway via the store
 ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
                  --key-store /var/lib/ccg/keys --demo-keys \
-                 --doip ADAS=192.168.10.20:13400      # Ethernet ECU endpoint (default from the table)
+                 --vehicle-ca vehicle-ca.pem --vehicle-cert gw-vehicle.pem --vehicle-key gw-vehicle.key
+                 # DoIP over TLS to ADAS (192.168.10.20:3496); --doip ADAS=IP:PORT overrides the endpoint
 
 # Ethernet gateway follows it: reloads the key store when it changes
 ccg_eth_gateway --bind ... --key-store /var/lib/ccg/keys --fv-store /var/lib/ccg/freshness

@@ -237,3 +237,68 @@ TEST_CASE("doip routing: the tester leaves, its ADAS connection is closed") {
     CHECK_EQ(r.doip.openConnections(), 0u);
     CHECK_EQ(r.adas->entity().openConnections(), 0u);
 }
+
+// --------------------------------------------------------------- DoIP over TLS to ADAS
+
+TEST_CASE("doip routing: the gateway reaches ADAS over TLS with its vehicle certificate") {
+    Routing r;
+    r.request(dg::kAdas, {0x22, 0xF1, 0x90});
+    std::optional<diag::ClientResult> internal;
+    r.doip.request(dg::kAdas, {0x3E, 0x00}, r.now, [&](diag::ClientResult res, Bytes) { internal = res; });
+    r.run(5ms);
+    CHECK_EQ(r.responses(dg::kAdas).size(), 1u);
+    CHECK(internal == std::optional<diag::ClientResult>(diag::ClientResult::Ok));
+    // ADAS (TLS required) sees two TLS connections authenticated by the gateway's certificate.
+    CHECK_EQ(r.adas->entity().statistics().tlsConnections, 2u);
+    CHECK_EQ(r.adas->entity().statistics().authenticatedConnections, 2u);
+    CHECK_EQ(r.adas->entity().statistics().routingActivationsAccepted, 2u);
+}
+
+TEST_CASE("doip routing: ADAS certificate problems stop the connection") {
+    struct Case {
+        sim::DoipLink::TlsServer server;
+        sim::DoipLink::TlsClient client;
+    };
+    sim::DoipLink::TlsClient noCertificate;
+    noCertificate.present = false;
+    const std::vector<Case> cases = {
+        {{true, "ivi-head-unit", true, false}, {}},  // certificate names another ECU
+        {{true, "", false, false}, {}},              // not signed by the vehicle CA
+        {{false, "", true, false}, {}},              // the endpoint offers no TLS
+        {{true, "", true, true}, noCertificate},     // ADAS wants the gateway's certificate
+    };
+    for (const auto& c : cases) {
+        Routing r;
+        r.ethernet.setTls(dg::kAdasEndpoint, c.server);
+        r.ethernet.setClientCertificate(c.client);
+        r.request(dg::kAdas, {0x22, 0xF1, 0x90});
+        std::optional<diag::ClientResult> internal;
+        r.doip.request(dg::kAdas, {0x3E, 0x00}, r.now, [&](diag::ClientResult res, Bytes) { internal = res; });
+        r.run(5ms);
+        const auto nacks = r.fromSource(pt::kDiagnosticNack, dg::kAdas);
+        REQUIRE(nacks.size() == 1u);
+        CHECK_EQ(nacks[0].at(4), static_cast<std::uint8_t>(doip::DiagNack::TargetUnreachable));
+        CHECK(internal == std::optional<diag::ClientResult>(diag::ClientResult::TransportError));
+        CHECK_EQ(r.ethernet.tlsHandshakeFailures(), 2u);
+        CHECK_EQ(r.adas->entity().statistics().tcpConnectionsAccepted, 0u);  // nothing reached ADAS
+    }
+}
+
+TEST_CASE("doip routing: a plain route to an ADAS that requires TLS is refused with 0x07") {
+    auto cfg = config::makeVehicleDoipClient();
+    cfg.ecus[0].tls = false;
+    TesterSide tester;
+    diag::DiagGateway gw(config::makeVehicleDiagRouting(), tester);
+    sim::DoipLink ethernet;
+    diag::DoipClient doip(cfg, ethernet);
+    ethernet.attach(doip);
+    sim::DoipEcu adas(config::makeAdasDoipEntity(), config::makeEcuKeySlots(dg::kAdas), ethernet.port(dg::kAdasEndpoint));
+    ethernet.bind(dg::kAdasEndpoint, adas.entity());
+    diag::TimePoint now = diag::TimePoint{} + 1s;
+    std::optional<diag::ClientResult> result;
+    doip.request(dg::kAdas, {0x3E, 0x00}, now, [&](diag::ClientResult res, Bytes) { result = res; });
+    for (int i = 0; i < 5; ++i) ethernet.pump(now);
+    CHECK(result == std::optional<diag::ClientResult>(diag::ClientResult::TransportError));
+    CHECK_EQ(doip.statistics().activationFailures, 1u);
+    CHECK_EQ(adas.entity().statistics().routingActivationsRejected, 1u);
+}

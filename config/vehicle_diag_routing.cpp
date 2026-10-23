@@ -53,7 +53,7 @@ diag::DoipClientConfig makeVehicleDoipClient() {
     c.sourceAddress = dg::kInternalTester;
     c.protocolVersion = 0x02;
     c.maxMessageSize = 4095;
-    c.ecus = {{"ADAS", dg::kAdas, dg::kAdasEndpoint}};
+    c.ecus = {{"ADAS", dg::kAdas, dg::kAdasEndpoint, true, dg::kAdasServerName}};
     return c;
 }
 
@@ -66,6 +66,7 @@ diag::DiagRoutingConfig makeAdasDoipEntity() {
     e.gid = {0x02, 0x00, 0x5E, 0x10, 0x00, 0x01};  // group: the gateway
     e.maxTcpConnections = 2;
     e.announceCount = 0;
+    e.requireTls = true;  // only DoIP over TLS (vehicle PKI); plain TCP gets 0x07
     return cfg;
 }
 

@@ -21,6 +21,9 @@ std::vector<std::string> validateDoipClientConfig(const DoipClientConfig& c) {
             errors.push_back("DoIP ECU '" + r.name + "': logical address used twice");
         }
         if (r.endpoint.empty()) errors.push_back("DoIP ECU '" + r.name + "': endpoint missing");
+        if (r.tls && r.serverName.empty()) {
+            errors.push_back("DoIP ECU '" + r.name + "': TLS needs the expected server name");
+        }
         if (r.logicalAddress >= 0x0E00 && r.logicalAddress <= 0x0FFF) {
             errors.push_back("DoIP ECU '" + r.name + "': logical address is in the tester range");
         }
@@ -128,7 +131,10 @@ void DoipClient::open(ConnectionId id, TimePoint now) {
             c.stream = doip::StreamReassembler(config_.maxMessageSize + 4);
             c.deadline = now + config_.connectTimeout;
             ++stats_.connects;
-            connector_.connect(id, config_.ecus[c.route].endpoint);
+            {
+                const auto& route = config_.ecus[c.route];
+                connector_.connect(id, DoipTarget{route.endpoint, route.tls, route.serverName});
+            }
             break;
         case State::Connecting:
         case State::Activating:

@@ -34,7 +34,8 @@ inline constexpr std::uint16_t kEps = 0x0021;  // CHS_CAN
 inline constexpr std::uint16_t kBcm = 0x0030;  // BODY_CAN
 inline constexpr std::uint16_t kAdas = 0x1010;  // ETH_ADAS, DoIP entity
 inline constexpr std::uint16_t kInternalTester = 0x0F00;  // the gateway as DoIP client
-inline constexpr const char* kAdasEndpoint = "192.168.10.20:13400";
+inline constexpr const char* kAdasEndpoint = "192.168.10.20:3496";  // DoIP over TLS
+inline constexpr const char* kAdasServerName = "adas-dc";            // ADAS certificate identity
 }  // namespace dg
 
 }  // namespace ccg::config

@@ -116,9 +116,12 @@ TEST_CASE("doip sockets: gateway DoIP client reaches a DoIP entity over TCP") {
     platform::DoipTcpServer server(kPort, 2);
     TcpPort port;
     port.server = &server;
-    sim::DoipEcu adas(config::makeAdasDoipEntity(), config::makeEcuKeySlots(config::dg::kAdas), port);
+    auto entityCfg = config::makeAdasDoipEntity();
+    entityCfg.entity.requireTls = false;  // plain DoIP here; TLS: test_doip_tls_linux.cpp
+    sim::DoipEcu adas(entityCfg, config::makeEcuKeySlots(config::dg::kAdas), port);
     auto clientCfg = config::makeVehicleDoipClient();
     clientCfg.ecus[0].endpoint = "127.0.0.1:" + std::to_string(kPort);
+    clientCfg.ecus[0].tls = false;
     platform::DoipTcpConnector connector;
     diag::DoipClient client(clientCfg, connector);
     connector.attach(client);

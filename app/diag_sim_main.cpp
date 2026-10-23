@@ -130,7 +130,7 @@ int main() {
     ethernet.attach(doip);
     gw.setEthernetRouting(doip);
     sim::DoipEcu adas(config::makeAdasDoipEntity(), config::makeEcuKeySlots(dg::kAdas), ethernet.port(dg::kAdasEndpoint));
-    ethernet.bind(dg::kAdasEndpoint, adas.entity());
+    ethernet.bind(dg::kAdasEndpoint, adas.entity());  // TLS required by ADAS, modelled by the link
 
     std::deque<std::pair<std::size_t, can::CanFrame>> ecuOut;
     std::vector<std::pair<std::size_t, std::unique_ptr<sim::UdsEcu>>> ecus;
@@ -234,7 +234,7 @@ int main() {
                 request(dg::kGateway, {0x22, 0xF1, 0x90});
                 break;
             case 1800:
-                log("ADAS (0x1010) on ETH_ADAS: routed DoIP-to-DoIP with the tester's address 0x0E80");
+                log("ADAS (0x1010) on ETH_ADAS: routed DoIP-to-DoIP over TLS (certificate 'adas-dc'), tester address 0x0E80");
                 request(dg::kAdas, {0x22, 0xF1, 0x90});
                 break;
             case 1820:
@@ -261,7 +261,8 @@ int main() {
     std::cout << "\nstatistics: requests=" << s.diagRequests << " acks=" << s.diagAcks << " nacks=" << s.diagNacks
               << " functional=" << s.functionalRequests << " local=" << s.localRequests
               << " ecuResponses=" << s.ecuResponses << " ethernet=" << s.ethernetRequests << "/"
-              << s.ethernetResponses << " tpTxErrors=" << s.isotpTxErrors
+              << s.ethernetResponses << " (ADAS TLS connections " << adas.entity().statistics().tlsConnections
+              << ") tpTxErrors=" << s.isotpTxErrors
               << " announcements=" << s.announcements << "\n";
     return 0;
 }

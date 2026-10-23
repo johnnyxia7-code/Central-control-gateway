@@ -13,6 +13,12 @@
 // In-memory vehicle Ethernet for tests and simulation: TCP connections from
 // the gateway's DoIP client to simulated DoIP entities. Events are queued and
 // delivered by pump(), like frames on a real network.
+//
+// TLS routes are modelled by their outcome (the real handshake is tested
+// with OpenSSL on loopback): the handshake fails if the entity has no TLS,
+// its certificate is untrusted or names another identity, or it requires a
+// client certificate the gateway does not present; otherwise the entity sees
+// a TLS connection, authenticated if the gateway's certificate is trusted.
 namespace ccg::sim {
 
 class DoipLink final : public diag::IDoipConnector {
@@ -24,10 +30,25 @@ public:
     void attach(diag::DoipClient& client) { client_ = &client; }
 
     void setReachable(const std::string& endpoint, bool reachable) { entities_[endpoint].reachable = reachable; }
+
+    struct TlsServer {
+        bool enabled = true;           // the entity offers TLS
+        std::string certificateName;   // identity in its certificate (empty: what the client expects)
+        bool trusted = true;           // signed by the vehicle CA
+        bool requireClientCertificate = false;
+    };
+    void setTls(const std::string& endpoint, const TlsServer& tls) { entities_[endpoint].tls = tls; }
+    struct TlsClient {
+        bool present = true;           // the gateway presents its vehicle certificate
+        bool trusted = true;
+        std::string name = "ccg-gateway";
+    };
+    void setClientCertificate(const TlsClient& client) { client_cert_ = client; }
+    std::uint64_t tlsHandshakeFailures() const { return tlsFailures_; }
     void setMuted(const std::string& endpoint, bool muted) { entities_[endpoint].muted = muted; }
 
     // diag::IDoipConnector
-    void connect(diag::ConnectionId id, const std::string& endpoint) override;
+    void connect(diag::ConnectionId id, const diag::DoipTarget& target) override;
     void send(diag::ConnectionId id, const std::vector<std::uint8_t>& data) override;
     void close(diag::ConnectionId id) override;
 
@@ -58,6 +79,7 @@ private:
         diag::DiagGateway* gateway = nullptr;
         bool reachable = true;
         bool muted = false;
+        TlsServer tls;
         std::map<diag::ConnectionId, diag::ConnectionId> clientOf;  // entity connection -> client id
         std::map<diag::ConnectionId, std::vector<std::vector<std::uint8_t>>> foreign;
         std::vector<std::vector<std::uint8_t>> received;
@@ -67,6 +89,8 @@ private:
         diag::ConnectionId client = 0;
         std::string endpoint;
         std::vector<std::uint8_t> data;
+        bool tls = false;
+        std::string serverName;
     };
 
     diag::DoipClient* client_ = nullptr;
@@ -75,6 +99,8 @@ private:
     std::deque<Event> events_;
     diag::ConnectionId nextEntityConnection_ = 100;
     std::uint64_t bytesToEntities_ = 0;
+    TlsClient client_cert_;
+    std::uint64_t tlsFailures_ = 0;
 };
 
 }  // namespace ccg::sim

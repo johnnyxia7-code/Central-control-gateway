@@ -22,10 +22,10 @@ namespace {
 
 // Scripted network: records what the client sends, the test plays the entity.
 struct ScriptedNet final : diag::IDoipConnector {
-    std::vector<std::pair<diag::ConnectionId, std::string>> connects;
+    std::vector<std::pair<diag::ConnectionId, diag::DoipTarget>> connects;
     std::vector<std::pair<std::uint16_t, Bytes>> sent;  // DoIP payload type, payload
     std::vector<diag::ConnectionId> closed;
-    void connect(diag::ConnectionId id, const std::string& endpoint) override { connects.emplace_back(id, endpoint); }
+    void connect(diag::ConnectionId id, const diag::DoipTarget& target) override { connects.emplace_back(id, target); }
     void send(diag::ConnectionId, const Bytes& d) override {
         sent.emplace_back(doip::decodeHeader(d.data()).type, Bytes(d.begin() + doip::kHeaderSize, d.end()));
     }
@@ -67,9 +67,9 @@ TEST_CASE("doip client: config validation") {
     CHECK(diag::validateDoipClientConfig(config::makeVehicleDoipClient()).empty());
     auto c = config::makeVehicleDoipClient();
     c.sourceAddress = 0x1001;  // not a tester address
-    c.ecus.push_back({"ADAS2", dg::kAdas, ""});
-    c.ecus.push_back({"X", 0x0E80, "10.0.0.1:13400"});
-    CHECK_EQ(diag::validateDoipClientConfig(c).size(), 4u);
+    c.ecus.push_back({"ADAS2", dg::kAdas, "", false, ""});
+    c.ecus.push_back({"X", 0x0E80, "10.0.0.1:3496", true, ""});  // tester range, TLS without server name
+    CHECK_EQ(diag::validateDoipClientConfig(c).size(), 5u);
 }
 
 TEST_CASE("doip client: connect, routing activation, request and response") {
@@ -78,7 +78,9 @@ TEST_CASE("doip client: connect, routing activation, request and response") {
     CHECK(!s.client.reaches(dg::kVcu));
     s.client.request(dg::kAdas, {0x22, 0xF2, 0xA1}, s.now, s.collect());
     REQUIRE(s.net.connects.size() == 1u);
-    CHECK(s.net.connects[0].second == std::string(dg::kAdasEndpoint));
+    CHECK(s.net.connects[0].second.endpoint == std::string(dg::kAdasEndpoint));
+    CHECK(s.net.connects[0].second.tls);
+    CHECK(s.net.connects[0].second.serverName == std::string(dg::kAdasServerName));
     CHECK(s.net.sent.empty());  // nothing before the TCP connection is up
 
     s.client.onConnected(1, s.now);
@@ -225,8 +227,8 @@ TEST_CASE("doip client: UDS with the simulated ADAS DoIP entity") {
     REQUIRE(results.size() == 2u);
     CHECK(results[1].second == (Bytes{0x7F, 0x31, 0x7F}));
 
-    // Another tester wants the only socket: the entity alive-checks us, we answer.
-    adas.entity().onTcpConnected(7, now);
+    // Another tester (also on TLS) wants the only socket: the entity alive-checks us, we answer.
+    adas.entity().onTcpConnected(7, now, diag::ConnectionSecurity{true, false, ""});
     const auto ra = doip::encode(doip::kVersion2012, pt::kRoutingActivationRequest, {0x0E, 0x80, 0x00, 0, 0, 0, 0});
     adas.entity().onTcpData(7, ra.data(), ra.size(), now);
     run(600ms);

@@ -5,11 +5,17 @@
 //                    [--key-store /var/lib/ccg/keys [--demo-keys]] [--doip ADAS=192.168.10.20:13400]
 //                    [--tls-cert gw.pem --tls-key gw.key [--tls-ca testers.pem]
 //                     [--tls-require-client-cert] [--tls-only] [--tls-port 3496]]
+//                    [--vehicle-ca vehicle-ca.pem --vehicle-cert gw-vehicle.pem --vehicle-key gw-vehicle.key]
+//                    [--doip-plain]
 //
 // DoIP over TLS (ISO 13400-2:2019): testers connect to the TLS port; with
 // --tls-ca their client certificates are verified, and a verified tester may
 // use central security activation (0xE0) and the key management routines that
 // change keys. --tls-only refuses routing activation on the plain port (0x07).
+// Towards the Ethernet ECUs the gateway is a TLS client as well: the ECU's
+// certificate must come from the vehicle CA and carry the route's name; the
+// gateway presents its vehicle certificate. --doip-plain switches the
+// Ethernet routes to plain DoIP (bench only).
 //
 // With --key-store the gateway's own diagnostic address also serves the SecOC
 // key management routines (SHE key update, activation, key status); the file
@@ -131,6 +137,8 @@ int main(int argc, char** argv) {
     bool tlsRequireClientCert = false;
     bool tlsOnly = false;
     std::uint16_t tlsPort = 3496;
+    std::string vehicleCa, vehicleCert, vehicleKey;
+    bool doipPlain = false;
     try {
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -144,6 +152,10 @@ int main(int argc, char** argv) {
             }
             if (arg == "--tls-only") {
                 tlsOnly = true;
+                continue;
+            }
+            if (arg == "--doip-plain") {
+                doipPlain = true;
                 continue;
             }
             if (i + 1 >= argc) throw std::invalid_argument("missing value for " + arg);
@@ -164,6 +176,12 @@ int main(int argc, char** argv) {
                 tlsKey = value;
             } else if (arg == "--tls-ca") {
                 tlsCa = value;
+            } else if (arg == "--vehicle-ca") {
+                vehicleCa = value;
+            } else if (arg == "--vehicle-cert") {
+                vehicleCert = value;
+            } else if (arg == "--vehicle-key") {
+                vehicleKey = value;
             } else if (arg == "--tls-port") {
                 tlsPort = static_cast<std::uint16_t>(std::stoul(value));
             } else if (arg == "--doip") {
@@ -175,6 +193,9 @@ int main(int argc, char** argv) {
             }
         }
         if (tlsCert.empty() != tlsKey.empty()) throw std::invalid_argument("--tls-cert and --tls-key go together");
+        if (vehicleCert.empty() != vehicleKey.empty()) {
+            throw std::invalid_argument("--vehicle-cert and --vehicle-key go together");
+        }
         if ((tlsOnly || tlsRequireClientCert || !tlsCa.empty()) && tlsCert.empty()) {
             throw std::invalid_argument("TLS options need --tls-cert and --tls-key");
         }
@@ -186,7 +207,8 @@ int main(int argc, char** argv) {
                   << " --can CHANNEL=IFACE ... [--port 13400] [--broadcast ADDR]"
                      " [--key-store FILE [--demo-keys]] [--doip ECU=IP:PORT]"
                      " [--tls-cert PEM --tls-key PEM [--tls-ca PEM] [--tls-require-client-cert] [--tls-only]"
-                     " [--tls-port 3496]]\n";
+                     " [--tls-port 3496]] [--vehicle-ca PEM [--vehicle-cert PEM --vehicle-key PEM]]"
+                     " [--doip-plain]\n";
         return EXIT_FAILURE;
     }
 
@@ -238,12 +260,23 @@ int main(int argc, char** argv) {
 
         // DoIP client towards the Ethernet ECUs (ADAS): gateway-internal UDS.
         auto doipCfg = config::makeVehicleDoipClient();
+        bool anyTls = false;
         for (auto& ecu : doipCfg.ecus) {
             const auto it = doipEndpoints.find(ecu.name);
             if (it != doipEndpoints.end()) ecu.endpoint = it->second;
-            std::cout << "[diag] DoIP ECU " << ecu.name << " at " << ecu.endpoint << "\n";
+            if (doipPlain) ecu.tls = false;
+            anyTls = anyTls || ecu.tls;
+            std::cout << "[diag] DoIP ECU " << ecu.name << " at " << ecu.endpoint
+                      << (ecu.tls ? " (TLS, certificate '" + ecu.serverName + "')" : " (plain, bench only)") << "\n";
         }
         platform::DoipTcpConnector doipConnector;
+        if (anyTls) {
+            if (vehicleCa.empty()) {
+                throw std::invalid_argument("Ethernet ECUs use DoIP over TLS: --vehicle-ca (and --vehicle-cert/"
+                                            "--vehicle-key), or --doip-plain on the bench");
+            }
+            doipConnector.enableTls(platform::TlsClientConfig{vehicleCert, vehicleKey, vehicleCa});
+        }
         diag::DoipClient doipClient(doipCfg, doipConnector);
         doipConnector.attach(doipClient);
         gateway.setEthernetRouting(doipClient);  // tester -> ADAS (DoIP-to-DoIP)

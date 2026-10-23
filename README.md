@@ -33,6 +33,7 @@ DoIP edge node for the external tester, routing UDS requests to the ECUs on CAN 
 
 - **DoIP (ISO 13400-2)**: vehicle identification and announcements, entity status, power mode (UDP); routing activation with alive-check socket handling, inactivity timers, header NACKs, diagnostic message ACK/NACK (TCP)
 - **DoIP over TLS** (ISO 13400-2:2019, port 3496, OpenSSL): TLS 1.2 ECDHE/AES-GCM or TLS 1.3, optional mutual TLS against a tester CA; plain TCP can be refused (activation code 0x07); a verified client certificate unlocks central security activation (0xE0) and the key routines that change keys (otherwise NRC 0x33)
+- **TLS towards the Ethernet ECUs**: the gateway connects to ADAS as TLS client: the ADAS certificate must come from the vehicle CA and carry the route's name (`adas-dc`), the gateway presents its vehicle certificate, there is no plain fallback, and ADAS accepts TLS only
 - **ISO-TP (ISO 15765-2)** on CAN and CAN FD: single/first/consecutive/flow-control frames, escape lengths > 4095 bytes, block size and STmin, N_As/N_Bs/N_Cr timeouts, FC.WAIT, overflow
 - **Routing** by logical address to the ECU's CAN channel and IDs; functional requests (0xE400) on 0x7DF on every bus; responses including NRC 0x78 *response pending* go back to the requesting tester
 - Local UDS server for the gateway's own address (session control, tester present, VIN / serial number), extensible by further services
@@ -62,7 +63,7 @@ Key slots of the gateway HSM and their renewal from the backend.
 - **Protection**: anti-rollback update counter per key, UID binding (wildcard only if allowed), write protection, MAC-only key usage, lockout after repeated authentication failures
 - **Rollover without communication loss**: new keys are staged until the backend activates them; the previous key is still accepted for verification during a grace period, the pending key already verifies MACs of ECUs that switched early
 - **UDS on DoIP** (gateway address 0x1001): RoutineControl F200 load key, F201 activate, F202 discard; DID F2A0 key status; the key store is persisted before M4/M5 are returned
-- **In-vehicle key master**: the gateway generates the SecOC keys it shares with VCU, EPS and BCM (CAN) and the ADAS domain controller (Ethernet) and distributes them with the same SHE protocol, over ISO-TP and as DoIP client (TCP 13400, routing activation as in-vehicle tester 0x0F00) (ECU authorisation keys derived from the vehicle key master secret and the ECU's UID). Each key group is atomic: it is activated only when every member proved it holds the key, and otherwise discarded everywhere. Started with RoutineControl F210
+- **In-vehicle key master**: the gateway generates the SecOC keys it shares with VCU, EPS and BCM (CAN) and the ADAS domain controller (Ethernet) and distributes them with the same SHE protocol, over ISO-TP and as DoIP client over TLS (port 3496, routing activation as in-vehicle tester 0x0F00) (ECU authorisation keys derived from the vehicle key master secret and the ECU's UID). Each key group is atomic: it is activated only when every member proved it holds the key, and otherwise discarded everywhere. Started with RoutineControl F210
 - Security events for the IdsM; backend tool `ccg_key_tool` builds M1–M3 and checks M4/M5
 
 Design: [docs/KEY_MANAGEMENT_DESIGN.md](docs/KEY_MANAGEMENT_DESIGN.md)
@@ -104,8 +105,9 @@ sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
 
 ./build/ccg_diag_gateway --can PT_CAN=can0 --can CHS_CAN=can1 --can BODY_CAN=can2 \
     --key-store keys.dat --demo-keys \
-    --doip ADAS=192.168.10.20:13400 \
-    --tls-cert gw.pem --tls-key gw.key --tls-ca testers.pem   # DoIP 13400 + TLS 3496, key routines, key master
+    --tls-cert gw.pem --tls-key gw.key --tls-ca testers.pem \
+    --vehicle-ca vehicle-ca.pem --vehicle-cert gw-vehicle.pem --vehicle-key gw-vehicle.key
+    # testers: DoIP 13400 + TLS 3496; ADAS over TLS; key routines, key master
 
 ./build/ccg_key_tool --uid 000000000000004343470000000001 --slot 6 --auth-slot 1 \
     --auth-key <MASTER_ECU_KEY> --key <new key> --counter 2      # backend: M1..M3, expected M4/M5

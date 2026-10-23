@@ -19,10 +19,14 @@
 #include <vector>
 
 #include "ccg/diag/diag_gateway.hpp"
+#include "ccg/diag/doip_client.hpp"
 #include "ccg/doip/doip_message.hpp"
+#include "doip_ecu.hpp"
+#include "doip_tcp_connector.hpp"
 #include "doip_tls_server.hpp"
 #include "test_framework.hpp"
 #include "vehicle_diag_routing.hpp"
+#include "vehicle_key_master.hpp"
 
 using namespace ccg;
 using Bytes = std::vector<std::uint8_t>;
@@ -89,9 +93,11 @@ struct Pki {
     Credential tester = makeCredential("tester", "backend-keyserver", &ca, false, 3);
     Credential rogueCa = makeCredential("rogue_ca", "Rogue CA", nullptr, true, 4);
     Credential rogue = makeCredential("rogue", "rogue-tester", &rogueCa, false, 5);
+    Credential adas = makeCredential("adas", "adas-dc", &ca, false, 6);
+    Credential rogueAdas = makeCredential("rogue_adas", "adas-dc", &rogueCa, false, 7);
 
     ~Pki() {
-        for (auto* c : {&ca, &gateway, &tester, &rogueCa, &rogue}) {
+        for (auto* c : {&ca, &gateway, &tester, &rogueCa, &rogue, &adas, &rogueAdas}) {
             std::remove(c->certFile.c_str());
             std::remove(c->keyFile.c_str());
             X509_free(c->cert);
@@ -336,6 +342,150 @@ TEST_CASE("doip tls linux: bad server credentials are reported at start-up") {
     bool threw = false;
     try {
         platform::DoipTlsServer server(31501, 2, cfg);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+// --------------------------------------------------------------- gateway -> ADAS over TLS
+
+namespace {
+
+// ADAS DoIP entity behind a real TLS server; the gateway's DoIP client with
+// the real TLS connector.
+struct AdasOverTls {
+    TlsTransport transport;
+    platform::DoipTlsServer server;
+    sim::DoipEcu adas;
+    platform::DoipTcpConnector connector;
+    diag::DoipClient client;
+    std::vector<std::pair<diag::ClientResult, Bytes>> results;
+
+    static diag::DoipClientConfig clientConfig(std::uint16_t port, const std::string& serverName) {
+        auto c = config::makeVehicleDoipClient();
+        c.ecus[0].endpoint = "127.0.0.1:" + std::to_string(port);
+        c.ecus[0].serverName = serverName;
+        return c;
+    }
+    AdasOverTls(std::uint16_t port, const platform::TlsServerConfig& serverCfg, const std::string& serverName = "adas-dc")
+        : server(port, 2, serverCfg),
+          adas(config::makeAdasDoipEntity(), config::makeEcuKeySlots(dg::kAdas), transport),
+          client(clientConfig(port, serverName), connector) {
+        transport.tls = &server;
+        connector.attach(client);
+        adas.entity().start(diag::Clock::now());
+    }
+    // Runs a request to ADAS; nullopt if nothing came back.
+    std::optional<std::pair<diag::ClientResult, Bytes>> request(const Bytes& uds) {
+        results.clear();
+        client.request(dg::kAdas, uds, diag::Clock::now(),
+                       [this](diag::ClientResult r, Bytes d) { results.emplace_back(r, std::move(d)); });
+        for (int i = 0; i < 1000 && results.empty(); ++i) {
+            auto fds = server.pollFds();
+            const std::size_t clientBase = fds.size();
+            const auto clientFds = connector.pollFds();
+            fds.insert(fds.end(), clientFds.begin(), clientFds.end());
+            ::poll(fds.data(), fds.size(), 2);
+            const auto now = diag::Clock::now();
+            server.process(std::vector<pollfd>(fds.begin(), fds.begin() + static_cast<std::ptrdiff_t>(clientBase)),
+                           adas.entity(), now);
+            connector.process(std::vector<pollfd>(fds.begin() + static_cast<std::ptrdiff_t>(clientBase), fds.end()), now);
+            client.mainFunction(now);
+            adas.entity().mainFunction(now);
+        }
+        if (results.empty()) return std::nullopt;
+        return results.front();
+    }
+};
+
+platform::TlsServerConfig adasServer(const Credential& identity, const Pki& pki) {
+    platform::TlsServerConfig c;
+    c.certificateFile = identity.certFile;
+    c.privateKeyFile = identity.keyFile;
+    c.caFile = pki.ca.certFile;  // vehicle CA: verifies the gateway
+    c.requireClientCertificate = true;
+    return c;
+}
+
+platform::TlsClientConfig gatewayClient(const Pki& pki, bool withCertificate = true) {
+    platform::TlsClientConfig c;
+    if (withCertificate) {
+        c.certificateFile = pki.gateway.certFile;
+        c.privateKeyFile = pki.gateway.keyFile;
+    }
+    c.caFile = pki.ca.certFile;
+    return c;
+}
+
+}  // namespace
+
+TEST_CASE("doip tls linux: gateway to ADAS over mutual TLS") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    AdasOverTls v(31510, adasServer(pki.adas, pki));
+    v.connector.enableTls(gatewayClient(pki));
+    const auto r = v.request({0x22, 0xF2, 0xA1});
+    REQUIRE(r.has_value());
+    CHECK(r->first == diag::ClientResult::Ok);
+    CHECK_EQ(r->second.size(), 3u + 15u);
+    CHECK(v.client.routingActive(dg::kAdas));
+    // ADAS saw a TLS connection authenticated with the gateway's certificate.
+    CHECK_EQ(v.adas.entity().statistics().tlsConnections, 1u);
+    CHECK_EQ(v.adas.entity().statistics().authenticatedConnections, 1u);
+    // The connection is kept.
+    CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::Ok);
+    CHECK_EQ(v.client.statistics().connects, 1u);
+}
+
+TEST_CASE("doip tls linux: the gateway refuses an ADAS with a wrong name or foreign certificate") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    {
+        AdasOverTls v(31511, adasServer(pki.adas, pki), "ivi-head-unit");  // expects another ECU
+        v.connector.enableTls(gatewayClient(pki));
+        const auto r = v.request({0x3E, 0x00});
+        REQUIRE(r.has_value());
+        CHECK(r->first == diag::ClientResult::TransportError);
+        CHECK_EQ(v.connector.tlsHandshakeFailures(), 1u);
+        CHECK_EQ(v.adas.entity().statistics().tcpConnectionsAccepted, 0u);
+    }
+    {
+        AdasOverTls v(31512, adasServer(pki.rogueAdas, pki));  // right name, wrong CA
+        v.connector.enableTls(gatewayClient(pki));
+        const auto r = v.request({0x3E, 0x00});
+        REQUIRE(r.has_value());
+        CHECK(r->first == diag::ClientResult::TransportError);
+        CHECK_EQ(v.connector.tlsHandshakeFailures(), 1u);
+        CHECK_EQ(v.adas.entity().statistics().tcpConnectionsAccepted, 0u);
+    }
+}
+
+TEST_CASE("doip tls linux: ADAS refuses a gateway without vehicle certificate; no plain fallback") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    {
+        AdasOverTls v(31513, adasServer(pki.adas, pki));
+        v.connector.enableTls(gatewayClient(pki, false));
+        const auto r = v.request({0x3E, 0x00});
+        REQUIRE(r.has_value());
+        CHECK(r->first != diag::ClientResult::Ok);
+        CHECK_EQ(v.server.handshakeFailures(), 1u);
+        CHECK_EQ(v.adas.entity().statistics().tcpConnectionsAccepted, 0u);
+    }
+    {
+        AdasOverTls v(31514, adasServer(pki.adas, pki));  // TLS route, connector without TLS
+        const auto r = v.request({0x3E, 0x00});
+        REQUIRE(r.has_value());
+        CHECK(r->first == diag::ClientResult::TransportError);
+        CHECK_EQ(v.server.connections(), 0u);  // never even opened a TCP connection
+    }
+    bool threw = false;
+    try {
+        platform::DoipTcpConnector c;
+        auto cfg = gatewayClient(pki);
+        cfg.privateKeyFile = pki.tester.keyFile;  // does not match the certificate
+        c.enableTls(cfg);
     } catch (const std::runtime_error&) {
         threw = true;
     }

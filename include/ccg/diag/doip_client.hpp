@@ -25,13 +25,25 @@
 //    tester's source address passed through, so the ECU sees who asks.
 //
 // One TCP connection per (ECU, source address), opened on demand and kept;
-// alive check requests of the entity are answered.
+// alive check requests of the entity are answered. Routes marked `tls` use
+// DoIP over TLS (ISO 13400-2:2019, port 3496): the connector establishes TLS
+// - verifying the entity's certificate and name, presenting the gateway's
+// vehicle certificate - before the client sees the connection.
 namespace ccg::diag {
 
 struct DoipEcuRoute {
     std::string name;
     std::uint16_t logicalAddress = 0;  // DoIP entity address (target address)
     std::string endpoint;              // "ip:port", resolved by the connector
+    bool tls = false;                  // DoIP over TLS
+    std::string serverName;            // TLS: identity the entity's certificate must carry
+};
+
+// What the connector is asked to open.
+struct DoipTarget {
+    std::string endpoint;
+    bool tls = false;
+    std::string serverName;
 };
 
 struct DoipClientConfig {
@@ -52,8 +64,9 @@ std::vector<std::string> validateDoipClientConfig(const DoipClientConfig& config
 class IDoipConnector {
 public:
     virtual ~IDoipConnector() = default;
-    // Completion is reported with DoipClient::onConnected or onClosed.
-    virtual void connect(ConnectionId id, const std::string& endpoint) = 0;
+    // Completion is reported with DoipClient::onConnected (TCP and, for TLS,
+    // the handshake done) or onClosed (refused, TLS failure, timeout).
+    virtual void connect(ConnectionId id, const DoipTarget& target) = 0;
     virtual void send(ConnectionId id, const std::vector<std::uint8_t>& data) = 0;
     virtual void close(ConnectionId id) = 0;
 };
