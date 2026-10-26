@@ -54,7 +54,8 @@ struct Routing {
     std::vector<std::pair<std::size_t, std::unique_ptr<sim::UdsEcu>>> canEcus;
     std::deque<std::pair<std::size_t, can::CanFrame>> ecuOut;
 
-    explicit Routing(diag::DiagRoutingConfig adasEntity = config::makeAdasDoipEntity()) {
+    explicit Routing(diag::DiagRoutingConfig adasEntity = config::makeAdasDoipEntity(),
+                     const diag::ConnectionSecurity& security = {}) {
         ethernet.attach(doip);
         gw.setEthernetRouting(doip);
         adas = std::make_unique<sim::DoipEcu>(std::move(adasEntity), config::makeEcuKeySlots(dg::kAdas),
@@ -74,7 +75,7 @@ struct Routing {
         }
         gw.start(now);
         adas->entity().start(now);
-        gw.onTcpConnected(1, now);
+        gw.onTcpConnected(1, now, security);
         send(pt::kRoutingActivationRequest, {0x0E, 0x80, 0x00, 0, 0, 0, 0});
     }
 
@@ -301,4 +302,36 @@ TEST_CASE("doip routing: a plain route to an ADAS that requires TLS is refused w
     CHECK(result == std::optional<diag::ClientResult>(diag::ClientResult::TransportError));
     CHECK_EQ(doip.statistics().activationFailures, 1u);
     CHECK_EQ(adas.entity().statistics().routingActivationsRejected, 1u);
+}
+
+TEST_CASE("doip routing: key activation and discard preserve tester authorization") {
+    for (const auto& security : {diag::ConnectionSecurity{}, diag::ConnectionSecurity{true, false, ""},
+                                  diag::ConnectionSecurity{true, true, "workshop"}}) {
+        for (const std::uint8_t rid : {0x01, 0x02}) {
+            for (const std::uint8_t sub : {0x01, 0x81}) {
+                Routing r(config::makeAdasDoipEntity(), security);
+                config::provisionDemoEcuKeyStore(r.adas->keys(), r.now);
+                keym::she::Flags flags;
+                flags.keyUsage = true;
+                REQUIRE(r.adas->keys().stageInternal(keym::she::kKey1, crypto::Block{42}, 2, flags, r.now) ==
+                        keym::she::ErrorCode::NoError);
+                r.request(dg::kAdas, {0x10, 0x03});
+                r.run(5ms);
+                r.request(dg::kAdas, {0x31, sub, 0xF2, rid});
+                r.run(5ms);
+                CHECK(r.adas->keys().hasPending() == !security.clientAuthenticated);
+                const auto replies = r.responses(dg::kAdas);
+                if (!security.clientAuthenticated) {
+                    REQUIRE(replies.size() == 1u);
+                    CHECK(replies[0] == (Bytes{0x7F, 0x31, 0x33}));
+                    CHECK_EQ(r.gw.statistics().ethernetRequests, 1u); // only session control was forwarded
+                } else if (sub == 0x01) {
+                    REQUIRE(replies.size() == 1u);
+                    CHECK(replies[0] == (Bytes{0x71, 0x01, 0xF2, rid, 0x01}));
+                } else {
+                    CHECK(replies.empty()); // suppressPositiveResponse never bypasses authorization
+                }
+            }
+        }
+    }
 }

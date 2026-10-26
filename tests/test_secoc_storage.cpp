@@ -66,3 +66,55 @@ TEST_CASE("secoc storage: freshness counters survive a restart") {
     CHECK_EQ(after.storedTrip(), 9U);  // FV master trip counter
     std::remove(path.c_str());
 }
+
+TEST_CASE("secoc storage: durable counters are restored exactly without periodic saves") {
+    const auto path = tempPath("fv_durable");
+    std::remove(path.c_str());
+    for (std::uint64_t cycle = 1; cycle <= 3; ++cycle) {
+        secoc::FreshnessManager manager;
+        if (const auto saved = platform::loadFreshness(path)) manager.restore(*saved);
+        manager.setPersistence([&](const secoc::FreshnessManager::Snapshot& next) {
+            if (!platform::saveFreshness(path, next)) throw std::runtime_error("save failed");
+        });
+        CHECK_EQ(*manager.nextTx(0x1003, 64), cycle);
+        manager.acceptRx(0x1004, cycle);
+        manager.setStoredTrip(cycle);
+        const auto disk = platform::loadFreshness(path);
+        REQUIRE(disk.has_value());
+        CHECK_EQ(disk->tx.at(0x1003), cycle);
+        CHECK_EQ(disk->rx.at(0x1004), cycle);
+        CHECK_EQ(disk->trip, cycle);
+        CHECK(!std::filesystem::exists(path + ".tmp"));
+        // No shutdown save: simulate losing all process memory now.
+    }
+    std::remove(path.c_str());
+}
+
+TEST_CASE("secoc storage: corrupt or incomplete state is never treated as a new store") {
+    const auto path = tempPath("fv_corrupt");
+    for (const std::string data : {"", "tx 1 2\n", "trip", "trip 1\ntx 1", "trip 1\nrx 1 2\nrx 1 3",
+                                   "trip 1\ntrip 2", "trip -1", "trip 1\ntx 65536 2", "trip 1\nunknown 2 3",
+                                   "trip 18446744073709551616", "trip 1\nrx 1 -2", "trip 1\nrx 1 2junk"}) {
+        { std::ofstream out(path); out << data; }
+        bool rejected = false;
+        try { (void)platform::loadFreshness(path); }
+        catch (const std::runtime_error&) { rejected = true; }
+        CHECK(rejected);
+    }
+    std::remove(path.c_str());
+}
+
+TEST_CASE("secoc storage: a failed replacement preserves the committed state") {
+    const auto path = tempPath("fv_failure");
+    secoc::FreshnessManager::Snapshot saved;
+    saved.tx[1] = 7;
+    REQUIRE(platform::saveFreshness(path, saved));
+    // A directory at the temporary path makes open fail even when running as root.
+    REQUIRE(std::filesystem::create_directory(path + ".tmp"));
+    auto next = saved;
+    next.tx[1] = 8;
+    CHECK(!platform::saveFreshness(path, next));
+    CHECK_EQ(platform::loadFreshness(path)->tx.at(1), 7u);
+    std::filesystem::remove(path + ".tmp");
+    std::remove(path.c_str());
+}

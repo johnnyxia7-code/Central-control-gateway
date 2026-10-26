@@ -1,9 +1,14 @@
 #include "secoc_storage.hpp"
 
 #include <cstdio>
+#include <cerrno>
+#include <charconv>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace ccg::platform {
 
@@ -56,36 +61,74 @@ std::size_t loadKeyFile(const std::string& path, secoc::SoftwareCryptoService& c
 
 std::optional<secoc::FreshnessManager::Snapshot> loadFreshness(const std::string& path) {
     std::ifstream in(path);
-    if (!in) return std::nullopt;
+    if (!in) {
+        if (std::filesystem::exists(path)) throw std::runtime_error("cannot read freshness store " + path);
+        return std::nullopt;
+    }
     secoc::FreshnessManager::Snapshot snapshot;
     std::string kind;
-    unsigned long id = 0;
-    unsigned long long value = 0;
+    const auto readNumber = [&]() {
+        std::string token;
+        std::uint64_t number = 0;
+        if (!(in >> token)) throw std::runtime_error("incomplete freshness store " + path);
+        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), number);
+        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size()) {
+            throw std::runtime_error("invalid freshness counter in " + path);
+        }
+        return number;
+    };
+    bool haveTrip = false;
     while (in >> kind) {
         if (kind == "trip") {
-            if (!(in >> value)) break;
-            snapshot.trip = value;
+            if (haveTrip) throw std::runtime_error("duplicate trip counter in " + path);
+            snapshot.trip = readNumber();
+            haveTrip = true;
             continue;
         }
-        if (!(in >> id >> value)) break;
+        if (kind != "tx" && kind != "rx") {
+            throw std::runtime_error("invalid freshness store " + path);
+        }
+        const auto id = readNumber();
+        const auto value = readNumber();
+        if (id > 0xFFFF) throw std::runtime_error("invalid freshness data ID in " + path);
         auto& map = kind == "tx" ? snapshot.tx : snapshot.rx;
-        map[static_cast<std::uint16_t>(id)] = value;
+        if (!map.emplace(static_cast<std::uint16_t>(id), value).second) {
+            throw std::runtime_error("duplicate freshness counter in " + path);
+        }
     }
+    if (!in.eof() || !haveTrip) throw std::runtime_error("incomplete freshness store " + path);
     return snapshot;
 }
 
 bool saveFreshness(const std::string& path, const secoc::FreshnessManager::Snapshot& snapshot) {
     const std::string tmp = path + ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::trunc);
-        if (!out) return false;
-        out << "trip " << snapshot.trip << "\n";
-        for (const auto& [id, v] : snapshot.tx) out << "tx " << id << " " << v << "\n";
-        for (const auto& [id, v] : snapshot.rx) out << "rx " << id << " " << v << "\n";
-        out.flush();
-        if (!out) return false;
+    std::ostringstream out;
+    out << "trip " << snapshot.trip << "\n";
+    for (const auto& [id, v] : snapshot.tx) out << "tx " << id << " " << v << "\n";
+    for (const auto& [id, v] : snapshot.rx) out << "rx " << id << " " << v << "\n";
+    const auto data = out.str();
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    std::size_t done = 0;
+    while (done < data.size()) {
+        const auto n = ::write(fd, data.data() + done, data.size() - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        done += static_cast<std::size_t>(n);
     }
-    return std::rename(tmp.c_str(), path.c_str()) == 0;
+    const bool saved = done == data.size() && ::fsync(fd) == 0;
+    const bool closed = ::close(fd) == 0;
+    if (!saved || !closed || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        ::unlink(tmp.c_str());
+        return false;
+    }
+    // The rename must survive power loss too, before a counter can be used.
+    const auto parent = std::filesystem::path(path).parent_path();
+    const int dir = ::open(parent.empty() ? "." : parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir < 0) return false;
+    const bool durable = ::fsync(dir) == 0;
+    ::close(dir);
+    return durable;
 }
 
 }  // namespace ccg::platform

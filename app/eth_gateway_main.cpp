@@ -202,12 +202,18 @@ int main(int argc, char** argv) {
         secoc::ICryptoService* cryptoService = keyStore.empty() ? static_cast<secoc::ICryptoService*>(&crypto)
                                                                 : &keyManager;
         ethgw::EthernetGateway gateway(std::move(config), transmitter, cryptoService);
-        constexpr std::uint64_t kFreshnessMargin = 10000;  // > Tx PDUs between two saves
         if (!fvStore.empty()) {
             if (const auto snapshot = platform::loadFreshness(fvStore)) {
-                gateway.freshness().restore(*snapshot, kFreshnessMargin);
+                gateway.freshness().restore(*snapshot);
                 std::cout << "[ethgw] freshness counters restored from " << fvStore << "\n";
             }
+            gateway.freshness().setPersistence([&](const secoc::FreshnessManager::Snapshot& snapshot) {
+                if (!platform::saveFreshness(fvStore, snapshot)) {
+                    throw std::runtime_error("cannot persist freshness counters to " + fvStore);
+                }
+            });
+        } else {
+            std::cout << "[ethgw] WARNING: freshness counters not persisted (no --fv-store) - bench only\n";
         }
         const auto period = std::chrono::milliseconds(periodMs);
         auto now = ethgw::Clock::now();
@@ -216,17 +222,6 @@ int main(int argc, char** argv) {
             std::cout << "[ethgw] WARNING: FV master inactive (trip counter exhausted) - "
                          "synchronised SecOC PDUs cannot be sent\n";
         }
-        // FV master: a new trip counter must reach NvM before anything uses it.
-        auto persistTripCounter = [&] {
-            if (!gateway.freshness().takePersistRequest()) return;
-            if (fvStore.empty()) {
-                std::cout << "[ethgw] WARNING: trip counter " << gateway.freshness().storedTrip()
-                          << " not persisted (no --fv-store) - bench only\n";
-            } else if (!platform::saveFreshness(fvStore, gateway.freshness().snapshot())) {
-                throw std::runtime_error("cannot persist the FV master trip counter to " + fvStore);
-            }
-        };
-        persistTripCounter();
         auto nextTick = now + period;
         auto nextStats = now + std::chrono::seconds(10);
         auto nextKeyCheck = now + std::chrono::seconds(1);
@@ -268,7 +263,6 @@ int main(int argc, char** argv) {
                     }
                 }
                 gateway.mainFunction(now);
-                persistTripCounter();  // reset counter overflow starts a new trip
                 nextTick += period;
                 if (nextTick <= now) nextTick = now + period;
             }
@@ -277,12 +271,10 @@ int main(int argc, char** argv) {
                 if (keyWatcher) {
                     std::cout << "[ethgw] keym rollover verifications=" << keyManager.rolloverVerifications() << "\n";
                 }
-                if (!fvStore.empty()) platform::saveFreshness(fvStore, gateway.freshness().snapshot());
                 nextStats = now + std::chrono::seconds(10);
             }
         }
         printStatistics(gateway.statistics());
-        if (!fvStore.empty()) platform::saveFreshness(fvStore, gateway.freshness().snapshot());
     } catch (const ethgw::RoutingConfigError& e) {
         std::cerr << e.what() << "\n";
         return EXIT_FAILURE;

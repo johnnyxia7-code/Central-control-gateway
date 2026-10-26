@@ -1,0 +1,29 @@
+name: Regression tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL development files
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Configure with TLS and warnings as errors
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCCG_WARNINGS_AS_ERRORS=ON
+          -DCMAKE_REQUIRE_FIND_PACKAGE_OpenSSL=ON
+      - name: Build all targets
+        run: cmake --build build --parallel 2
+      - name: Run regression suite
+        run: ctest --test-dir build --output-on-failure

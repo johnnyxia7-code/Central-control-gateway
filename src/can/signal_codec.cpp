@@ -108,18 +108,20 @@ std::uint64_t physicalToRaw(const SignalSpec& spec, double physical) {
 }
 
 std::optional<std::uint64_t> numberToRaw(const SignalSpec& spec, double number) {
-    if (std::isnan(number) || std::trunc(number) != number) {
+    if (spec.length == 0 || spec.length > 64 || !std::isfinite(number) || std::trunc(number) != number) {
         return std::nullopt;
     }
     if (spec.isSigned) {
-        if (number < static_cast<double>(signedMin(spec.length)) ||
-            number > static_cast<double>(signedMax(spec.length))) {
+        // Powers of two are exact doubles; INT64_MAX rounds up to 2^63.
+        const double bound = std::ldexp(1.0, spec.length - 1);
+        if (number < -bound || number >= bound) {
             return std::nullopt;
         }
         return static_cast<std::uint64_t>(static_cast<std::int64_t>(number)) &
                rawMask(spec.length);
     }
-    if (number < 0.0 || number > static_cast<double>(rawMask(spec.length))) {
+    // Likewise, UINT64_MAX rounds up to the excluded value 2^64.
+    if (number < 0.0 || number >= std::ldexp(1.0, spec.length)) {
         return std::nullopt;
     }
     return static_cast<std::uint64_t>(number);

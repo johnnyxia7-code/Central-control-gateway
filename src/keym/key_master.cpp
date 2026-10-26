@@ -116,6 +116,7 @@ bool KeyMaster::start(TimePoint now, const std::vector<std::size_t>& groups) {
     ecus_.clear();
     ecuOrder_.clear();
     loaded_.clear();
+    attemptedLoads_.clear();
     gatewayStaged_.clear();
     steps_.clear();
     waiting_ = false;
@@ -170,6 +171,9 @@ void KeyMaster::issueNext(TimePoint now) {
             continue;
         }
         waiting_ = true;
+        if (steps_.front().kind == Step::Kind::Load) {
+            attemptedLoads_.insert({steps_.front().groups.front(), steps_.front().ecu});
+        }
         client_.request(steps_.front().ecu, requestFor(steps_.front()), now,
                         [this](diag::ClientResult r, std::vector<std::uint8_t> data) {
                             reply_.emplace(r, std::move(data));
@@ -371,8 +375,11 @@ void KeyMaster::nextPhase(TimePoint now) {
                 std::vector<std::size_t> activate;
                 std::vector<std::size_t> discard;
                 for (const auto g : selected_) {
-                    if (!loaded_.count({g, ecu})) continue;
-                    (running(g) ? activate : discard).push_back(g);
+                    if (running(g) && loaded_.count({g, ecu})) {
+                        activate.push_back(g);
+                    } else if (!running(g) && attemptedLoads_.count({g, ecu})) {
+                        discard.push_back(g);  // includes a load whose M4/M5 was lost or damaged
+                    }
                 }
                 if (activate.empty() && discard.empty()) continue;
                 ecus_[ecu].failed = false;  // a failed load must not block the clean-up

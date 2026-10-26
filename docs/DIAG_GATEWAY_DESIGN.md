@@ -98,6 +98,13 @@ portable gateway only learns what the handshake established
 Local services see `LocalRequestContext::tls` and `authenticated` for their
 own policies.
 
+The gateway also checks the original tester's authentication before forwarding
+F201/F202/F210 to CAN or Ethernet ECUs, including suppressed-positive-response
+requests. The gateway's outbound TLS identity does not grant the tester these
+privileges. Functional key-control requests are acknowledged and ignored;
+key changes require a physical target. CRL exceptions explicitly permitted by
+policy preserve the verified client's authenticated status.
+
 Bench certificates (ECDSA P-256) can be created with OpenSSL:
 
 ```sh

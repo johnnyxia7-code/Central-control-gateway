@@ -588,3 +588,105 @@ TEST_CASE("diag tcp: DoIP message split over several TCP segments") {
     for (const auto b : bytes) f.gw.onTcpData(c, &b, 1, f.now);
     CHECK_EQ(f.responses(c, dg::kGateway).size(), 1U);
 }
+
+TEST_CASE("diag routing: unauthenticated key controls never reach CAN") {
+    for (const auto& security : {ConnectionSecurity{}, ConnectionSecurity{true, false, ""},
+                                  ConnectionSecurity{true, true, "workshop"}}) {
+        for (const auto target : {dg::kVcu, dg::kBcm, dg::kFunctional}) {
+            for (const std::uint8_t rid : {0x01, 0x02, 0x10}) {
+                Fixture f;
+                f.gw.onTcpConnected(1, f.now, security);
+                f.activate(1);
+                f.request(1, target, {0x31, 0x81, 0xF2, rid});
+                if (target == dg::kFunctional) {
+                    CHECK(f.tx.canLog.empty());
+                    CHECK(f.responses(1, target).empty());
+                } else if (security.clientAuthenticated) {
+                    CHECK(!f.tx.canLog.empty());
+                } else {
+                    CHECK(f.tx.canLog.empty());
+                    const auto replies = f.responses(1, target);
+                    REQUIRE(replies.size() == 1u);
+                    CHECK(replies[0] == (Bytes{0x7F, 0x31, 0x33}));
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("diag routing: functional traffic cannot interfere with an internal exchange") {
+    Fixture f;
+    const auto tester = f.activeTester();
+    f.ecu("BCM").setSilent(true);
+    std::optional<Bytes> internal;
+    f.gw.request(dg::kBcm, {0x22, 0xF1, 0x90}, f.now,
+                 [&](ClientResult result, Bytes reply) {
+                     CHECK(result == ClientResult::Ok);
+                     internal = std::move(reply);
+                 });
+    const auto frames = f.tx.canLog.size();
+    f.request(tester, dg::kFunctional, {0x3E, 0x00});
+    CHECK_EQ(f.tx.canLog.size(), frames); // refusal must precede every broadcast
+    REQUIRE(!f.received(tester, pt::kDiagnosticNack).empty());
+    CHECK_EQ(f.received(tester, pt::kDiagnosticNack).back().payload.at(4), 0x08);
+    auto response = [&](const Bytes& uds) {
+        const auto frame = isotp::makeSingleFrame(0x748, false, false, 0xCC, uds.data(), uds.size());
+        REQUIRE(frame.has_value());
+        f.gw.onCanFrame(dg::kBodyCan, *frame, f.now);
+    };
+    response({0x7E, 0x00});       // different service
+    response({0x62, 0xF1, 0x87}); // same service, different DID
+    response({0x7F, 0x31, 0x78}); // pending response for a different service
+    CHECK(!internal.has_value());
+    response({0x62, 0xF1, 0x90, 0x42});
+    REQUIRE(internal.has_value());
+    CHECK(*internal == (Bytes{0x62, 0xF1, 0x90, 0x42}));
+    CHECK_EQ(f.gw.statistics().responsesDropped, 3u);
+    f.request(tester, dg::kFunctional, {0x3E, 0x00});
+    CHECK(f.tx.canLog.size() > frames);
+}
+
+TEST_CASE("diag routing: ownership lasts until reply even after request delivery") {
+    Fixture f;
+    const auto tester = f.activeTester();
+    // Functional requests also reserve the ECU before an internal client can start.
+    f.request(tester, dg::kFunctional, {0x22, 0xF1, 0x90});
+    std::optional<ClientResult> result;
+    f.gw.request(dg::kBcm, {0x3E, 0x00}, f.now, [&](ClientResult r, Bytes) { result = r; });
+    CHECK(result == ClientResult::Busy);
+    f.advance(10ms);
+    result.reset();
+    f.gw.request(dg::kBcm, {0x3E, 0x00}, f.now, [&](ClientResult r, Bytes) { result = r; });
+    f.advance(10ms);
+    CHECK(result == ClientResult::Ok);
+
+    f.ecu("BCM").setHandler([](const Bytes&, bool) {
+        return sim::UdsEcu::Responses{{0ms, {0x7F, 0x31, 0x78}}, {2000ms, {0x71, 0x01, 0xFF, 0x00}}};
+    });
+    f.request(tester, dg::kBcm, {0x31, 0x01, 0xFF, 0x00});
+    f.advance(1100ms); // pending extended P2; request TX has long completed
+    const auto frames = f.tx.canLog.size();
+    f.request(tester, dg::kFunctional, {0x3E, 0x00});
+    CHECK_EQ(f.tx.canLog.size(), frames);
+    f.gw.request(dg::kBcm, {0x3E, 0x00}, f.now, [&](ClientResult r, Bytes) { result = r; });
+    CHECK(result == ClientResult::Busy);
+    f.advance(1000ms);
+    const auto replies = f.responses(tester, dg::kBcm);
+    CHECK(replies.back() == (Bytes{0x71, 0x01, 0xFF, 0x00}));
+}
+
+TEST_CASE("diag routing: unanswered requests release ownership at timeout") {
+    Fixture f;
+    const auto tester = f.activeTester();
+    f.ecu("BCM").setSilent(true);
+    f.request(tester, dg::kBcm, {0x3E, 0x80});
+    std::optional<ClientResult> result;
+    f.gw.request(dg::kBcm, {0x22, 0xF1, 0x90}, f.now, [&](ClientResult r, Bytes) { result = r; });
+    CHECK(result == ClientResult::Busy);
+    f.advance(1001ms);
+    f.ecu("BCM").setSilent(false);
+    result.reset();
+    f.gw.request(dg::kBcm, {0x22, 0xF1, 0x90}, f.now, [&](ClientResult r, Bytes) { result = r; });
+    f.advance(10ms);
+    CHECK(result == ClientResult::Ok);
+}

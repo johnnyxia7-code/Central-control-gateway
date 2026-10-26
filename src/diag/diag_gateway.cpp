@@ -31,6 +31,26 @@ std::string joinErrors(const std::vector<std::string>& errors) {
     return os.str();
 }
 
+bool matchesResponse(const std::vector<std::uint8_t>& request, const std::vector<std::uint8_t>& response) {
+    if (request.empty() || response.empty()) return false;
+    if (response[0] == 0x7F) return response.size() == 3 && response[1] == request[0];
+    if (response[0] != static_cast<std::uint8_t>(request[0] + 0x40)) return false;
+    switch (request[0]) {
+        case 0x10: case 0x11: case 0x27: case 0x28: case 0x3E: case 0x85:
+            return request.size() >= 2 && response.size() >= 2 && response[1] == (request[1] & 0x7F);
+        case 0x22: case 0x2E:
+            return request.size() >= 3 && response.size() >= 3 &&
+                   response[1] == request[1] && response[2] == request[2];
+        case 0x31:
+            return request.size() >= 4 && response.size() >= 4 && response[1] == (request[1] & 0x7F) &&
+                   response[2] == request[2] && response[3] == request[3];
+        case 0x36:
+            return request.size() >= 2 && response.size() >= 2 && response[1] == request[1];
+        default:
+            return true;
+    }
+}
+
 }  // namespace
 
 const char* toString(ClientResult result) {
@@ -270,6 +290,7 @@ void DiagGateway::closeConnection(ConnectionId id, bool notifyTransport) {
 
 void DiagGateway::onTcpData(ConnectionId id, const std::uint8_t* data, std::size_t length,
                             TimePoint now) {
+    now_ = now;  // ISO-TP may complete a single-frame transmission synchronously.
     auto it = connections_.find(id);
     if (it == connections_.end()) {
         return;
@@ -463,6 +484,21 @@ void DiagGateway::handleDiagnosticMessage(ConnectionId id, const std::vector<std
         }
         return;
     }
+    // The downstream TLS peer authenticates this gateway, not the original
+    // tester. Enforce authority here before either CAN or Ethernet forwarding.
+    if (data.size() >= 4 && data[0] == 0x31 && (data[1] & 0x7F) == 0x01 &&
+        data[2] == 0xF2 && (data[3] == 0x01 || data[3] == 0x02 || data[3] == 0x10)) {
+        if (target == config_.entity.functionalAddress) {
+            // Key changes are physical-only, including for authenticated testers.
+            sendDiagAck(req, target);
+            return;
+        }
+        if (!c.security.clientAuthenticated) {
+            sendDiagAck(req, target);
+            sendDiagMessage(req, target, {0x7F, 0x31, 0x33});
+            return;
+        }
+    }
     if (target == config_.entity.functionalAddress) {
         handleFunctionalRequest(req, data, now);
         return;
@@ -481,15 +517,17 @@ void DiagGateway::handleDiagnosticMessage(ConnectionId id, const std::vector<std
         sendDiagNack(req, target, DiagNack::MessageTooLarge);
         return;
     }
-    if (ecu.awaitingAck || ecu.tp->txBusy() || ecu.internal) {
+    if (ecu.awaitingAck || ecu.tp->txBusy() || ecu.tp->rxBusy() || ecu.internal || ecu.external) {
         // previous request still on the bus, or the gateway itself talks to the ECU
         sendDiagNack(req, target, DiagNack::TransportProtocolError);
         return;
     }
     ecu.awaitingAck = req;
     ecu.responseOwner = req;
+    ecu.external = ExternalRequest{data, now + kP2Client};
     if (!ecu.tp->transmit(std::move(data), now)) {
         ecu.awaitingAck.reset();
+        ecu.external.reset();
         sendDiagNack(req, target, DiagNack::TransportProtocolError);
     }
     // The ACK follows from onEcuTxDone() once ISO-TP has delivered the request.
@@ -502,6 +540,18 @@ void DiagGateway::handleFunctionalRequest(const Requester& req,
         sendDiagNack(req, config_.entity.functionalAddress, DiagNack::MessageTooLarge);
         return;
     }
+    // A functional frame reaches every ECU on a bus. Reject the whole
+    // request before transmitting anything if it would overlap an exchange.
+    for (const auto& ecu : ecus_) {
+        if (ecu.internal || ecu.external || ecu.awaitingAck || ecu.tp->txBusy() || ecu.tp->rxBusy()) {
+            sendDiagNack(req, config_.entity.functionalAddress, DiagNack::TransportProtocolError);
+            return;
+        }
+    }
+    for (auto& ecu : ecus_) {
+        ecu.responseOwner = req;
+        ecu.external = ExternalRequest{data, now + kP2Client};
+    }
     ++stats_.functionalRequests;
     sendDiagAck(req, config_.entity.functionalAddress);
     for (std::size_t c = 0; c < config_.channels.size(); ++c) {
@@ -510,10 +560,10 @@ void DiagGateway::handleFunctionalRequest(const Requester& req,
                                                   data.data(), data.size());
         if (!transport_.transmitCan(c, *frame)) {
             ++stats_.isotpTxErrors;
+            for (auto& ecu : ecus_) {
+                if (ecu.channel == c) ecu.external.reset();
+            }
         }
-    }
-    for (auto& ecu : ecus_) {
-        ecu.responseOwner = req;  // every ECU may answer
     }
     if (ethernet_) {
         for (const auto& ecu : ethernet_->config().ecus) {
@@ -613,8 +663,10 @@ void DiagGateway::onEcuTxDone(std::size_t index, isotp::Result result) {
     if (!req) return;
     const std::uint16_t source = config_.ecus[index].logicalAddress;
     if (result == isotp::Result::Ok) {
+        if (ecu.external) ecu.external->deadline = now_ + kP2Client;
         sendDiagAck(*req, source);
     } else {
+        ecu.external.reset();
         ++stats_.isotpTxErrors;
         sendDiagNack(*req, source, DiagNack::TransportProtocolError);
     }
@@ -623,12 +675,26 @@ void DiagGateway::onEcuTxDone(std::size_t index, isotp::Result result) {
 void DiagGateway::onEcuResponse(std::size_t index, std::vector<std::uint8_t>&& data) {
     ++stats_.ecuResponses;
     if (auto& internal = ecus_[index].internal) {
+        if (!matchesResponse(internal->uds, data)) {
+            ++stats_.responsesDropped;
+            return;
+        }
         if (data.size() == 3 && data[0] == 0x7F && data[2] == 0x78) {
             internal->deadline = now_ + kP2StarClient;  // response pending
             return;
         }
         finishInternal(index, ClientResult::Ok, std::move(data));
         return;
+    }
+    auto& external = ecus_[index].external;
+    if (!external || !matchesResponse(external->uds, data)) {
+        ++stats_.responsesDropped;
+        return;
+    }
+    if (data.size() == 3 && data[0] == 0x7F && data[2] == 0x78) {
+        external->deadline = now_ + kP2StarClient;
+    } else {
+        external.reset();
     }
     const auto& owner = ecus_[index].responseOwner;
     const auto it = owner ? connections_.find(owner->connection) : connections_.end();
@@ -685,11 +751,11 @@ void DiagGateway::request(std::uint16_t target, std::vector<std::uint8_t> uds, T
         return;
     }
     auto& ecu = ecus_[it->second];
-    if (ecu.awaitingAck || ecu.tp->txBusy() || ecu.internal) {
+    if (ecu.awaitingAck || ecu.tp->txBusy() || ecu.tp->rxBusy() || ecu.internal || ecu.external) {
         callback(ClientResult::Busy, {});
         return;
     }
-    ecu.internal = InternalRequest{std::move(callback), now + kP2Client};
+    ecu.internal = InternalRequest{std::move(callback), now + kP2Client, uds};
     ecu.responseOwner.reset();  // a tester's late responses must not reach the client
     if (!ecu.tp->transmit(std::move(uds), now)) {
         finishInternal(it->second, ClientResult::TransportError, {});
@@ -746,6 +812,10 @@ void DiagGateway::mainFunction(TimePoint now) {
         ecus_[i].tp->mainFunction(now);
         if (ecus_[i].internal && now >= ecus_[i].internal->deadline) {
             finishInternal(i, ClientResult::Timeout, {});
+        }
+        if (ecus_[i].external && !ecus_[i].awaitingAck && !ecus_[i].tp->txBusy() &&
+            !ecus_[i].tp->rxBusy() && now >= ecus_[i].external->deadline) {
+            ecus_[i].external.reset();
         }
     }
 }

@@ -207,6 +207,7 @@ int revocationVerifyCallback(int ok, X509_STORE_CTX* ctx) {
         case X509_V_ERR_CRL_HAS_EXPIRED:
             if (policy.acceptExpiredCrl) {
                 ++s.expiredCrlAccepted;
+                X509_STORE_CTX_set_error(ctx, X509_V_OK);
                 return 1;
             }
             ++s.expiredCrlRejected;
@@ -214,6 +215,7 @@ int revocationVerifyCallback(int ok, X509_STORE_CTX* ctx) {
         case X509_V_ERR_UNABLE_TO_GET_CRL:
             if (!policy.requireCrl) {
                 ++s.missingCrlAccepted;
+                X509_STORE_CTX_set_error(ctx, X509_V_OK);
                 return 1;
             }
             ++s.missingCrlRejected;
@@ -237,9 +239,13 @@ RevocationChecker::DeltaVerdict RevocationChecker::deltaVerdict(X509* cert) cons
     if (!cert || deltas_.empty()) return DeltaVerdict::None;
     const auto it = deltas_.find(nameKey(X509_get_issuer_name(cert)));
     if (it == deltas_.end()) return DeltaVerdict::None;
+    const bool expired = it->second.nextUpdate != 0 && std::time(nullptr) > it->second.nextUpdate;
+    // A hold-removal entry cannot override the strict expiry policy. In the
+    // offline policy, continue to apply the expired delta's revocations too.
+    if (expired && !policy_.acceptExpiredCrl) return DeltaVerdict::Expired;
     const auto entry = it->second.entries.find(serialKey(X509_get0_serialNumber(cert)));
     if (entry != it->second.entries.end()) return entry->second ? DeltaVerdict::Revoked : DeltaVerdict::Unrevoked;
-    if (it->second.nextUpdate != 0 && std::time(nullptr) > it->second.nextUpdate) return DeltaVerdict::Expired;
+    if (expired) return DeltaVerdict::Expired;
     return DeltaVerdict::None;
 }
 

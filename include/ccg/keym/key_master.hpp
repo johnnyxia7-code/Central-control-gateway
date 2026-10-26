@@ -162,6 +162,7 @@ private:
     std::vector<GroupStatus> results_;
     std::vector<crypto::Block> newKeys_;
     std::set<std::pair<std::size_t, std::uint16_t>> loaded_;  // (group, ECU) holding the new key
+    std::set<std::pair<std::size_t, std::uint16_t>> attemptedLoads_;  // may have stored a key without a reply
     std::set<std::size_t> gatewayStaged_;
 
     std::deque<Step> steps_;

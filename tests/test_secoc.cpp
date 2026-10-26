@@ -1,7 +1,9 @@
 #include <vector>
+#include <stdexcept>
 
 #include "ccg/secoc/secoc.hpp"
 #include "test_framework.hpp"
+#include "vehicle_eth_gateway_matrix.hpp"
 
 using namespace ccg;
 using namespace ccg::secoc;
@@ -172,4 +174,88 @@ TEST_CASE("secoc: configuration checks and missing key") {
     CHECK(!proc.protect(profile1(), a.data(), 1).has_value());
     const Bytes s = {1, 1, 0, 0, 0};
     CHECK(proc.verify(profile1(), s.data(), 1) == VerifyResult::CryptoError);
+}
+
+TEST_CASE("secoc: durable TX restarts stay inside the reference Ethernet window") {
+    const auto matrix = config::makeVehicleEthGatewayMatrix();
+    bool exercised = false;
+    for (const auto& pdu : matrix.pdus) {
+        if (!pdu.secoc || pdu.secoc->freshnessMode != FreshnessMode::Counter) continue;
+        exercised = true;
+        const auto& c = *pdu.secoc;
+        REQUIRE(c.acceptanceWindow == 1000);
+        SoftwareCryptoService crypto;
+        crypto.setKey(c.keyId, key(1));
+        FreshnessManager receiver;
+        SecOcProcessor rx(crypto, receiver);
+        FreshnessManager::Snapshot durable;
+        const Bytes data{1, 2, 3};
+        for (int restart = 0; restart < 5; ++restart) {
+            FreshnessManager sender;
+            sender.restore(durable);  // application's durable mode: no restart margin
+            sender.setPersistence([&](const FreshnessManager::Snapshot& s) { durable = s; });
+            SecOcProcessor tx(crypto, sender);
+            // Also model one counter stored before a crash prevented its transmission.
+            tx.protect(c, data.data(), data.size());
+            const auto packet = tx.protect(c, data.data(), data.size());
+            REQUIRE(packet.has_value());
+            CHECK_EQ(durable.tx.at(c.dataId), 2u * (restart + 1));
+            CHECK(rx.verify(c, packet->data(), data.size()) == VerifyResult::Ok);
+        }
+    }
+    CHECK(exercised);
+}
+
+TEST_CASE("secoc: RX state is durable before acceptance and replays fail after crash") {
+    Pair p;
+    auto c = profile1();
+    c.freshnessTxBits = 64;
+    c.macTxBits = 64;
+    c.acceptanceWindow = 1000;
+    FreshnessManager::Snapshot durable;
+    unsigned writes = 0;
+    p.rxFvm.setPersistence([&](const FreshnessManager::Snapshot& s) {
+        CHECK(s.rx.at(c.dataId) > p.rxFvm.latestRx(c.dataId));
+        durable = s;
+        ++writes;
+    });
+    const Bytes data{1, 2, 3};
+    const auto first = *p.tx.protect(c, data.data(), data.size());
+    REQUIRE(p.rx.verify(c, first.data(), data.size()) == VerifyResult::Ok);
+    const auto captured = *p.tx.protect(c, data.data(), data.size());
+    auto tampered = captured;
+    tampered[0] ^= 1;
+    CHECK(p.rx.verify(c, tampered.data(), data.size()) == VerifyResult::MacFailure);
+    CHECK_EQ(writes, 1u);
+    REQUIRE(p.rx.verify(c, captured.data(), data.size()) == VerifyResult::Ok);
+    CHECK_EQ(writes, 2u);
+    FreshnessManager restarted;
+    restarted.restore(durable); // no orderly shutdown or periodic save
+    SecOcProcessor rx(p.crypto, restarted);
+    CHECK(rx.verify(c, captured.data(), data.size()) == VerifyResult::FreshnessFailure);
+    CHECK(rx.verify(c, first.data(), data.size()) == VerifyResult::FreshnessFailure);
+    const auto next = *p.tx.protect(c, data.data(), data.size());
+    CHECK(rx.verify(c, next.data(), data.size()) == VerifyResult::Ok);
+}
+
+TEST_CASE("secoc: failed persistence prevents TX and successful RX verification") {
+    Pair p;
+    auto c = profile1();
+    c.freshnessTxBits = 64;
+    const Bytes data{7};
+    auto unavailable = [](const FreshnessManager::Snapshot&) { throw std::runtime_error("storage unavailable"); };
+    p.txFvm.setPersistence(unavailable);
+    bool failed = false;
+    try { p.tx.protect(c, data.data(), data.size()); } catch (const std::runtime_error&) { failed = true; }
+    CHECK(failed);
+    CHECK_EQ(p.txFvm.snapshot().tx.at(c.dataId), 0u);
+    p.txFvm.setPersistence({});
+    const auto packet = *p.tx.protect(c, data.data(), data.size());
+    p.rxFvm.setPersistence(unavailable);
+    failed = false;
+    try { p.rx.verify(c, packet.data(), data.size()); } catch (const std::runtime_error&) { failed = true; }
+    CHECK(failed);
+    CHECK_EQ(p.rxFvm.latestRx(c.dataId), 0u);
+    p.rxFvm.setPersistence({});
+    CHECK(p.rx.verify(c, packet.data(), data.size()) == VerifyResult::Ok);
 }

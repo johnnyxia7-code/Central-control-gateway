@@ -93,6 +93,11 @@ std::optional<std::uint64_t> FreshnessManager::nextTx(std::uint16_t dataId, std:
     if (counter >= maxValue(bits)) {
         return std::nullopt;  // counter exhausted: key renewal / counter reset required
     }
+    if (persist_) {
+        auto next = snapshot();
+        next.tx[dataId] = counter + 1;
+        persist_(next);
+    }
     return ++counter;
 }
 
@@ -101,7 +106,14 @@ std::uint64_t FreshnessManager::latestRx(std::uint16_t dataId) const {
     return it == rx_.end() ? 0 : it->second;
 }
 
-void FreshnessManager::acceptRx(std::uint16_t dataId, std::uint64_t value) { rx_[dataId] = value; }
+void FreshnessManager::acceptRx(std::uint16_t dataId, std::uint64_t value) {
+    if (persist_) {
+        auto next = snapshot();
+        next.rx[dataId] = value;
+        persist_(next);
+    }
+    rx_[dataId] = value;
+}
 
 void FreshnessManager::restore(const Snapshot& snapshot, std::uint64_t txMargin) {
     rx_ = snapshot.rx;
@@ -119,6 +131,11 @@ void FreshnessManager::setTripReset(std::uint32_t trip, std::uint32_t reset) {
 }
 
 void FreshnessManager::setStoredTrip(std::uint64_t trip) {
+    if (persist_) {
+        auto next = snapshot();
+        next.trip = trip;
+        persist_(next);
+    }
     storedTrip_ = trip;
     persistRequest_ = true;
 }

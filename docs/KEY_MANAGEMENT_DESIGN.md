@@ -244,8 +244,11 @@ gateway (DoIP client, SA 0x0F00)                     ADAS domain controller (DoI
 
 - **Atomic per group**: a key is activated only when every member proved
   (M4/M5) that it stores it. A failed member (no response, negative response,
-  SHE error, wrong proof) fails the group, and the members that already hold
-  the key discard it. Other groups go ahead.
+  SHE error, wrong proof) fails the group. Cleanup attempts a discard on every
+  member whose load was attempted, including members with a lost or damaged
+  proof that may nevertheless have staged the key. Only proof-confirmed loads
+  can activate. Other groups go ahead. An unreachable member still needs
+  reconciliation in a later campaign; cleanup cannot guarantee its state.
 - **Activation order**: ECUs first, the gateway last. During the switch,
   receivers accept the pending and the previous key (section 4), so no PDU is
   lost whichever side switches first. If an ECU does not confirm the
@@ -259,8 +262,12 @@ gateway (DoIP client, SA 0x0F00)                     ADAS domain controller (DoI
   (e.g. at the next ignition when the ECU is powered).
 - **Diagnostic client**: CAN requests use the gateway's own ISO-TP channels
   (`diag::IDiagClient`, implemented by `DiagGateway`). While the key master
-  talks to a CAN ECU, tester requests to that ECU are refused with a
-  diagnostic NACK. P2 is 1 s, and 5.5 s after NRC 0x78. Ethernet requests use
+  talks to a CAN ECU, physical tester requests to that ECU and functional
+  broadcasts are refused with a diagnostic NACK. Every CAN transaction owns
+  its channel until its matching final response or timeout, including after
+  request transmission completes. Replies must match the requested service
+  and available echoed DID, routine, subfunction, or block sequence. P2 is
+  1 s, and 5.5 s after NRC 0x78. Ethernet requests use
   the DoIP client described above.
 - **Key generation**: `keym::IRandom`. The Linux process uses `getrandom()`
   (`platform::SystemRandom`) and the target uses the HSM TRNG.

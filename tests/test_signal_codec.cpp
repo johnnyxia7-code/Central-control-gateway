@@ -1,5 +1,6 @@
 #include <array>
 #include <cstdint>
+#include <limits>
 
 #include "ccg/can/signal_codec.hpp"
 #include "test_framework.hpp"
@@ -108,4 +109,29 @@ TEST_CASE("codec: numberToRaw rejects non integral and out of range") {
     const auto s = spec(0, 8, ByteOrder::Intel, true);
     CHECK_EQ(*numberToRaw(s, -1.0), 0xFFU);
     CHECK(!numberToRaw(s, 128.0).has_value());
+}
+
+TEST_CASE("codec: integer bounds remain exact through 64 bits") {
+    for (std::uint8_t bits : {1, 8, 32, 53, 54, 63, 64}) {
+        for (bool signedValue : {false, true}) {
+            const auto s = spec(0, bits, ByteOrder::Intel, signedValue);
+            const double upper = std::ldexp(1.0, bits - (signedValue ? 1 : 0));
+            CHECK(!numberToRaw(s, upper).has_value());
+            CHECK(!numberToRaw(s, std::nextafter(upper, INFINITY)).has_value());
+            const double below = std::floor(std::nextafter(upper, 0.0));
+            REQUIRE(numberToRaw(s, below).has_value());
+            CHECK_EQ(*numberToRaw(s, below), static_cast<std::uint64_t>(below));
+            if (signedValue) {
+                CHECK(numberToRaw(s, -upper).has_value());
+                CHECK(!numberToRaw(s, std::nextafter(-upper, -INFINITY)).has_value());
+            } else {
+                CHECK_EQ(*numberToRaw(s, 0.0), 0u);
+                CHECK(!numberToRaw(s, -1.0).has_value());
+            }
+        }
+    }
+    const auto s = spec(0, 64, ByteOrder::Intel);
+    CHECK(!numberToRaw(s, std::numeric_limits<double>::infinity()).has_value());
+    CHECK(!numberToRaw(s, -std::numeric_limits<double>::infinity()).has_value());
+    CHECK(!numberToRaw(s, std::numeric_limits<double>::quiet_NaN()).has_value());
 }

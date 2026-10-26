@@ -955,6 +955,27 @@ TEST_CASE("doip tls linux: a delta CRL ends the connection to a revoked ADAS") {
     CHECK(v.request({0x3E, 0x00})->first == diag::ClientResult::TransportError);
 }
 
+TEST_CASE("doip tls linux: accepted CRL exceptions preserve authenticated tester privileges") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    TempFiles files;
+    const auto foreign = files.add(makeCrl("auth_missing_crl", pki.rogueCa, {}));
+    const auto expired = files.add(makeCrl("auth_expired_crl", pki.ca, {}, true));
+    for (const bool missing : {false, true}) {
+        const std::uint16_t port = missing ? 31581 : 31580;
+        Bench bench(port, withCrl(serverConfig(pki, true), missing ? foreign : expired, !missing, true));
+        Client client(port, pki, &pki.tester);
+        REQUIRE(handshake(bench, client) == std::optional<bool>(true));
+        CHECK_EQ(bench.gw.statistics().authenticatedConnections, 1u);
+        const auto ra = exchange(bench, client, pt::kRoutingActivationRequest, kCentralSecurity,
+                                 pt::kRoutingActivationResponse);
+        REQUIRE(ra.has_value());
+        CHECK_EQ(ra->at(4), 0x10);
+        if (missing) CHECK(bench.server.revocation().missingCrlAccepted > 0u);
+        else CHECK(bench.server.revocation().expiredCrlAccepted > 0u);
+    }
+}
+
 // --------------------------------------------------------------- CRL distribution points
 
 namespace {
@@ -975,6 +996,49 @@ struct ExtraCredentials {
         }
     }
 };
+
+}  // namespace
+
+TEST_CASE("doip tls linux: an expired intermediate delta cannot lift a hold under strict policy") {
+    std::signal(SIGPIPE, SIG_IGN);
+    Pki pki;
+    ExtraCredentials extra;
+    TempFiles files;
+    const auto& intermediate = extra.add(makeCredential("delta_intermediate", "Workshop CA", &pki.ca, true, 20));
+    const auto& tester = extra.add(makeCredential("delta_leaf", "workshop", &intermediate, false, 21));
+    const auto trust = files.add(tempFile("delta_chain_trust"));
+    {
+        std::ofstream out(trust);
+        out << std::ifstream(pki.ca.certFile).rdbuf() << std::ifstream(intermediate.certFile).rdbuf();
+    }
+    const auto rootCrl = files.add(writeCrl("delta_root_crl", pki.ca, complete(5)));
+    const auto intermediateCrl = files.add(writeCrl("delta_intermediate_crl", intermediate,
+                                                   complete(10, {{21, kCertificateHold}})));
+    const auto base = files.add(tempFile("delta_chain_base"));
+    {
+        std::ofstream out(base);
+        out << std::ifstream(rootCrl).rdbuf() << std::ifstream(intermediateCrl).rdbuf();
+    }
+    // Root CRLs remain valid and have another issuer: they cannot incidentally
+    // reject the leaf issuer's expired delta and hide a hold-removal bug.
+    for (const bool expired : {true, false}) {
+        for (const bool acceptExpired : {false, true}) {
+            for (const bool removeHold : {true, false}) {
+                auto spec = delta(11, 10, {{21, removeHold ? kRemoveFromCrl : kKeyCompromise}});
+                spec.expired = expired;
+                const auto d = files.add(writeCrl("delta_chain_changes", intermediate, spec));
+                auto cfg = withDelta(serverConfig(pki, true), base, d, acceptExpired);
+                cfg.caFile = trust;
+                Bench bench(31582, cfg);
+                const bool shouldAccept = removeHold && (!expired || acceptExpired);
+                CHECK_EQ(testerGetsIn(bench, 31582, pki, tester), shouldAccept);
+                if (shouldAccept) CHECK_EQ(bench.gw.statistics().authenticatedConnections, 1u);
+            }
+        }
+    }
+}
+
+namespace {
 
 // DER of a PEM CRL file, as a distribution point serves it.
 test::HttpTestServer::Response crlResponse(const std::string& pemFile) {

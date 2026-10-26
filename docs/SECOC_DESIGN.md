@@ -89,11 +89,23 @@ One Tx and one Rx counter per Data ID.
   `verifyAttempts > 1` the next epoch (+2^`freshnessTxBits`) is tried as well.
   Only a successful verification advances the Rx counter, so forged frames
   cannot push it forward.
-- **Persistence:** counters must survive a reset, otherwise a reused value
-  would make old messages valid again. The gateway process saves a snapshot to
-  `--fv-store` every 10 s and on exit. On start-up the Tx counters are restored
-  with a margin of 10 000, so a value sent after the last snapshot is never
-  sent again. The file is written to `.tmp` first and then renamed.
+- **Persistence:** with `--fv-store`, each proposed Tx/Rx counter is committed
+  before the secured transmission or verified reception can be used. The store
+  is written to `.tmp`, fsynced, renamed, and its parent directory fsynced.
+  Restarts restore exact counters, with no jump beyond the peer's window.
+  A write failure throws before publishing the counter and stops the Linux
+  gateway; a corrupt store also prevents startup. The trip counter uses the
+  same commit hook before its first use, including reset-counter overflow.
+  Omitting `--fv-store` selects volatile bench operation and logs a warning.
+
+This synchronous file backend trades throughput and flash wear for crash
+durability. Production targets should supply an NvM/HSM commit hook with the
+same durable-before-use contract, sized for the traffic rate. Any reservation
+scheme must be designed together with the peer's acceptance window. A lost
+or deleted store requires reprovisioning/synchronization; do not reset
+counters under existing keys. When upgrading from the old periodic store,
+quiesce traffic and establish current counters at both peers or reprovision:
+an old snapshot cannot recover counters used since its last save.
 
 | Attack | Result |
 |--------|--------|
@@ -124,9 +136,10 @@ truncated   = ResetFlag (2 LSBs of ResetCounter) | MessageCounter LSBs (6) =  8 
     accepted value of the same reset period, or from 0 in a new period.
   - The complete FV must be newer than the last accepted one, and the MAC must
     match. With `verifyAttempts > 1` the next message counter epoch is tried as well.
-- **No per-message persistence:** a power cycle increments the trip counter,
+- **No per-message Tx persistence:** a power cycle increments the trip counter,
   so every FV of the new trip is larger than any old one. Messages recorded
   before a restart are rebuilt with the new trip counter and fail the MAC.
+  The shared file backend still commits accepted Rx counters with its snapshot.
 
 ## 4. Freshness value synchronisation master (`secoc::FreshnessSyncMaster`)
 

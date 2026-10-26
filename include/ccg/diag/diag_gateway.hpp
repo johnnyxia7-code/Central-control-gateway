@@ -224,6 +224,12 @@ private:
     struct InternalRequest {
         Callback callback;
         TimePoint deadline{};
+        std::vector<std::uint8_t> uds;
+    };
+
+    struct ExternalRequest {
+        std::vector<std::uint8_t> uds;
+        TimePoint deadline{};
     };
 
     struct Ecu {
@@ -232,6 +238,7 @@ private:
         std::optional<InternalRequest> internal;  // gateway-internal client request
         std::optional<Requester> awaitingAck;    // physical request in ISO-TP transmission
         std::optional<Requester> responseOwner;  // tester that gets the ECU responses
+        std::optional<ExternalRequest> external; // owns the ECU until reply or timeout, not just TX completion
     };
 
     void handleTcpMessage(ConnectionId id, const doip::StreamReassembler::Item& item, TimePoint now);

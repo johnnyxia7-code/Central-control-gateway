@@ -239,3 +239,42 @@ TEST_CASE("fv sync: parameter checks") {
     CHECK(validateFreshnessSync(TripResetLayout{}, syncConfig()).empty());
     CHECK_EQ(syncMessageLength(TripResetLayout{}, syncConfig()), 8U);
 }
+
+TEST_CASE("fv sync: a new trip is persisted before any synchronization message") {
+    Network n;
+    std::uint64_t durableTrip = 0;
+    n.masterFv.setPersistence([&](const FreshnessManager::Snapshot& s) {
+        CHECK(s.trip > n.masterFv.storedTrip());
+        durableTrip = s.trip;
+    });
+    REQUIRE(n.master.start(n.now));
+    CHECK_EQ(durableTrip, 1u);
+    REQUIRE(n.master.mainFunction(n.now).has_value());
+    n.masterFv.setTripReset(1, (1u << n.masterFv.layout().resetBits) - 1);
+    REQUIRE(n.master.mainFunction(n.now + 1000ms).has_value());
+    CHECK_EQ(durableTrip, 2u); // reset overflow is committed before emitting its new trip
+    CHECK_EQ(n.masterFv.tripCounter(), 2u);
+
+    Network failed;
+    failed.masterFv.setPersistence([](const FreshnessManager::Snapshot&) {
+        throw std::runtime_error("NvM failed");
+    });
+    bool threw = false;
+    try { failed.master.start(failed.now); } catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+    CHECK(!failed.master.mainFunction(failed.now).has_value());
+    CHECK_EQ(failed.masterFv.storedTrip(), 0u);
+
+    failed.masterFv.setPersistence({});
+    REQUIRE(failed.master.start(failed.now));
+    REQUIRE(failed.master.mainFunction(failed.now).has_value());
+    failed.masterFv.setTripReset(1, (1u << failed.masterFv.layout().resetBits) - 1);
+    failed.masterFv.setPersistence([](const FreshnessManager::Snapshot&) {
+        throw std::runtime_error("NvM failed on overflow");
+    });
+    threw = false;
+    try { failed.master.mainFunction(failed.now + 1000ms); } catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+    CHECK_EQ(failed.masterFv.tripCounter(), 1u);
+    CHECK_EQ(failed.masterFv.storedTrip(), 1u);
+}

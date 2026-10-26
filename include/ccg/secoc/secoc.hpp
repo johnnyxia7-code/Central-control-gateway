@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -136,15 +137,21 @@ public:
     // True once after the stored trip counter changed: persist the snapshot now.
     bool takePersistRequest();
 
-    // Persistence (NvM). Tx counters skip `txMargin` values on restore so that
-    // a value used after the last snapshot is never sent again.
+    // Persistence (NvM). With a durable callback, every counter is stored
+    // before use and restore needs no margin. Legacy periodic snapshots may
+    // use txMargin, but it must fit the receiver's acceptance window.
     struct Snapshot {
         std::map<std::uint16_t, std::uint64_t> tx;
         std::map<std::uint16_t, std::uint64_t> rx;
         std::uint64_t trip = 0;
     };
     Snapshot snapshot() const { return {tx_, rx_, storedTrip_}; }
-    void restore(const Snapshot& snapshot, std::uint64_t txMargin);
+    void restore(const Snapshot& snapshot, std::uint64_t txMargin = 0);
+    // The callback must durably save the proposed snapshot before returning,
+    // or throw. Exceptions propagate before transmission / successful
+    // verification / trip activation, so the caller can stop fail-closed.
+    using Persist = std::function<void(const Snapshot&)>;
+    void setPersistence(Persist persist) { persist_ = std::move(persist); }
 
 private:
     struct SyncTx {
@@ -161,6 +168,7 @@ private:
     std::map<std::uint16_t, SyncTx> syncTx_;
     std::uint64_t storedTrip_ = 0;
     bool persistRequest_ = false;
+    Persist persist_;
 };
 
 class SecOcProcessor {

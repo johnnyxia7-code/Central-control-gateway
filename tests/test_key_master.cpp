@@ -493,3 +493,45 @@ TEST_CASE("key master: starting a campaign needs a certificate-authenticated tes
         CHECK(v.master.state() == keym::KeyMaster::State::Idle);
     }
 }
+
+TEST_CASE("key master: uncertain key loads are discarded without activating them") {
+    for (int failure = 0; failure < 3; ++failure) {
+        Vehicle v;
+        struct FaultyReply final : diag::IDiagClient {
+            diag::IDiagClient& inner;
+            int failure;
+            unsigned discards = 0;
+            unsigned loads = 0;
+            FaultyReply(diag::IDiagClient& c, int f) : inner(c), failure(f) {}
+            bool reaches(std::uint16_t target) const override { return inner.reaches(target); }
+            void request(std::uint16_t target, Bytes uds, diag::TimePoint now, Callback callback) override {
+                const bool load = uds.size() >= 4 && uds[0] == 0x31 && uds[2] == 0xF2 && uds[3] == 0;
+                if (uds.size() >= 4 && uds[0] == 0x31 && uds[2] == 0xF2 && uds[3] == 2) ++discards;
+                inner.request(target, std::move(uds), now,
+                    [this, load, callback = std::move(callback)](diag::ClientResult result, Bytes reply) {
+                        if (load && result == diag::ClientResult::Ok) {
+                            ++loads; // ECU has already applied the load
+                            if (failure == 0) { callback(diag::ClientResult::Timeout, {}); return; }
+                            if (failure == 1) reply.back() ^= 1; // damaged M4/M5
+                            if (failure == 2) reply = {0x7F, 0x31, 0x72}; // persistence confirmation lost
+                        }
+                        callback(result, std::move(reply));
+                    });
+            }
+        } client(v.router, failure);
+        keym::KeyMaster master(config::makeVehicleKeyMaster(), v.gatewayKeys, client, v.random);
+        REQUIRE(master.start(v.now, {3}));
+        for (int i = 0; i < 20000 && master.state() == keym::KeyMaster::State::Running; ++i) {
+            v.tick();
+            master.mainFunction(v.now);
+        }
+        REQUIRE(master.state() == keym::KeyMaster::State::Finished);
+        CHECK_EQ(client.loads, 1u);
+        CHECK_EQ(client.discards, 1u);
+        CHECK(master.results()[3].result != GroupResult::Activated);
+        CHECK(!v.adas->keys().hasPending());
+        CHECK(!v.gatewayKeys.hasPending());
+        CHECK_EQ(Vehicle::status(v.adas->keys(), kKey1).counter, 1u);
+        CHECK_EQ(Vehicle::status(v.gatewayKeys, ks::kAdasGw).counter, 1u);
+    }
+}
