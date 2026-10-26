@@ -123,7 +123,7 @@ private:
     enum class Phase : std::uint8_t { Prepare, Load, Activate };
 
     struct Step {
-        enum class Kind : std::uint8_t { Session, ReadUid, ReadStatus, Load, Activate, Discard };
+        enum class Kind : std::uint8_t { Session, ReadUid, ReadStatus, ReadCounters, Load, Activate, Discard };
         Kind kind;
         std::uint16_t ecu = 0;
         std::vector<std::size_t> groups;  // Load: one group; Activate/Discard: their slots in the ECU

@@ -1,4 +1,5 @@
 #include <vector>
+#include <stdexcept>
 
 #include "ccg/secoc/fv_sync.hpp"
 #include "ccg/secoc/secoc.hpp"
@@ -277,4 +278,19 @@ TEST_CASE("fv sync: a new trip is persisted before any synchronization message")
     CHECK(threw);
     CHECK_EQ(failed.masterFv.tripCounter(), 1u);
     CHECK_EQ(failed.masterFv.storedTrip(), 1u);
+}
+
+TEST_CASE("fv sync: invalid MAC configuration and null messages are rejected") {
+    SoftwareCryptoService crypto;
+    FreshnessManager fvm;
+    auto config = syncConfig();
+    config.macTxBits = 129;
+    bool masterRejected = false, slaveRejected = false;
+    try { FreshnessSyncMaster master(config, crypto, fvm); }
+    catch (const std::invalid_argument&) { masterRejected = true; }
+    try { FreshnessSyncSlave slave(config, crypto, fvm); }
+    catch (const std::invalid_argument&) { slaveRejected = true; }
+    CHECK(masterRejected && slaveRejected);
+    FreshnessSyncSlave slave(syncConfig(), crypto, fvm);
+    CHECK(slave.onSyncMessage(nullptr, 8) == SyncResult::LengthError);
 }

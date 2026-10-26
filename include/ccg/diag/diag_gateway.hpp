@@ -1,4 +1,5 @@
 #pragma once
+#include "ccg/security/event_recorder.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -163,6 +164,7 @@ public:
     DiagGateway(DiagRoutingConfig config, IDiagTransport& transport);
 
     // Starts the vehicle announcements.
+    void setSecurityRecorder(security::EventRecorder& recorder) { securityRecorder_ = &recorder; }
     void start(TimePoint now);
 
     // `security`: what the TLS layer established (plain TCP by default).
@@ -196,6 +198,7 @@ public:
     const DiagRoutingConfig& config() const { return config_; }
 
 private:
+    security::EventRecorder* securityRecorder_ = nullptr;
     struct Requester {
         ConnectionId connection = 0;
         std::uint16_t tester = 0;

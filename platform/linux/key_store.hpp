@@ -11,6 +11,8 @@
 //   active   <slot> <counter> <flags> <key, 32 hex digits>
 //   pending  <slot> <counter> <flags> <key>
 //   previous <slot> <counter> <flags> <key> <remaining grace period in ms>
+// New stores also contain "version 2", "counter <slot> <highest accepted>"
+// and a terminal "end" marker. Legacy stores require controlled migration.
 //
 // The diagnostic gateway process owns the file (key updates over UDS); the
 // Ethernet gateway process reloads it when it changes.
@@ -19,7 +21,7 @@ namespace ccg::platform {
 // nullopt if the file does not exist. Throws on malformed content.
 std::optional<keym::KeyManager::Snapshot> loadKeyStore(const std::string& path);
 
-// Written with mode 0600 to "<path>.tmp", flushed to disk and renamed.
+// Written to a unique mode-0600 file, synced, renamed, then directory synced.
 bool saveKeyStore(const std::string& path, const keym::KeyManager::Snapshot& snapshot);
 
 // Detects a replaced or modified file (inode, size, modification time).

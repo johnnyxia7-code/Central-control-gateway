@@ -85,8 +85,7 @@ private:
 
 class FreshnessSyncSlave {
 public:
-    FreshnessSyncSlave(SyncMessageConfig config, ICryptoService& crypto, FreshnessManager& freshness)
-        : cfg_(std::move(config)), crypto_(crypto), freshness_(freshness) {}
+    FreshnessSyncSlave(SyncMessageConfig config, ICryptoService& crypto, FreshnessManager& freshness);
 
     SyncResult onSyncMessage(const std::uint8_t* data, std::size_t length);
 

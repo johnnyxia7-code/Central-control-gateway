@@ -26,6 +26,12 @@ std::optional<std::vector<std::uint8_t>> KeyManagementService::handle(
         if (request.size() != 3) return std::nullopt;
         const auto did = static_cast<std::uint16_t>((request[1] << 8) | request[2]);
         if (did == uds::kDidKeyStatus) return keyStatus();
+        if (did == uds::kDidUpdateCounters) {
+            const auto slots = keys_.status();
+            std::vector<std::uint8_t> out = {0x62, request[1], request[2], static_cast<std::uint8_t>(slots.size())};
+            for (const auto& s : slots) { out.push_back(s.slot); putU32(out, s.updateCounter); }
+            return out;
+        }
         if (did == uds::kDidUid) {
             std::vector<std::uint8_t> out = {0x62, request[1], request[2]};
             out.insert(out.end(), keys_.config().uid.begin(), keys_.config().uid.end());

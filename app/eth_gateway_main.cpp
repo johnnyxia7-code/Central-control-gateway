@@ -24,6 +24,7 @@
 #include "ccg/ethgw/ethernet_gateway.hpp"
 #include "ccg/keym/key_manager.hpp"
 #include "key_store.hpp"
+#include "security_runtime.hpp"
 #include "socketcan_transport.hpp"
 #include "secoc_storage.hpp"
 #include "udp_socket.hpp"
@@ -92,6 +93,7 @@ int main(int argc, char** argv) {
     std::string keyFile;
     std::string fvStore;
     std::string keyStore;
+    std::string securityLog;
     bool demoKeys = false;
     try {
         for (int i = 1; i < argc; ++i) {
@@ -101,7 +103,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             if ((arg == "--bind" || arg == "--period-ms" || arg == "--keys" || arg == "--fv-store" ||
-                 arg == "--key-store") &&
+                 arg == "--key-store" || arg == "--security-log") &&
                 i + 1 < argc) {
                 const std::string value = argv[++i];
                 if (arg == "--period-ms") {
@@ -116,6 +118,7 @@ int main(int argc, char** argv) {
                     fvStore = value;
                     continue;
                 }
+                if (arg == "--security-log") { securityLog = value; continue; }
                 if (arg == "--key-store") {
                     keyStore = value;
                     continue;
@@ -134,7 +137,7 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\nusage: " << argv[0]
                   << " --bind CHANNEL=IFACE | --bind CHANNEL=udp:LPORT:IP:RPORT ... "
-                     "(--key-store FILE | --keys FILE | --demo-keys) [--fv-store FILE] [--period-ms N]\n";
+                     "(--key-store FILE | --keys FILE | --demo-keys) [--fv-store FILE] [--security-log FILE] [--period-ms N]\n";
         return EXIT_FAILURE;
     }
 
@@ -142,6 +145,7 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, onSignal);
 
     try {
+        platform::SecurityRuntime securityRuntime(securityLog);
         auto config = config::makeVehicleEthGatewayMatrix();
         LinuxTransmitter transmitter(config.channels.size());
 
@@ -181,6 +185,7 @@ int main(int argc, char** argv) {
         // SecOC keys (HSM on the target) and persisted freshness counters.
         secoc::SoftwareCryptoService crypto;
         keym::KeyManager keyManager(config::makeVehicleKeySlots());
+        keyManager.setSecurityRecorder(securityRuntime.recorder());
         std::unique_ptr<platform::FileWatcher> keyWatcher;
         auto reloadKeys = [&](ethgw::TimePoint t) {
             const auto snapshot = platform::loadKeyStore(keyStore);
@@ -217,6 +222,7 @@ int main(int argc, char** argv) {
         }
         const auto period = std::chrono::milliseconds(periodMs);
         auto now = ethgw::Clock::now();
+        gateway.setSecurityRecorder(securityRuntime.recorder());
         gateway.start(now);
         if (!gateway.freshnessMasterActive()) {
             std::cout << "[ethgw] WARNING: FV master inactive (trip counter exhausted) - "
@@ -254,11 +260,7 @@ int main(int argc, char** argv) {
                     if (now >= nextKeyCheck) {
                         nextKeyCheck = now + std::chrono::seconds(1);
                         if (keyWatcher->changed()) {
-                            try {
-                                reloadKeys(now);  // keys updated / activated over UDS
-                            } catch (const std::exception& e) {
-                                std::cerr << "[ethgw] keeping current keys: " << e.what() << "\n";
-                            }
+                            reloadKeys(now); // invalid or rolled-back state stops processing
                         }
                     }
                 }
@@ -266,6 +268,7 @@ int main(int argc, char** argv) {
                 nextTick += period;
                 if (nextTick <= now) nextTick = now + period;
             }
+            securityRuntime.flush(now);
             if (now >= nextStats) {
                 printStatistics(gateway.statistics());
                 if (keyWatcher) {

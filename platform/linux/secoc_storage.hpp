@@ -17,7 +17,7 @@ std::size_t loadKeyFile(const std::string& path, secoc::SoftwareCryptoService& c
 // nullopt if the file does not exist.
 std::optional<secoc::FreshnessManager::Snapshot> loadFreshness(const std::string& path);
 
-// Written to "<path>.tmp" and renamed, so a power loss never leaves a torn file.
+// Written to a unique private temporary file, then file/directory synced around rename.
 bool saveFreshness(const std::string& path, const secoc::FreshnessManager::Snapshot& snapshot);
 
 }  // namespace ccg::platform

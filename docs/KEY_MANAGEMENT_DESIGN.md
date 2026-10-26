@@ -85,7 +85,7 @@ Checks of `KeyManager::loadKey` (SHE CMD_LOAD_KEY), in this order:
 | target not write-protected | `ERC_KEY_WRITE_PROTECTED` |
 | M3 correct (CMAC with K2) | `ERC_KEY_UPDATE_ERROR` (counts towards the lockout) |
 | UID = gateway UID, or wildcard and the key allows it | `ERC_KEY_UPDATE_ERROR` |
-| counter > counter of the active and of the pending key (anti-rollback) | `ERC_KEY_UPDATE_ERROR` |
+| counter > highest accepted counter, including discarded generations (anti-rollback) | `ERC_KEY_UPDATE_ERROR` |
 
 On success the gateway returns M4/M5, computed from the new key and its own UID
 (also for a wildcard update). The backend compares them with its own
@@ -157,9 +157,16 @@ outcome is reported as the SHE error code so the backend can tell an
 authentication failure from a rollback. The routines without such
 cryptographic protection rely on the tester's TLS client certificate (above).
 
-**Persistence before confirmation**: the service writes the key store before
-it returns M4/M5 or the activation result. If that fails it answers NRC 0x72 and
-the backend retries with the next counter value.
+**Durable commit before publication**: the Linux process installs the key
+manager's snapshot callback before enabling key updates. Every proposed mutation
+is saved before changing live keys or returning success. A failed durable write
+throws and stops the process; restart from the last valid store and reconcile the
+campaign before retrying. The legacy service-level bool callback can still return
+NRC 0x72 in bench integrations, but does not guarantee atomic publication.
+
+`22 F2 A2` returns `62 F2 A2 <count> { <slot> <highest accepted counter:4> }`.
+The key master requires this DID before renewal, including after discard. See
+[migration requirements](CYBERSECURITY_READINESS.md#key-store-and-ecu-protocol-migration).
 
 ## 6. Security events
 
@@ -168,6 +175,10 @@ the backend retries with the next counter value.
 code), `UPDATE_LOCKED`, `KEY_ACTIVATED`, `PENDING_DISCARDED`,
 `PREVIOUS_KEY_EXPIRED`. MAC failures of SecOC PDUs remain SecOC security events
 of the Ethernet gateway.
+
+Both Linux processes now connect these sensors to the bounded `EventRecorder`.
+Use separate `--security-log FILE` paths for durable rotating JSONL journals.
+See [event semantics and limits](CYBERSECURITY_READINESS.md#reference-idps-path).
 
 ## 7. In-vehicle key master (`keym::KeyMaster`)
 
@@ -315,9 +326,9 @@ previous <slot> <counter> <flags hex> <key hex> <remaining grace period ms>
   key store file are the bench stand-in. Production (EOL) provisioning of
   MASTER_ECU_KEY is a plant process; `provision()` models it.
 - Key master: the campaign runs the ECUs one after the other (one request in
-  flight), and its results are not persisted across a restart. Generation
-  numbers of discarded (never activated) keys can be used again by the next
-  campaign. The key master does not unlock ECUs with SecurityAccess, because
+  flight), and its results are not persisted across a restart. Discarded
+  generations remain reserved and are never reused by later campaigns.
+  The key master does not unlock ECUs with SecurityAccess, because
   the SHE container is the authorisation.
 - No key validity period / automatic renewal schedule; the backend decides when
   to renew.

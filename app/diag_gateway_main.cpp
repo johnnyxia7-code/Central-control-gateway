@@ -73,6 +73,7 @@
 #endif
 #include "doip_tcp_connector.hpp"
 #include "key_store.hpp"
+#include "security_runtime.hpp"
 #include "tls_revocation.hpp"
 #include "socketcan_transport.hpp"
 #include "system_random.hpp"
@@ -158,6 +159,7 @@ int main(int argc, char** argv) {
     std::uint16_t port = doip::kPort;
     std::string broadcast = "255.255.255.255";
     std::string keyStore;
+    std::string securityLog;
     bool demoKeys = false;
     std::map<std::string, std::string> doipEndpoints;
     std::string tlsCert, tlsKey, tlsCa;
@@ -215,6 +217,8 @@ int main(int argc, char** argv) {
                 port = static_cast<std::uint16_t>(std::stoul(value));
             } else if (arg == "--broadcast") {
                 broadcast = value;
+            } else if (arg == "--security-log") {
+                securityLog = value;
             } else if (arg == "--key-store") {
                 keyStore = value;
             } else if (arg == "--tls-cert") {
@@ -285,7 +289,7 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\nusage: " << argv[0]
                   << " --can CHANNEL=IFACE ... [--port 13400] [--broadcast ADDR]"
-                     " [--key-store FILE [--demo-keys]] [--doip ECU=IP:PORT]"
+                     " [--key-store FILE [--demo-keys]] [--security-log FILE] [--doip ECU=IP:PORT]"
                      " [--tls-cert PEM --tls-key PEM [--tls-ca PEM] [--tls-require-client-cert] [--tls-only]"
                      " [--tls-port 3496]] [--vehicle-ca PEM [--vehicle-cert PEM --vehicle-key PEM]]"
                      " [--doip-plain] [--tls-crl PEM] [--vehicle-crl PEM] [--tls-delta-crl PEM]"
@@ -300,6 +304,7 @@ int main(int argc, char** argv) {
     std::signal(SIGPIPE, SIG_IGN);  // a tester resetting its TLS socket must not end the process
 
     try {
+        platform::SecurityRuntime securityRuntime(securityLog);
         auto config = config::makeVehicleDiagRouting();
         config.entity.requireTls = tlsOnly;
         config.entity.tlsPort = tlsPort;
@@ -393,6 +398,7 @@ int main(int argc, char** argv) {
         auto saveKeys = [&] { return platform::saveKeyStore(keyStore, keys->snapshot(diag::Clock::now())); };
         if (!keyStore.empty()) {
             keys = std::make_unique<keym::KeyManager>(config::makeVehicleKeySlots());
+            keys->setSecurityRecorder(securityRuntime.recorder());
             if (const auto snapshot = platform::loadKeyStore(keyStore)) {
                 keys->restore(*snapshot, now);
                 std::cout << "[diag] key store " << keyStore << " loaded (" << snapshot->keys.size() << " keys)\n";
@@ -405,12 +411,17 @@ int main(int argc, char** argv) {
             }
             keys->takePersistRequest();
             keyEventsSeen = keys->eventCount();
-            keyService = std::make_unique<keym::KeyManagementService>(*keys, saveKeys, true);
+            keys->setPersistence([&](const keym::KeyManager::Snapshot& snapshot) {
+                if (!platform::saveKeyStore(keyStore, snapshot))
+                    throw std::runtime_error("cannot durably persist key store " + keyStore);
+            });
+            keyService = std::make_unique<keym::KeyManagementService>(*keys, std::function<bool()>{}, true);
             gateway.addLocalService(*keyService);
             keyMaster = std::make_unique<keym::KeyMaster>(config::makeVehicleKeyMaster(), *keys, diagClients, random);
             keyMaster->setTrace([](const std::string& t) { std::cout << "[keym] " << t << "\n"; });
             gateway.addLocalService(*keyMaster);
         }
+        gateway.setSecurityRecorder(securityRuntime.recorder());
         gateway.start(now);
         std::cout << "[diag] DoIP entity listening on TCP/UDP " << port << "\n";
 
@@ -486,14 +497,13 @@ int main(int argc, char** argv) {
                 if (keys) {
                     keyMaster->mainFunction(now);
                     keys->mainFunction(now);  // previous keys expire after the grace period
-                    if (keys->takePersistRequest() && !saveKeys()) {
-                        std::cerr << "[diag] ERROR: cannot persist key store " << keyStore << "\n";
-                    }
+                    keys->takePersistRequest(); // durable callback already committed every mutation
                     printKeyEvents(*keys, keyEventsSeen);
                 }
                 nextTick += std::chrono::milliseconds(1);
                 if (nextTick <= now) nextTick = now + std::chrono::milliseconds(1);
             }
+            securityRuntime.flush(now);
             if (now >= nextStats) {
                 printStatistics(gateway.statistics());
                 nextStats = now + std::chrono::seconds(10);

@@ -1,4 +1,5 @@
 #pragma once
+#include "ccg/security/event_recorder.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -90,6 +91,7 @@ public:
     EthernetGateway(RoutingConfig config, IGatewayTransmitter& transmitter,
                     secoc::ICryptoService* crypto = nullptr);
 
+    void setSecurityRecorder(security::EventRecorder& recorder) { securityRecorder_ = &recorder; }
     void start(TimePoint now);
 
     void onCanFrame(std::size_t channel, const can::CanFrame& frame, TimePoint now);
@@ -115,6 +117,7 @@ public:
                                                     const std::string& signal) const;
 
 private:
+    security::EventRecorder* securityRecorder_ = nullptr;
     struct PduState {
         std::size_t channel = 0;
         std::vector<std::uint8_t> buffer;  // assembled content (targets)

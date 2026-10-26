@@ -494,6 +494,7 @@ void DiagGateway::handleDiagnosticMessage(ConnectionId id, const std::vector<std
             return;
         }
         if (!c.security.clientAuthenticated) {
+            if (securityRecorder_) securityRecorder_->report(security::EventId::DiagnosticDenied, target, now);
             sendDiagAck(req, target);
             sendDiagMessage(req, target, {0x7F, 0x31, 0x33});
             return;

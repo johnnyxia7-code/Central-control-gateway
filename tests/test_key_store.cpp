@@ -91,3 +91,37 @@ TEST_CASE("key store: missing file, malformed entries and change detection") {
     std::remove(path.c_str());
     CHECK(watcher.changed());
 }
+
+
+TEST_CASE("key store: strict parsing rejects empty truncated duplicate and trailing records") {
+    const auto path = tempPath("strict_keys");
+    const std::string row = "active 6 1 02 000102030405060708090a0b0c0d0e0f\n";
+    for (const auto& data : std::vector<std::string>{"", "version 2\n" + row, row + row,
+            "counter 6 2junk\n", "counter -1 2\n", "counter 6 2 extra\n",
+            "version 2\ncounter 6 0\n" + row + "end\n"}) {
+        { std::ofstream out(path); out << data; }
+        bool threw = false;
+        try { platform::loadKeyStore(path); } catch (const std::runtime_error&) { threw = true; }
+        CHECK(threw);
+    }
+    std::remove(path.c_str());
+}
+
+TEST_CASE("key store: discarded counter floor persists and predictable temp links are harmless") {
+    const auto path = tempPath("counter_floor");
+    const auto victim = path + ".victim";
+    { std::ofstream out(victim); out << "unchanged"; }
+    REQUIRE(::symlink(victim.c_str(), (path + ".tmp").c_str()) == 0);
+    keym::KeyManager km(config::makeVehicleKeySlots());
+    const keym::TimePoint now{};
+    config::provisionDemoKeyStore(km, now);
+    keym::she::Flags flags; flags.keyUsage = true;
+    REQUIRE(km.stageInternal(config::keyslot::kVcuGw, crypto::Block{}, 8, flags, now) == keym::she::ErrorCode::NoError);
+    km.discardPending(now);
+    REQUIRE(platform::saveKeyStore(path, km.snapshot(now)));
+    keym::KeyManager reboot(config::makeVehicleKeySlots());
+    reboot.restore(*platform::loadKeyStore(path), now);
+    CHECK(reboot.stageInternal(config::keyslot::kVcuGw, crypto::Block{}, 8, flags, now) == keym::she::ErrorCode::KeyUpdateError);
+    std::ifstream in(victim); std::string contents; in >> contents; CHECK(contents == "unchanged");
+    std::remove(path.c_str()); std::remove((path + ".tmp").c_str()); std::remove(victim.c_str());
+}

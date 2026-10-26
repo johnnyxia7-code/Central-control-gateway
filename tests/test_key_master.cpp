@@ -463,11 +463,24 @@ TEST_CASE("key master: an ADAS group renewal uses one DoIP connection and routin
     Vehicle v;
     REQUIRE(v.runCampaign({3}));
     CHECK(v.master.results()[3].result == GroupResult::Activated);
-    // Session, UID, status, session, load, session, activate: one connection, one activation.
+    // Session, UID, status, counter floors, session, load, session, activate: one connection, one activation.
     CHECK_EQ(v.doip.statistics().connects, 1u);
     CHECK_EQ(v.doip.statistics().activations, 1u);
-    CHECK_EQ(v.doip.statistics().responses, 7u);
+    CHECK_EQ(v.doip.statistics().responses, 8u);
     CHECK_EQ(v.doip.statistics().nacks, 0u);
+}
+
+TEST_CASE("key master: generation advances beyond an ECU's discarded update after reboot") {
+    Vehicle v;
+    auto& keys = v.ecuKeys(dg::kAdas);
+    keym::she::Flags flags; flags.keyUsage = true;
+    REQUIRE(keys.stageInternal(kKey1, config::demoKey(0x31), 41, flags, v.now) == keym::she::ErrorCode::NoError);
+    keys.discardPending(v.now);
+    const auto disk = keys.snapshot(v.now);
+    keys.restore(disk, v.now);
+    REQUIRE(v.runCampaign({3}));
+    CHECK(v.master.results()[3].result == GroupResult::Activated);
+    CHECK_EQ(v.master.results()[3].generation, 42u);
 }
 
 TEST_CASE("key master: starting a campaign needs a certificate-authenticated tester") {
@@ -533,5 +546,43 @@ TEST_CASE("key master: uncertain key loads are discarded without activating them
         CHECK(!v.gatewayKeys.hasPending());
         CHECK_EQ(Vehicle::status(v.adas->keys(), kKey1).counter, 1u);
         CHECK_EQ(Vehicle::status(v.gatewayKeys, ks::kAdasGw).counter, 1u);
+    }
+}
+
+TEST_CASE("key master: inconsistent metadata is refused and unconfirmed activation is reported failed") {
+    for (int fault = 0; fault < 4; ++fault) {
+        Vehicle v;
+        struct AlterReply final : diag::IDiagClient {
+            diag::IDiagClient& inner;
+            int fault;
+            AlterReply(diag::IDiagClient& c, int f) : inner(c), fault(f) {}
+            bool reaches(std::uint16_t target) const override { return inner.reaches(target); }
+            void request(std::uint16_t target, Bytes uds, diag::TimePoint now, Callback cb) override {
+                const auto original = uds;
+                inner.request(target, std::move(uds), now,
+                    [this, original, cb = std::move(cb)](diag::ClientResult result, Bytes reply) {
+                        if (result == diag::ClientResult::Ok) {
+                            if (fault == 0 && original == (Bytes{0x22, 0xF2, 0xA1})) reply[2] = 0xA0;
+                            if (fault == 1 && original == (Bytes{0x22, 0xF2, 0xA2})) reply = {0x62, 0xF2, 0xA2, 0};
+                            if (fault == 2 && original == (Bytes{0x22, 0xF2, 0xA0}) && reply.size() >= 24)
+                                reply[14] = reply[4]; // duplicate slot
+                            if (fault == 3 && original.size() >= 4 && original[0] == 0x31 && original[3] == 1)
+                                reply.back() = 0; // nothing activated according to the acknowledgement
+                        }
+                        cb(result, std::move(reply));
+                    });
+            }
+        } client(v.router, fault);
+        keym::KeyMaster master(config::makeVehicleKeyMaster(), v.gatewayKeys, client, v.random);
+        REQUIRE(master.start(v.now, {3}));
+        for (int i = 0; i < 20000 && master.state() == keym::KeyMaster::State::Running; ++i) {
+            v.tick(); master.mainFunction(v.now);
+        }
+        REQUIRE(master.state() == keym::KeyMaster::State::Finished);
+        CHECK(master.results()[3].result != GroupResult::Activated);
+        // Existing convergence policy switches the gateway after all load proofs
+        // even if an activation reply is lost/invalid, but must report the failure.
+        CHECK_EQ(Vehicle::status(v.gatewayKeys, ks::kAdasGw).counter, fault == 3 ? 2u : 1u);
+        if (fault == 3) CHECK(master.results()[3].result == GroupResult::ActivationFailed);
     }
 }

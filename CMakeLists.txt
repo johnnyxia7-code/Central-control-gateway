@@ -165,6 +165,7 @@ if(CCG_BUILD_TESTS)
   enable_testing()
   add_executable(ccg_tests
     tests/test_main.cpp
+    tests/test_event_recorder.cpp
     tests/test_signal_codec.cpp
     tests/test_e2e.cpp
     tests/test_someip.cpp
@@ -189,7 +190,7 @@ if(CCG_BUILD_TESTS)
   if(TARGET ccg_platform_linux)
     target_sources(ccg_tests PRIVATE tests/test_someip_udp_binding.cpp tests/test_udp_socket.cpp
                                      tests/test_doip_sockets.cpp tests/test_secoc_storage.cpp
-                                     tests/test_key_store.cpp tests/test_crl_fetcher_linux.cpp)
+                                     tests/test_key_store.cpp tests/test_crl_fetcher_linux.cpp tests/test_security_journal_linux.cpp)
     target_link_libraries(ccg_tests PRIVATE ccg_platform_linux)
   endif()
   if(OpenSSL_FOUND)  # test-only cross-check of the software AES-CMAC

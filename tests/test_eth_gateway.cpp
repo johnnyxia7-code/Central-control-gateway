@@ -602,6 +602,9 @@ TEST_CASE("secoc gateway: verify on ETH_ADAS, re-authenticate for CHS_CAN") {
 
 TEST_CASE("secoc gateway: tampered, replayed and forged PDUs are dropped") {
     Fixture f;
+    std::vector<security::EventRecord> recorded;
+    security::EventRecorder recorder([&](const security::EventRecord& e) { recorded.push_back(e); return true; });
+    f.gw.setSecurityRecorder(recorder);
     SecureEcu adas;
     const auto& cfg = *f.def("ADAS_SteerTorqueReq").secoc;
     const auto request = steerRequest(1.0, true);
@@ -631,6 +634,11 @@ TEST_CASE("secoc gateway: tampered, replayed and forged PDUs are dropped") {
     CHECK(events[0].result == secoc::VerifyResult::MacFailure);
     CHECK(events[1].result == secoc::VerifyResult::FreshnessFailure);
     CHECK_EQ(events[2].channel, gw::kEthAdas);
+    recorder.flush(f.now);
+    REQUIRE(recorded.size() == 2u);
+    CHECK(recorded[0].id == security::EventId::SecOcMac);
+    CHECK_EQ(recorded[0].count, 2u);
+    CHECK(recorded[1].id == security::EventId::SecOcFreshness);
 }
 
 TEST_CASE("secoc gateway: unauthenticated source falls back to the safe state") {

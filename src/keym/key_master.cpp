@@ -136,6 +136,7 @@ bool KeyMaster::start(TimePoint now, const std::vector<std::size_t>& groups) {
         steps_.push_back({Step::Kind::Session, ecu, {}});
         steps_.push_back({Step::Kind::ReadUid, ecu, {}});
         steps_.push_back({Step::Kind::ReadStatus, ecu, {}});
+        steps_.push_back({Step::Kind::ReadCounters, ecu, {}});
     }
     trace("key master: campaign for " + std::to_string(selected_.size()) + " key group(s), " +
           std::to_string(ecuOrder_.size()) + " ECU(s)");
@@ -197,6 +198,7 @@ std::vector<std::uint8_t> KeyMaster::requestFor(const Step& s) const {
         case Step::Kind::Session: return {0x10, 0x03};
         case Step::Kind::ReadUid: return {0x22, uds::kDidUid >> 8, uds::kDidUid & 0xFF};
         case Step::Kind::ReadStatus: return {0x22, uds::kDidKeyStatus >> 8, uds::kDidKeyStatus & 0xFF};
+        case Step::Kind::ReadCounters: return {0x22, uds::kDidUpdateCounters >> 8, uds::kDidUpdateCounters & 0xFF};
         case Step::Kind::Load: {
             const std::size_t g = s.groups.front();
             const auto& ecu = ecus_.at(s.ecu);
@@ -241,13 +243,13 @@ void KeyMaster::process(const Step& s, diag::ClientResult result, const std::vec
     const bool negative = !rsp.empty() && rsp[0] == 0x7F;
     switch (s.kind) {
         case Step::Kind::Session:
-            if (rsp.size() < 2 || rsp[0] != 0x50) {
+            if (rsp.size() < 2 || (rsp[0] != 0x50 || rsp[1] != 0x03)) {
                 failEcu(s.ecu, phase_ == Phase::Activate ? GroupResult::ActivationFailed : GroupResult::EcuRefused);
             }
             return;
         case Step::Kind::ReadUid: {
             auto& ecu = ecus_[s.ecu];
-            if (negative || rsp.size() != 3 + ecu.uid.size()) {
+            if (negative || rsp.size() != 3 + ecu.uid.size() || rsp[0] != 0x62 || rsp[1] != 0xF2 || rsp[2] != 0xA1) {
                 failEcu(s.ecu, GroupResult::EcuRefused);
                 return;
             }
@@ -256,19 +258,41 @@ void KeyMaster::process(const Step& s, diag::ClientResult result, const std::vec
         }
         case Step::Kind::ReadStatus: {
             auto& ecu = ecus_[s.ecu];
-            if (negative || rsp.size() < 4 || rsp.size() != 4u + 10u * rsp[3]) {
+            if (negative || rsp.size() < 4 || rsp.size() != 4u + 10u * rsp[3] || rsp[0] != 0x62 || rsp[1] != 0xF2 || rsp[2] != 0xA0) {
                 failEcu(s.ecu, GroupResult::EcuRefused);
                 return;
             }
             for (std::size_t i = 0; i < rsp[3]; ++i) {
                 const std::uint8_t* e = &rsp[4 + 10 * i];
+                if (ecu.newest.count(e[0]) || e[0] > she::kKey10 || (e[1] & ~0x1F) ||
+                    readU32(e + 2) > she::kMaxCounter || readU32(e + 6) > she::kMaxCounter) {
+                    failEcu(s.ecu, GroupResult::EcuRefused); return;
+                }
                 ecu.newest[e[0]] = std::max(readU32(e + 2), readU32(e + 6));
             }
             return;
         }
+        case Step::Kind::ReadCounters: {
+            auto& ecu = ecus_[s.ecu];
+            if (rsp.size() < 4 || rsp[0] != 0x62 || rsp[1] != 0xF2 || rsp[2] != 0xA2 ||
+                rsp.size() != 4u + 5u * rsp[3]) { failEcu(s.ecu, GroupResult::EcuRefused); return; }
+            std::set<std::uint8_t> seen;
+            for (std::size_t i = 0; i < rsp[3]; ++i) {
+                const auto* e = &rsp[4 + 5 * i];
+                const auto counter = readU32(e + 1);
+                if (!seen.insert(e[0]).second || counter > she::kMaxCounter ||
+                    !ecu.newest.count(e[0]) || counter < ecu.newest[e[0]]) {
+                    failEcu(s.ecu, GroupResult::EcuRefused); return;
+                }
+                ecu.newest[e[0]] = counter;
+            }
+            if (seen.size() != ecu.newest.size()) failEcu(s.ecu, GroupResult::EcuRefused);
+            return;
+        }
         case Step::Kind::Load: {
             const std::size_t g = s.groups.front();
-            if (negative || rsp.size() < 5 || rsp[0] != 0x71) {
+            if (negative || rsp.size() < 5 || rsp[0] != 0x71 || rsp[1] != 0x01 || rsp[2] != 0xF2 ||
+                rsp[3] != 0x00) {
                 failGroup(g, GroupResult::EcuRefused, s.ecu);
                 return;
             }
@@ -293,7 +317,8 @@ void KeyMaster::process(const Step& s, diag::ClientResult result, const std::vec
             return;
         }
         case Step::Kind::Activate:
-            if (negative || rsp.size() < 5 || rsp[0] != 0x71) {
+            if (negative || rsp.size() != 5 || rsp[0] != 0x71 || rsp[1] != 0x01 || rsp[2] != 0xF2 ||
+                rsp[3] != 0x01 || rsp[4] != slotsOf(s.ecu, s.groups).size()) {
                 for (const auto g : s.groups) failGroup(g, GroupResult::ActivationFailed, s.ecu);
             }
             return;
@@ -330,7 +355,7 @@ void KeyMaster::nextPhase(TimePoint now) {
                 std::uint32_t newest = 0;
                 for (const auto& st : local) {
                     if (group.gatewaySlot != 0 && st.slot == group.gatewaySlot) {
-                        newest = std::max({newest, st.counter, st.pendingCounter});
+                        newest = std::max(newest, st.updateCounter);
                     }
                 }
                 for (const auto& m : group.ecus) {

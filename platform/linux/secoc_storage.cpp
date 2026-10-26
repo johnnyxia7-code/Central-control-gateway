@@ -1,4 +1,5 @@
 #include "secoc_storage.hpp"
+#include "atomic_file.hpp"
 
 #include <cstdio>
 #include <cerrno>
@@ -101,34 +102,11 @@ std::optional<secoc::FreshnessManager::Snapshot> loadFreshness(const std::string
 }
 
 bool saveFreshness(const std::string& path, const secoc::FreshnessManager::Snapshot& snapshot) {
-    const std::string tmp = path + ".tmp";
     std::ostringstream out;
     out << "trip " << snapshot.trip << "\n";
     for (const auto& [id, v] : snapshot.tx) out << "tx " << id << " " << v << "\n";
     for (const auto& [id, v] : snapshot.rx) out << "rx " << id << " " << v << "\n";
-    const auto data = out.str();
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0) return false;
-    std::size_t done = 0;
-    while (done < data.size()) {
-        const auto n = ::write(fd, data.data() + done, data.size() - done);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
-        done += static_cast<std::size_t>(n);
-    }
-    const bool saved = done == data.size() && ::fsync(fd) == 0;
-    const bool closed = ::close(fd) == 0;
-    if (!saved || !closed || std::rename(tmp.c_str(), path.c_str()) != 0) {
-        ::unlink(tmp.c_str());
-        return false;
-    }
-    // The rename must survive power loss too, before a counter can be used.
-    const auto parent = std::filesystem::path(path).parent_path();
-    const int dir = ::open(parent.empty() ? "." : parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dir < 0) return false;
-    const bool durable = ::fsync(dir) == 0;
-    ::close(dir);
-    return durable;
+    return atomicPrivateFile(path, out.str());
 }
 
 }  // namespace ccg::platform

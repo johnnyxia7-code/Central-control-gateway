@@ -66,6 +66,7 @@ enum class VerifyResult : std::uint8_t {
     MacFailure,        // authenticator wrong: tampered, wrong key or replay with truncated FV
     FreshnessFailure,  // FV not newer than the last accepted one or outside the window
     CryptoError,       // key not available / crypto service failed
+    InvalidInput,      // invalid configuration, null or truncated buffer
 };
 
 const char* toString(VerifyResult result);
@@ -112,7 +113,7 @@ public:
     void acceptRx(std::uint16_t dataId, std::uint64_t value);
 
     // --- trip / reset counter mode
-    void setLayout(const TripResetLayout& layout) { layout_ = layout; }
+    void setLayout(const TripResetLayout& layout);
     const TripResetLayout& layout() const { return layout_; }
     void setTripReset(std::uint32_t trip, std::uint32_t reset);
     bool synchronized() const { return synchronized_; }
@@ -182,9 +183,13 @@ public:
                                                      std::size_t length);
 
     // Verifies a secured PDU whose authentic part is `authenticLength` bytes.
+    // Legacy trusted-buffer overload: caller guarantees authenticLength +
+    // overheadBytes(config) readable bytes. Network inputs must use the sized overload.
     // On success the Rx freshness counter advances.
     VerifyResult verify(const SecOcConfig& config, const std::uint8_t* secured,
                         std::size_t authenticLength);
+    VerifyResult verify(const SecOcConfig& config, const std::uint8_t* secured,
+                        std::size_t securedLength, std::size_t authenticLength);
 
     FreshnessManager& freshness() { return freshness_; }
 

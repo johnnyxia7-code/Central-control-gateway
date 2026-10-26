@@ -26,4 +26,23 @@ jobs:
       - name: Build all targets
         run: cmake --build build --parallel 2
       - name: Run regression suite
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --verbose --output-on-failure
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL development files
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Configure with ASan and UBSan
+        run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DCCG_WARNINGS_AS_ERRORS=ON -DCMAKE_REQUIRE_FIND_PACKAGE_OpenSSL=ON
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+      - name: Build all targets
+        run: cmake --build build --parallel 2
+      - name: Run security regressions with sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --verbose --output-on-failure

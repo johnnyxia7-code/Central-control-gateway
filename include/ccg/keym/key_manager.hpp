@@ -1,9 +1,12 @@
 #pragma once
+#include "ccg/security/event_recorder.hpp"
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -80,6 +83,7 @@ const char* toString(KeyEvent::Kind kind);
 
 class KeyManager final : public secoc::ICryptoService {
 public:
+    void setSecurityRecorder(security::EventRecorder& recorder) { securityRecorder_ = &recorder; }
     explicit KeyManager(KeyManagerConfig config);  // throws std::invalid_argument
 
     // Production (EOL) provisioning in the secure plant: plain-text key into an
@@ -123,6 +127,7 @@ public:
         bool pending = false;
         std::uint32_t pendingCounter = 0;
         bool previous = false;  // previous key still accepted
+        std::uint32_t updateCounter = 0;  // includes discarded generations
     };
     std::vector<SlotStatus> status() const;
 
@@ -151,14 +156,19 @@ public:
     };
     struct Snapshot {
         std::vector<StoredKey> keys;
+        std::map<std::uint8_t, std::uint32_t> updateCounters;
     };
     Snapshot snapshot(TimePoint now) const;
-    // Replaces all keys. Entries for unknown slots are ignored.
+    // Validate the entire snapshot before replacing any live state.
+    // A durable callback must commit the proposed state or throw before publication.
+    using Persist = std::function<void(const Snapshot&)>;
+    void setPersistence(Persist persist) { persist_ = std::move(persist); }
     void restore(const Snapshot& snapshot, TimePoint now);
     // True once after the stored keys changed: persist the snapshot now.
     bool takePersistRequest();
 
 private:
+    security::EventRecorder* securityRecorder_ = nullptr;
     struct Key {
         Key(const crypto::Block& v, std::uint32_t c, const she::Flags& f) : value(v), counter(c), flags(f), cmac(v) {}
         crypto::Block value;
@@ -172,6 +182,7 @@ private:
         std::optional<Key> pending;
         std::optional<Key> previous;
         TimePoint previousExpiry{};
+        std::uint32_t updateCounter = 0;
     };
 
     Slot* findSlot(std::uint8_t slot);
@@ -183,6 +194,9 @@ private:
     static bool selected(const Slot& slot, const std::vector<std::uint8_t>& slots);
     void log(KeyEvent::Kind kind, std::uint8_t slot, std::uint32_t counter, she::ErrorCode error, TimePoint now);
 
+    Snapshot snapshotOf(const std::vector<Slot>& slots, TimePoint now) const;
+    void commit(std::vector<Slot> slots, TimePoint now);
+    Persist persist_;
     KeyManagerConfig config_;
     std::vector<Slot> slots_;
     std::uint8_t failedAttempts_ = 0;

@@ -529,3 +529,66 @@ TEST_CASE("keym uds: the key store is persisted before M4/M5 are returned") {
     service.handle(retry, ctx);
     CHECK_EQ(saves, 3);
 }
+
+
+TEST_CASE("keym: discarded update counters survive restart and prevent container replay") {
+    Keys t;
+    const auto request = t.update(ks::kVcuGw, keyOf(5), 9);
+    REQUIRE(t.km.loadKey(request, t.now).error == she::ErrorCode::NoError);
+    REQUIRE(t.km.discardPending(t.now) == 1u);
+    KeyManager reboot(t.cfg);
+    reboot.restore(t.km.snapshot(t.now), t.now);
+    CHECK(reboot.loadKey(request, t.now).error == she::ErrorCode::KeyUpdateError);
+    CHECK(reboot.stageInternal(ks::kVcuGw, keyOf(6), 9, macFlags(), t.now) == she::ErrorCode::KeyUpdateError);
+    CHECK(reboot.stageInternal(ks::kVcuGw, keyOf(6), 10, macFlags(), t.now) == she::ErrorCode::NoError);
+}
+
+TEST_CASE("keym: durable commit failures never publish key changes or successful events") {
+    Keys t;
+    auto disk = t.km.snapshot(t.now);
+    bool fail = true;
+    t.km.setPersistence([&](const KeyManager::Snapshot& next) {
+        if (fail) throw std::runtime_error("injected storage failure");
+        disk = next;
+    });
+    const auto request = t.update(ks::kVcuGw, keyOf(5), 2);
+    auto expectFailure = [&](auto op) {
+        const auto events = t.km.eventCount();
+        bool threw = false;
+        try { op(); } catch (const std::runtime_error&) { threw = true; }
+        CHECK(threw); CHECK_EQ(t.km.eventCount(), events);
+    };
+    expectFailure([&] { t.km.loadKey(request, t.now); });
+    CHECK(!t.status(ks::kVcuGw).pending);
+    fail = false;
+    REQUIRE(t.km.loadKey(request, t.now).error == she::ErrorCode::NoError);
+    fail = true;
+    expectFailure([&] { t.km.activatePending(t.now); });
+    CHECK_EQ(t.status(ks::kVcuGw).counter, 1u);
+    expectFailure([&] { t.km.discardPending(t.now); });
+    CHECK(t.status(ks::kVcuGw).pending);
+    KeyManager reboot(t.cfg); reboot.restore(disk, t.now);
+    CHECK(reboot.hasPending());
+    fail = false; t.km.activatePending(t.now);
+    fail = true;
+    expectFailure([&] { t.km.mainFunction(t.now + 1h); });
+    CHECK(t.status(ks::kVcuGw).previous);
+}
+
+TEST_CASE("keym: invalid snapshots leave live keys unchanged") {
+    Keys t;
+    const auto original = t.km.snapshot(t.now);
+    for (int mode = 0; mode < 5; ++mode) {
+        auto bad = original;
+        if (mode == 0) bad.keys.push_back(bad.keys.front());
+        if (mode == 1) bad.keys.front().slot = 15;
+        if (mode == 2) bad.keys.front().counter = she::kMaxCounter + 1;
+        if (mode == 3) bad.updateCounters[bad.keys.front().slot] = 0;
+        if (mode == 4) bad.keys.front().state = static_cast<KeyManager::StoredKey::State>(99);
+        bool threw = false;
+        try { t.km.restore(bad, t.now); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+        CHECK(t.km.snapshot(t.now).keys.front().key == original.keys.front().key);
+        CHECK_EQ(t.km.snapshot(t.now).keys.size(), original.keys.size());
+    }
+}

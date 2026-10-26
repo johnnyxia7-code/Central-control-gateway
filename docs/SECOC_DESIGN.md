@@ -136,10 +136,13 @@ truncated   = ResetFlag (2 LSBs of ResetCounter) | MessageCounter LSBs (6) =  8 
     accepted value of the same reset period, or from 0 in a new period.
   - The complete FV must be newer than the last accepted one, and the MAC must
     match. With `verifyAttempts > 1` the next message counter epoch is tried as well.
-- **No per-message Tx persistence:** a power cycle increments the trip counter,
+- **No per-message synchronized Tx persistence:** an FV-master power cycle increments the trip counter,
   so every FV of the new trip is larger than any old one. Messages recorded
   before a restart are rebuilt with the new trip counter and fail the MAC.
   The shared file backend still commits accepted Rx counters with its snapshot.
+  An ECU-only restart while the master remains running needs a separate secure
+  resynchronization/persistence design; this implementation does not establish
+  that guarantee. See production gate G03 in [deployment readiness](CYBERSECURITY_READINESS.md).
 
 ## 4. Freshness value synchronisation master (`secoc::FreshnessSyncMaster`)
 

@@ -17,6 +17,7 @@
 //   31 01 F2 02 [slot ..]   discard pending keys  (all, or the listed slots) -> 71 01 F2 02 <count>
 //   22 F2 A0                key status: <n> { slot, state, counter (4), pending counter (4) }
 //   22 F2 A1                SHE UID (15 bytes), needed to address an update container
+//   22 F2 A2                update floors: <n> { slot, highest accepted counter (4) }
 //
 // The routines need the extended session and a physical request. Their
 // authorisation is the SHE protocol itself (M3, made with MASTER_ECU_KEY by the
@@ -24,6 +25,9 @@
 // A changed key store is persisted before the response is sent: if that fails
 // the answer is NRC 0x72 (generalProgrammingFailure) and the backend retries
 // with the next counter value.
+// Production adapters must use KeyManager::setPersistence to save proposed
+// state before publication and propagate exceptions; this legacy service-level
+// callback alone does not roll back an in-memory update on failure.
 // With `requireAuthenticatedTester` (the gateway), activating and discarding
 // keys - which the SHE protocol does not authenticate - needs a tester with a
 // verified TLS client certificate; others get NRC 0x33 (securityAccessDenied).
@@ -35,6 +39,7 @@ inline constexpr std::uint16_t kRidActivateKeys = 0xF201;
 inline constexpr std::uint16_t kRidDiscardKeys = 0xF202;
 inline constexpr std::uint16_t kDidKeyStatus = 0xF2A0;
 inline constexpr std::uint16_t kDidUid = 0xF2A1;
+inline constexpr std::uint16_t kDidUpdateCounters = 0xF2A2; // slot + highest accepted counter
 
 // key status byte
 inline constexpr std::uint8_t kStatusActive = 0x01;

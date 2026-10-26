@@ -177,6 +177,8 @@ void EthernetGateway::onEthernetDatagram(std::size_t channel, const std::uint8_t
     ++stats_.datagramsReceived;
     const auto decoded = decodeDatagram(data, length);
     if (!decoded.complete) {
+        if (securityRecorder_) securityRecorder_->report(security::EventId::MalformedDatagram,
+            static_cast<std::uint32_t>(channel), now);
         ++stats_.malformedDatagrams;  // PDUs before the defect are still routed
     }
     for (const auto& pdu : decoded.pdus) {
@@ -193,6 +195,8 @@ void EthernetGateway::processPdu(std::size_t index, const std::uint8_t* data, st
                                  TimePoint now) {
     const auto& cfg = config_.pdus[index];
     if (length < cfg.length) {
+        if (securityRecorder_) securityRecorder_->report(security::EventId::SecOcInput,
+            static_cast<std::uint32_t>(index), now);
         ++stats_.lengthErrors;
         return;
     }
@@ -202,7 +206,7 @@ void EthernetGateway::processPdu(std::size_t index, const std::uint8_t* data, st
     // are verified; from here on only the authentic part is used.
     const std::size_t authentic = authenticLength(cfg);
     if (cfg.secoc) {
-        const auto result = secoc_->verify(*cfg.secoc, data, authentic);
+        const auto result = secoc_->verify(*cfg.secoc, data, length, authentic);
         if (result != secoc::VerifyResult::Ok) {
             reportSecurityEvent(index, result, now);
             return;
@@ -393,6 +397,8 @@ bool EthernetGateway::sendPdu(std::size_t index, const std::uint8_t* authentic, 
     // The gateway re-authenticates with the key and freshness of the target PDU.
     const auto secured = secoc_->protect(*cfg.secoc, authentic, length);
     if (!secured) {
+        if (securityRecorder_) securityRecorder_->report(security::EventId::SecOcTransmit,
+            static_cast<std::uint32_t>(index), now);
         ++stats_.secocTxFailures;
         return false;
     }
@@ -403,6 +409,10 @@ bool EthernetGateway::sendPdu(std::size_t index, const std::uint8_t* authentic, 
 
 void EthernetGateway::reportSecurityEvent(std::size_t index, secoc::VerifyResult result,
                                           TimePoint now) {
+    if (securityRecorder_) securityRecorder_->report(
+        result == secoc::VerifyResult::FreshnessFailure ? security::EventId::SecOcFreshness :
+        result == secoc::VerifyResult::InvalidInput ? security::EventId::SecOcInput : security::EventId::SecOcMac,
+        static_cast<std::uint32_t>(index), now);
     if (result == secoc::VerifyResult::FreshnessFailure) {
         ++stats_.secocFreshnessFailures;
     } else {

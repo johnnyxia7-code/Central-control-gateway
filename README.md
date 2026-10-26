@@ -2,6 +2,11 @@
 
 Gateway functions for a vehicle HPC (high performance computer): signal-to-service, Ethernet routing with SecOC and key management, and diagnostic routing.
 
+Deployment status: reference/bench implementation. See the [IDPS and SecOC
+cybersecurity readiness assessment](docs/CYBERSECURITY_READINESS.md) for the
+ISO/SAE 21434 / R155 alignment gaps, new `--security-log` event recorder, key-store
+migration and required production release evidence.
+
 ## Signal-to-Service (S2S)
 
 Translates CAN signals into SOME/IP events/fields and SOME/IP method calls into CAN signals.

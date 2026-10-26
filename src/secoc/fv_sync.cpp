@@ -1,4 +1,5 @@
 #include "ccg/secoc/fv_sync.hpp"
+#include <stdexcept>
 
 #include <array>
 
@@ -77,7 +78,10 @@ bool syncAuthenticator(ICryptoService& crypto, const SyncMessageConfig& c, std::
 
 FreshnessSyncMaster::FreshnessSyncMaster(SyncMessageConfig config, ICryptoService& crypto,
                                          FreshnessManager& freshness)
-    : cfg_(std::move(config)), crypto_(crypto), freshness_(freshness) {}
+    : cfg_(std::move(config)), crypto_(crypto), freshness_(freshness) {
+    if (!validateFreshnessSync(freshness_.layout(), cfg_).empty())
+        throw std::invalid_argument("invalid freshness synchronization configuration");
+}
 
 bool FreshnessSyncMaster::start(TimePoint now) {
     const auto& layout = freshness_.layout();
@@ -153,7 +157,15 @@ std::optional<std::vector<std::uint8_t>> FreshnessSyncMaster::encode() {
 // Slave
 // ---------------------------------------------------------------------------
 
+FreshnessSyncSlave::FreshnessSyncSlave(SyncMessageConfig config, ICryptoService& crypto,
+                                     FreshnessManager& freshness)
+    : cfg_(std::move(config)), crypto_(crypto), freshness_(freshness) {
+    if (!validateFreshnessSync(freshness_.layout(), cfg_).empty())
+        throw std::invalid_argument("invalid freshness synchronization configuration");
+}
+
 SyncResult FreshnessSyncSlave::onSyncMessage(const std::uint8_t* data, std::size_t length) {
+    if (!data) return SyncResult::LengthError;
     const auto& layout = freshness_.layout();
     if (length < syncMessageLength(layout, cfg_)) {
         return SyncResult::LengthError;

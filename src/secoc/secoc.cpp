@@ -1,4 +1,6 @@
 #include "ccg/secoc/secoc.hpp"
+#include <limits>
+#include <stdexcept>
 
 namespace ccg::secoc {
 
@@ -6,6 +8,12 @@ namespace {
 
 std::uint64_t maxValue(std::uint8_t bits) {
     return bits >= 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << bits) - 1);
+}
+
+bool valid(const SecOcConfig& c) {
+    return !c.keyId.empty() && c.freshnessBits >= 1 && c.freshnessBits <= 64 &&
+           c.freshnessTxBits <= c.freshnessBits && c.macTxBits >= 8 && c.macTxBits <= 128 &&
+           c.verifyAttempts != 0 && (c.freshnessMode == FreshnessMode::Counter || c.freshnessMode == FreshnessMode::TripReset);
 }
 
 class BitWriter {
@@ -57,6 +65,7 @@ const char* toString(VerifyResult result) {
         case VerifyResult::MacFailure: return "VERIFICATION_FAILURE";
         case VerifyResult::FreshnessFailure: return "FRESHNESS_FAILURE";
         case VerifyResult::CryptoError: return "CRYPTO_ERROR";
+        case VerifyResult::InvalidInput: return "INVALID_INPUT";
     }
     return "UNKNOWN";
 }
@@ -66,6 +75,7 @@ const char* toString(VerifyResult result) {
 std::optional<bool> ICryptoService::verifyMac(const std::string& keyId, const std::uint8_t* data,
                                               std::size_t length, const std::uint8_t* mac,
                                               std::size_t macBits) {
+    if (macBits == 0 || macBits > 128 || !mac || (!data && length)) return std::nullopt;
     crypto::Block expected;
     if (!generateMac(keyId, data, length, expected)) return std::nullopt;
     return crypto::equalBits(expected.data(), mac, macBits);
@@ -89,6 +99,7 @@ bool SoftwareCryptoService::generateMac(const std::string& keyId, const std::uin
 // --- freshness ----------------------------------------------------------------
 
 std::optional<std::uint64_t> FreshnessManager::nextTx(std::uint16_t dataId, std::uint8_t bits) {
+    if (bits == 0 || bits > 64) return std::nullopt;
     auto& counter = tx_[dataId];
     if (counter >= maxValue(bits)) {
         return std::nullopt;  // counter exhausted: key renewal / counter reset required
@@ -124,7 +135,18 @@ void FreshnessManager::restore(const Snapshot& snapshot, std::uint64_t txMargin)
     }
 }
 
+void FreshnessManager::setLayout(const TripResetLayout& l) {
+    if (l.tripBits == 0 || l.tripBits > 32 || l.resetBits == 0 || l.resetBits > 32 ||
+        l.messageBits == 0 || l.totalBits() > 64 || l.resetFlagBits == 0 || l.resetFlagBits >= l.resetBits)
+        throw std::invalid_argument("invalid freshness layout");
+    if (synchronized_) throw std::logic_error("cannot change synchronized freshness layout");
+    layout_ = l;
+}
+
 void FreshnessManager::setTripReset(std::uint32_t trip, std::uint32_t reset) {
+    if (trip > maxValue(layout_.tripBits) || reset > maxValue(layout_.resetBits) ||
+        (synchronized_ && (trip < trip_ || (trip == trip_ && reset < reset_))))
+        throw std::invalid_argument("invalid or regressing freshness epoch");
     trip_ = trip;
     reset_ = reset;
     synchronized_ = true;
@@ -148,7 +170,8 @@ bool FreshnessManager::takePersistRequest() {
 
 std::optional<FreshnessManager::TxFreshness> FreshnessManager::nextTxSynchronized(std::uint16_t dataId,
                                                                                 std::uint8_t txBits) {
-    if (!synchronized_ || txBits <= layout_.resetFlagBits) {
+    if (!synchronized_ || txBits <= layout_.resetFlagBits ||
+        txBits > layout_.resetFlagBits + layout_.messageBits) {
         return std::nullopt;
     }
     const std::uint64_t epoch = (static_cast<std::uint64_t>(trip_) << layout_.resetBits) | reset_;
@@ -171,7 +194,8 @@ std::optional<std::uint64_t> FreshnessManager::rxSynchronizedCandidate(std::uint
                                                                        std::uint64_t truncated,
                                                                        std::uint8_t txBits,
                                                                        std::uint8_t attempt) const {
-    if (!synchronized_ || txBits <= layout_.resetFlagBits) {
+    if (!synchronized_ || txBits <= layout_.resetFlagBits ||
+        txBits > layout_.resetFlagBits + layout_.messageBits) {
         return std::nullopt;
     }
     const std::uint8_t messageTxBits = static_cast<std::uint8_t>(txBits - layout_.resetFlagBits);
@@ -229,7 +253,7 @@ std::vector<std::uint8_t> SecOcProcessor::dataToAuthenticator(const SecOcConfig&
     dta.reserve(2 + length + fvBytes);
     dta.push_back(static_cast<std::uint8_t>(c.dataId >> 8));
     dta.push_back(static_cast<std::uint8_t>(c.dataId));
-    dta.insert(dta.end(), authentic, authentic + length);
+    if (length) dta.insert(dta.end(), authentic, authentic + length);
     for (std::size_t i = fvBytes; i > 0; --i) {
         dta.push_back(static_cast<std::uint8_t>(fv >> (8 * (i - 1))));
     }
@@ -239,6 +263,8 @@ std::vector<std::uint8_t> SecOcProcessor::dataToAuthenticator(const SecOcConfig&
 std::optional<std::vector<std::uint8_t>> SecOcProcessor::protect(const SecOcConfig& c,
                                                                  const std::uint8_t* authentic,
                                                                  std::size_t length) {
+    if (!valid(c) || (!authentic && length) || length > (std::numeric_limits<std::size_t>::max() / 8) - 32)
+        return std::nullopt;
     std::uint64_t complete;
     std::uint64_t truncated;
     if (c.freshnessMode == FreshnessMode::TripReset) {
@@ -257,7 +283,8 @@ std::optional<std::vector<std::uint8_t>> SecOcProcessor::protect(const SecOcConf
     if (!crypto_.generateMac(c.keyId, dta.data(), dta.size(), mac)) {
         return std::nullopt;
     }
-    std::vector<std::uint8_t> out(authentic, authentic + length);
+    std::vector<std::uint8_t> out;
+    if (length) out.assign(authentic, authentic + length);
     out.resize(length + overheadBytes(c), 0x00);
     BitWriter w(out, length * 8);
     for (int i = c.freshnessTxBits - 1; i >= 0; --i) w.put((truncated >> i) & 1);
@@ -278,6 +305,16 @@ bool SecOcProcessor::matches(const SecOcConfig& c, const std::uint8_t* authentic
 
 VerifyResult SecOcProcessor::verify(const SecOcConfig& c, const std::uint8_t* secured,
                                     std::size_t authenticLength) {
+    if (!valid(c) || authenticLength > (std::numeric_limits<std::size_t>::max() / 8) - 32)
+        return VerifyResult::InvalidInput;
+    return verify(c, secured, authenticLength + overheadBytes(c), authenticLength);
+}
+
+VerifyResult SecOcProcessor::verify(const SecOcConfig& c, const std::uint8_t* secured,
+                                    std::size_t securedLength, std::size_t authenticLength) {
+    if (!valid(c) || !secured || authenticLength > (std::numeric_limits<std::size_t>::max() / 8) - 32 ||
+        securedLength < authenticLength || securedLength - authenticLength < overheadBytes(c))
+        return VerifyResult::InvalidInput;
     BitReader r(secured, authenticLength * 8);
     std::uint64_t receivedFv = 0;
     for (std::size_t i = 0; i < c.freshnessTxBits; ++i) receivedFv = (receivedFv << 1) | (r.get() ? 1 : 0);

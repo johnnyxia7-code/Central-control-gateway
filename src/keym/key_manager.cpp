@@ -98,6 +98,9 @@ const KeyManager::Slot* KeyManager::findKey(const std::string& keyId) const {
 
 void KeyManager::log(KeyEvent::Kind kind, std::uint8_t slot, std::uint32_t counter, she::ErrorCode error,
                      TimePoint now) {
+    if (securityRecorder_) securityRecorder_->report(
+        static_cast<security::EventId>(static_cast<unsigned>(security::EventId::KeyEventBase) + static_cast<unsigned>(kind)),
+        slot, now);
     events_.push_back(KeyEvent{kind, slot, counter, error, now});
     ++eventCount_;
     if (events_.size() > kMaxEvents) events_.pop_front();
@@ -106,9 +109,12 @@ void KeyManager::log(KeyEvent::Kind kind, std::uint8_t slot, std::uint32_t count
 bool KeyManager::provision(std::uint8_t slot, const crypto::Block& key, std::uint32_t counter,
                            const she::Flags& flags, TimePoint now) {
     Slot* s = findSlot(slot);
-    if (!s || s->active || counter > she::kMaxCounter) return false;
-    s->active.emplace(key, counter, flags);
-    persistRequest_ = true;
+    if (!s || s->active || s->updateCounter != 0 || counter > she::kMaxCounter) return false;
+    auto next = slots_;
+    auto& target = next[static_cast<std::size_t>(s - slots_.data())];
+    target.active.emplace(key, counter, flags);
+    target.updateCounter = counter;
+    commit(std::move(next), now);
     log(KeyEvent::Kind::Provisioned, slot, counter, she::ErrorCode::NoError, now);
     return true;
 }
@@ -159,15 +165,8 @@ KeyManager::LoadResult KeyManager::loadKey(const she::UpdateRequest& request, Ti
 
     // Anti-rollback: the counter must exceed every stored generation.
     const auto payload = she::decryptM2(request, authKey);
-    std::uint32_t newest = 0;
-    bool any = false;
-    for (const auto* k : {&target->active, &target->pending}) {
-        if (*k) {
-            newest = std::max(newest, (*k)->counter);
-            any = true;
-        }
-    }
-    if (any && payload.counter <= newest) return reject(slotId, she::ErrorCode::KeyUpdateError, now);
+    if ((target->active || target->updateCounter != 0) && payload.counter <= target->updateCounter)
+        return reject(slotId, she::ErrorCode::KeyUpdateError, now);
 
     LoadResult r;
     r.error = she::ErrorCode::NoError;
@@ -179,22 +178,25 @@ KeyManager::LoadResult KeyManager::loadKey(const she::UpdateRequest& request, Ti
 }
 
 bool KeyManager::install(Slot& target, const she::UpdatePayload& payload, TimePoint now) {
-    const bool secocKey = !target.config.keyId.empty();
-    if (target.active && target.config.staged) {
-        target.pending.emplace(payload.key, payload.counter, payload.flags);
-        log(KeyEvent::Kind::KeyStaged, target.config.slot, payload.counter, she::ErrorCode::NoError, now);
-        persistRequest_ = true;
-        return true;
+    auto next = slots_;
+    auto& s = next[static_cast<std::size_t>(&target - slots_.data())];
+    const bool staged = s.active && s.config.staged;
+    if (staged) {
+        s.pending.emplace(payload.key, payload.counter, payload.flags);
+    } else {
+        if (s.active && !s.config.keyId.empty() && config_.gracePeriod.count() > 0) {
+            s.previous = s.active;
+            s.previousExpiry = now + config_.gracePeriod;
+        }
+        s.active.emplace(payload.key, payload.counter, payload.flags);
+        s.pending.reset();
     }
-    if (target.active && secocKey && config_.gracePeriod.count() > 0) {
-        target.previous = target.active;
-        target.previousExpiry = now + config_.gracePeriod;
-    }
-    target.active.emplace(payload.key, payload.counter, payload.flags);
-    target.pending.reset();
-    log(KeyEvent::Kind::KeyLoaded, target.config.slot, payload.counter, she::ErrorCode::NoError, now);
-    persistRequest_ = true;
-    return false;
+    s.updateCounter = payload.counter;
+    const auto id = s.config.slot;
+    commit(std::move(next), now);
+    log(staged ? KeyEvent::Kind::KeyStaged : KeyEvent::Kind::KeyLoaded, id, payload.counter,
+        she::ErrorCode::NoError, now);
+    return staged;
 }
 
 bool KeyManager::selected(const Slot& slot, const std::vector<std::uint8_t>& slots) {
@@ -224,17 +226,17 @@ she::ErrorCode KeyManager::stageInternal(std::uint8_t slot, const crypto::Block&
     Slot* target = findSlot(slot);
     if (!target || slot == she::kMasterEcuKey || slot == config_.keyMasterSlot) return she::ErrorCode::KeyInvalid;
     if (target->active && target->active->flags.writeProtection) return she::ErrorCode::KeyWriteProtected;
-    for (const auto* k : {&target->active, &target->pending}) {
-        if (*k && counter <= (*k)->counter) return she::ErrorCode::KeyUpdateError;
-    }
+    if ((target->active || target->updateCounter != 0) && counter <= target->updateCounter)
+        return she::ErrorCode::KeyUpdateError;
     if (counter > she::kMaxCounter) return she::ErrorCode::KeyUpdateError;
     install(*target, she::UpdatePayload{counter, flags, key}, now);
     return she::ErrorCode::NoError;
 }
 
 std::size_t KeyManager::activatePending(TimePoint now, const std::vector<std::uint8_t>& slots) {
-    std::size_t count = 0;
-    for (auto& s : slots_) {
+    auto next = slots_;
+    std::vector<KeyEvent> events;
+    for (auto& s : next) {
         if (!s.pending || !selected(s, slots)) continue;
         if (s.active && !s.config.keyId.empty() && config_.gracePeriod.count() > 0) {
             s.previous = s.active;
@@ -242,34 +244,42 @@ std::size_t KeyManager::activatePending(TimePoint now, const std::vector<std::ui
         }
         s.active = s.pending;
         s.pending.reset();
-        log(KeyEvent::Kind::KeysActivated, s.config.slot, s.active->counter, she::ErrorCode::NoError, now);
-        ++count;
+        events.push_back({KeyEvent::Kind::KeysActivated, s.config.slot, s.active->counter,
+                          she::ErrorCode::NoError, now});
     }
-    if (count) persistRequest_ = true;
-    return count;
+    if (!events.empty()) commit(std::move(next), now);
+    for (const auto& e : events) log(e.kind, e.slot, e.counter, e.error, now);
+    return events.size();
 }
 
 std::size_t KeyManager::discardPending(TimePoint now, const std::vector<std::uint8_t>& slots) {
-    std::size_t count = 0;
-    for (auto& s : slots_) {
+    auto next = slots_;
+    std::vector<KeyEvent> events;
+    for (auto& s : next) {
         if (!s.pending || !selected(s, slots)) continue;
-        log(KeyEvent::Kind::PendingDiscarded, s.config.slot, s.pending->counter, she::ErrorCode::NoError, now);
-        s.pending.reset();
-        ++count;
+        events.push_back({KeyEvent::Kind::PendingDiscarded, s.config.slot, s.pending->counter,
+                          she::ErrorCode::NoError, now});
+        s.pending.reset(); // updateCounter survives discard and restart
     }
-    if (count) persistRequest_ = true;
-    return count;
+    if (!events.empty()) commit(std::move(next), now);
+    for (const auto& e : events) log(e.kind, e.slot, e.counter, e.error, now);
+    return events.size();
 }
 
 void KeyManager::mainFunction(TimePoint now) {
-    for (auto& s : slots_) {
+    if (std::none_of(slots_.begin(), slots_.end(),
+                     [&](const Slot& s) { return s.previous && now >= s.previousExpiry; })) return;
+    auto next = slots_;
+    std::vector<KeyEvent> events;
+    for (auto& s : next) {
         if (s.previous && now >= s.previousExpiry) {
-            log(KeyEvent::Kind::PreviousKeyExpired, s.config.slot, s.previous->counter, she::ErrorCode::NoError,
-                now);
+            events.push_back({KeyEvent::Kind::PreviousKeyExpired, s.config.slot, s.previous->counter,
+                              she::ErrorCode::NoError, now});
             s.previous.reset();
-            persistRequest_ = true;
         }
     }
+    if (!events.empty()) commit(std::move(next), now);
+    for (const auto& e : events) log(e.kind, e.slot, e.counter, e.error, now);
 }
 
 std::vector<KeyManager::SlotStatus> KeyManager::status() const {
@@ -286,6 +296,7 @@ std::vector<KeyManager::SlotStatus> KeyManager::status() const {
         st.pending = s.pending.has_value();
         if (s.pending) st.pendingCounter = s.pending->counter;
         st.previous = s.previous.has_value();
+        st.updateCounter = s.updateCounter;
         out.push_back(st);
     }
     return out;
@@ -307,6 +318,7 @@ bool KeyManager::generateMac(const std::string& keyId, const std::uint8_t* data,
 
 std::optional<bool> KeyManager::verifyMac(const std::string& keyId, const std::uint8_t* data,
                                           std::size_t length, const std::uint8_t* mac, std::size_t macBits) {
+    if (macBits == 0 || macBits > 128 || !mac || (!data && length)) return std::nullopt;
     if (!hasKey(keyId)) return std::nullopt;
     const Slot* s = findKey(keyId);
     if (crypto::equalBits(s->active->cmac.compute(data, length).data(), mac, macBits)) return true;
@@ -324,7 +336,15 @@ std::optional<bool> KeyManager::verifyMac(const std::string& keyId, const std::u
 
 // --- persistence ----------------------------------------------------------------
 
-KeyManager::Snapshot KeyManager::snapshot(TimePoint now) const {
+KeyManager::Snapshot KeyManager::snapshot(TimePoint now) const { return snapshotOf(slots_, now); }
+
+void KeyManager::commit(std::vector<Slot> slots, TimePoint now) {
+    if (persist_) persist_(snapshotOf(slots, now));
+    slots_ = std::move(slots);
+    persistRequest_ = true;
+}
+
+KeyManager::Snapshot KeyManager::snapshotOf(const std::vector<Slot>& slots, TimePoint now) const {
     Snapshot snap;
     auto add = [&](const Slot& s, const Key& k, StoredKey::State state) {
         StoredKey sk;
@@ -339,7 +359,8 @@ KeyManager::Snapshot KeyManager::snapshot(TimePoint now) const {
         }
         snap.keys.push_back(sk);
     };
-    for (const auto& s : slots_) {
+    for (const auto& s : slots) {
+        snap.updateCounters.emplace(s.config.slot, s.updateCounter);
         if (s.active) add(s, *s.active, StoredKey::State::Active);
         if (s.pending) add(s, *s.pending, StoredKey::State::Pending);
         if (s.previous) add(s, *s.previous, StoredKey::State::Previous);
@@ -348,24 +369,48 @@ KeyManager::Snapshot KeyManager::snapshot(TimePoint now) const {
 }
 
 void KeyManager::restore(const Snapshot& snapshot, TimePoint now) {
-    for (auto& s : slots_) {
-        s.active.reset();
-        s.pending.reset();
-        s.previous.reset();
+    auto next = slots_;
+    for (auto& s : next) {
+        s.active.reset(); s.pending.reset(); s.previous.reset(); s.updateCounter = 0;
     }
+    const auto slotFor = [&](std::uint8_t id) -> Slot& {
+        for (auto& s : next) if (s.config.slot == id) return s;
+        throw std::invalid_argument("key snapshot contains unknown slot");
+    };
+    for (const auto& [id, counter] : snapshot.updateCounters) {
+        if (counter > she::kMaxCounter) throw std::invalid_argument("invalid key update counter");
+        slotFor(id).updateCounter = counter;
+    }
+    std::set<std::pair<std::uint8_t, StoredKey::State>> seen;
     for (const auto& k : snapshot.keys) {
-        Slot* s = findSlot(k.slot);
-        if (!s) continue;
+        auto& s = slotFor(k.slot);
+        if (k.counter > she::kMaxCounter || k.flags > 0x1F || k.remaining.count() < 0 ||
+            k.remaining > config_.gracePeriod || !seen.emplace(k.slot, k.state).second ||
+            (snapshot.updateCounters.count(k.slot) && s.updateCounter < k.counter))
+            throw std::invalid_argument("invalid key snapshot entry");
+        s.updateCounter = std::max(s.updateCounter, k.counter); // legacy snapshots
         const auto flags = she::Flags::decode(k.flags);
         switch (k.state) {
-            case StoredKey::State::Active: s->active.emplace(k.key, k.counter, flags); break;
-            case StoredKey::State::Pending: s->pending.emplace(k.key, k.counter, flags); break;
+            case StoredKey::State::Active: s.active.emplace(k.key, k.counter, flags); break;
+            case StoredKey::State::Pending: s.pending.emplace(k.key, k.counter, flags); break;
             case StoredKey::State::Previous:
-                s->previous.emplace(k.key, k.counter, flags);
-                s->previousExpiry = now + k.remaining;
+                if (k.remaining.count() > 0) {
+                    s.previous.emplace(k.key, k.counter, flags);
+                    s.previousExpiry = now + k.remaining;
+                }
                 break;
+            default: throw std::invalid_argument("invalid key state");
         }
     }
+    for (const auto& s : next) {
+        if ((s.pending && (!s.active || s.pending->counter <= s.active->counter)) ||
+            (s.previous && (!s.active || s.previous->counter >= s.active->counter)))
+            throw std::invalid_argument("inconsistent key generations");
+        const auto* live = findSlot(s.config.slot);
+        if (live && s.updateCounter < live->updateCounter)
+            throw std::invalid_argument("key snapshot rollback");
+    }
+    slots_ = std::move(next);
 }
 
 bool KeyManager::takePersistRequest() {

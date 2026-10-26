@@ -595,6 +595,9 @@ TEST_CASE("diag routing: unauthenticated key controls never reach CAN") {
         for (const auto target : {dg::kVcu, dg::kBcm, dg::kFunctional}) {
             for (const std::uint8_t rid : {0x01, 0x02, 0x10}) {
                 Fixture f;
+                std::vector<security::EventRecord> recorded;
+                security::EventRecorder recorder([&](const security::EventRecord& e) { recorded.push_back(e); return true; });
+                f.gw.setSecurityRecorder(recorder);
                 f.gw.onTcpConnected(1, f.now, security);
                 f.activate(1);
                 f.request(1, target, {0x31, 0x81, 0xF2, rid});
@@ -608,6 +611,10 @@ TEST_CASE("diag routing: unauthenticated key controls never reach CAN") {
                     const auto replies = f.responses(1, target);
                     REQUIRE(replies.size() == 1u);
                     CHECK(replies[0] == (Bytes{0x7F, 0x31, 0x33}));
+                    recorder.flush(f.now);
+                    REQUIRE(recorded.size() == 1u);
+                    CHECK(recorded[0].id == security::EventId::DiagnosticDenied);
+                    CHECK_EQ(recorded[0].source, target);
                 }
             }
         }

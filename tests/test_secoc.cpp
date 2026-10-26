@@ -259,3 +259,45 @@ TEST_CASE("secoc: failed persistence prevents TX and successful RX verification"
     p.rxFvm.setPersistence({});
     CHECK(p.rx.verify(c, packet.data(), data.size()) == VerifyResult::Ok);
 }
+
+
+TEST_CASE("secoc: sized verification rejects truncated and invalid buffers without advancing freshness") {
+    Pair p;
+    const Bytes authentic = {1, 2, 3, 4};
+    const auto packet = *p.tx.protect(profile1(), authentic.data(), authentic.size());
+    for (std::size_t n = 0; n < packet.size(); ++n) {
+        const Bytes truncated(packet.begin(), packet.begin() + n);
+        CHECK(p.rx.verify(profile1(), truncated.data(), truncated.size(), 4) == VerifyResult::InvalidInput);
+        CHECK_EQ(p.rxFvm.latestRx(0x01B0), 0u);
+    }
+    CHECK(p.rx.verify(profile1(), nullptr, packet.size(), 4) == VerifyResult::InvalidInput);
+    CHECK(p.rx.verify(profile1(), packet.data(), packet.size(), 4) == VerifyResult::Ok);
+}
+
+TEST_CASE("secoc: invalid bit layouts and MAC sizes are rejected before shifts or reads") {
+    Pair p;
+    const Bytes authentic = {1, 2, 3, 4};
+    for (int mode = 0; mode < 6; ++mode) {
+        auto c = profile1();
+        if (mode == 0) c.macTxBits = 129;
+        if (mode == 1) c.freshnessBits = 65;
+        if (mode == 2) c.freshnessTxBits = 65;
+        if (mode == 3) c.freshnessBits = 0;
+        if (mode == 4) c.verifyAttempts = 0;
+        if (mode == 5) c.freshnessMode = static_cast<FreshnessMode>(99);
+        CHECK(!p.tx.protect(c, authentic.data(), authentic.size()));
+        CHECK(p.rx.verify(c, authentic.data(), authentic.size(), 4) == VerifyResult::InvalidInput);
+    }
+    CHECK(!p.txFvm.nextTx(1, 65));
+    CHECK(!p.txFvm.nextTx(1, 0));
+    TripResetLayout invalid;
+    invalid.messageBits = 64;
+    bool threw = false;
+    try { p.txFvm.setLayout(invalid); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+    p.txFvm.setTripReset(2, 3);
+    threw = false;
+    try { p.txFvm.setTripReset(2, 2); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+    CHECK(!p.txFvm.nextTxSynchronized(1, 64));
+}

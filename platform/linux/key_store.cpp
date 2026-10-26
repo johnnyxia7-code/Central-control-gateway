@@ -1,4 +1,8 @@
 #include "key_store.hpp"
+#include "atomic_file.hpp"
+#include <charconv>
+#include <filesystem>
+#include <set>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -36,39 +40,64 @@ bool parseHex(const std::string& hex, std::uint8_t* out, std::size_t n) {
 }  // namespace
 
 std::optional<keym::KeyManager::Snapshot> loadKeyStore(const std::string& path) {
+    std::error_code ec;
+    const auto status = std::filesystem::status(path, ec);
+    if (ec == std::errc::no_such_file_or_directory || status.type() == std::filesystem::file_type::not_found)
+        return std::nullopt;
+    if (ec || !std::filesystem::is_regular_file(status) || std::filesystem::file_size(path) > 65536)
+        throw std::runtime_error("invalid key store file " + path);
     std::ifstream in(path);
-    if (!in) return std::nullopt;
+    if (!in) throw std::runtime_error("cannot read key store " + path);
     keym::KeyManager::Snapshot snapshot;
+    std::set<std::pair<unsigned, std::string>> seen;
+    bool versioned = false, ended = false, any = false;
     std::string line;
-    for (int number = 1; std::getline(in, line); ++number) {
+    const auto invalid = [&]() { throw std::runtime_error("malformed or incomplete key store " + path); };
+    while (std::getline(in, line)) {
         line = line.substr(0, line.find('#'));
         std::istringstream is(line);
         std::string state;
         if (!(is >> state)) continue;
-        StoredKey k;
-        unsigned slot = 0;
-        unsigned long counter = 0;
-        unsigned flags = 0;
-        std::string hex;
-        bool ok = static_cast<bool>(is >> slot >> counter >> std::hex >> flags >> std::dec >> hex) && slot <= 0xF &&
-                  counter <= keym::she::kMaxCounter && flags <= 0x1F && parseHex(hex, k.key.data(), 16);
-        if (state == "active") {
-            k.state = StoredKey::State::Active;
-        } else if (state == "pending") {
-            k.state = StoredKey::State::Pending;
-        } else if (state == "previous") {
-            long long remaining = 0;
-            ok = ok && static_cast<bool>(is >> remaining) && remaining >= 0;
-            k.state = StoredKey::State::Previous;
-            k.remaining = std::chrono::milliseconds(remaining);
-        } else {
-            ok = false;
+        if (ended) invalid();
+        const auto number = [&](int base = 10) {
+            std::string token;
+            std::uint32_t value = 0;
+            if (!(is >> token)) invalid();
+            const auto r = std::from_chars(token.data(), token.data() + token.size(), value, base);
+            if (r.ec != std::errc{} || r.ptr != token.data() + token.size()) invalid();
+            return value;
+        };
+        const auto endLine = [&]() { std::string extra; if (is >> extra) invalid(); };
+        if (state == "version") {
+            if (any || versioned || number() != 2) invalid();
+            versioned = true; endLine(); continue;
         }
-        if (!ok) throw std::runtime_error(path + ":" + std::to_string(number) + ": malformed key store entry");
-        k.slot = static_cast<std::uint8_t>(slot);
-        k.counter = static_cast<std::uint32_t>(counter);
-        k.flags = static_cast<std::uint8_t>(flags);
+        if (state == "end") { if (!versioned) invalid(); ended = true; endLine(); continue; }
+        any = true;
+        const auto slot = number(), counter = number();
+        if (slot > 0xF || counter > keym::she::kMaxCounter || !seen.emplace(slot, state).second) invalid();
+        if (state == "counter") {
+            snapshot.updateCounters.emplace(static_cast<std::uint8_t>(slot), counter);
+            endLine(); continue;
+        }
+        StoredKey k;
+        const auto flags = number(16);
+        std::string hex;
+        if (!(is >> hex) || flags > 0x1F || !parseHex(hex, k.key.data(), 16)) invalid();
+        if (state == "active") k.state = StoredKey::State::Active;
+        else if (state == "pending") k.state = StoredKey::State::Pending;
+        else if (state == "previous") {
+            k.state = StoredKey::State::Previous;
+            k.remaining = std::chrono::milliseconds(number());
+        } else invalid();
+        endLine();
+        k.slot = static_cast<std::uint8_t>(slot); k.counter = counter; k.flags = static_cast<std::uint8_t>(flags);
         snapshot.keys.push_back(k);
+    }
+    if (!in.eof() || !any || (versioned && !ended)) invalid();
+    for (const auto& k : snapshot.keys) {
+        if (versioned && (!snapshot.updateCounters.count(k.slot) || snapshot.updateCounters.at(k.slot) < k.counter))
+            invalid();
     }
     return snapshot;
 }
@@ -76,6 +105,13 @@ std::optional<keym::KeyManager::Snapshot> loadKeyStore(const std::string& path) 
 bool saveKeyStore(const std::string& path, const keym::KeyManager::Snapshot& snapshot) {
     std::ostringstream os;
     os << "# ccg key store - SECRET KEY MATERIAL (bench HSM emulation)\n";
+    os << "version 2\n";
+    for (const auto& [slot, counter] : snapshot.updateCounters) os << "counter " << int{slot} << " " << counter << "\n";
+    // Also support callers constructing a legacy snapshot in memory.
+    std::map<std::uint8_t, std::uint32_t> inferred;
+    for (const auto& k : snapshot.keys) inferred[k.slot] = std::max(inferred[k.slot], k.counter);
+    for (const auto& [slot, counter] : inferred)
+        if (!snapshot.updateCounters.count(slot)) os << "counter " << int{slot} << " " << counter << "\n";
     for (const auto& k : snapshot.keys) {
         const char* state = k.state == StoredKey::State::Active    ? "active"
                             : k.state == StoredKey::State::Pending ? "pending"
@@ -88,23 +124,8 @@ bool saveKeyStore(const std::string& path, const keym::KeyManager::Snapshot& sna
         if (k.state == StoredKey::State::Previous) os << " " << k.remaining.count();
         os << "\n";
     }
-    const std::string data = os.str();
-    const std::string tmp = path + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0) return false;
-    std::size_t done = 0;
-    while (done < data.size()) {
-        const ssize_t n = ::write(fd, data.data() + done, data.size() - done);
-        if (n <= 0) break;
-        done += static_cast<std::size_t>(n);
-    }
-    const bool ok = done == data.size() && ::fsync(fd) == 0;
-    ::close(fd);
-    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
-        ::unlink(tmp.c_str());
-        return false;
-    }
-    return true;
+    os << "end\n";
+    return atomicPrivateFile(path, os.str());
 }
 
 FileWatcher::FileWatcher(std::string path) : path_(std::move(path)) { changed(); }
