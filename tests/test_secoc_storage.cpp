@@ -4,6 +4,8 @@
 #include <string>
 
 #include "secoc_storage.hpp"
+#include <csignal>
+#include <sys/resource.h>
 #include "test_framework.hpp"
 
 using namespace ccg;
@@ -109,12 +111,25 @@ TEST_CASE("secoc storage: a failed replacement preserves the committed state") {
     secoc::FreshnessManager::Snapshot saved;
     saved.tx[1] = 7;
     REQUIRE(platform::saveFreshness(path, saved));
-    // A directory at the temporary path makes open fail even when running as root.
-    REQUIRE(std::filesystem::create_directory(path + ".tmp"));
     auto next = saved;
     next.tx[1] = 8;
-    CHECK(!platform::saveFreshness(path, next));
+    bool written = true;
+    {
+        // Inject a real write failure, independent of the random temporary name.
+        // The file-size limit is enforced even when CI runs as root.
+        struct rlimit original{};
+        REQUIRE(::getrlimit(RLIMIT_FSIZE, &original) == 0);
+        struct RestoreLimit {
+            struct rlimit limit;
+            void (*handler)(int);
+            ~RestoreLimit() { ::setrlimit(RLIMIT_FSIZE, &limit); std::signal(SIGXFSZ, handler); }
+        } restore{original, std::signal(SIGXFSZ, SIG_IGN)};
+        auto limited = original;
+        limited.rlim_cur = 0;
+        REQUIRE(::setrlimit(RLIMIT_FSIZE, &limited) == 0);
+        written = platform::saveFreshness(path, next);
+    }
+    CHECK(!written);
     CHECK_EQ(platform::loadFreshness(path)->tx.at(1), 7u);
-    std::filesystem::remove(path + ".tmp");
     std::remove(path.c_str());
 }
